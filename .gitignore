@@ -4,3 +4,9 @@ internal-docs/
 target/
 config/indexer.stage.supabase.yaml
 config/api.stage.supabase.yaml
+# `.env.example` is committed as a template; the real `.env` and any
+# environment-specific overrides stay local so secrets can never land in git.
+.env
+.env.local
+.env.stage
+.env.prod

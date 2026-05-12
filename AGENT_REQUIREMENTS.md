@@ -2,16 +2,34 @@
 
 These rules apply to any AI agent that makes changes in this repository.
 
+## Avoid perfectionism
+
+Match the scope of changes to what was actually requested. Do not, without explicit ask:
+
+- refactor code that already works for a hypothetical readability win;
+- add error handling for cases that cannot happen (validated upstream, framework-guaranteed, etc.);
+- introduce new abstractions to "make this extensible later";
+- rewrite comments that aren't actually wrong;
+- add tests for code paths already covered by existing tests.
+
+When in doubt about whether a change is in scope, ask. A 50-line PR that solves the asked problem cleanly beats a 500-line PR that "also fixes a few things along the way".
+
 ## Project Documentation Rules
 
 Repository specifications live under [`docs/`](docs/), with implementation technical specs under [`docs/tech-specs/`](docs/tech-specs/).
 
 The public REST API contract is [`docs/api-spec.md`](docs/api-spec.md); do not edit it unless the task explicitly asks to change the public API.
 
+README files are entry points only: keep a short service definition, links to canonical specs, config locations/variables, and maintenance commands such as run/test/deploy. Do not put implementation details in README files. Functional requirements belong in `docs/api-spec.md`; implementation details belong in `docs/tech-specs/` (`market-data-api.md`, `market-data-indexer.md`, `auth.md`, and `trading-api/`); schema details belong in `docs/tech-specs/data-schema.md`.
+
 ## Before every `git commit`
 
-Re-read **every** file under `docs/` and the `README.md` of every touched component, then update each one the staged diff invalidates. Default is "check all"; only skip a doc after re-reading it and confirming it is unaffected.
+Re-read **every** file under `docs/`, the root [`README.md`](README.md), and the `README.md` of every touched component, then update each one the staged diff invalidates. Default is "check all"; only skip a doc after re-reading it and confirming it is unaffected.
+
+The root `README.md` is the project's high-level entry point — keep its architecture overview, repository layout, configuration / running-locally / test instructions, and the "Documentation" section in sync with the actual code, doc structure, and config files. Stale links or removed files referenced from the README are bugs.
 
 This includes terminology renames (e.g. `OEL` -> `OracleEventList`) and schema/field shape changes - propagate them across all docs, not just the file whose name matches the code change.
 
 If a doc is now obsolete and has no salvageable content, delete it and remove references in the same commit.
+
+Before running the full test suite or DB-backed integration tests, start the disposable test Postgres as described in [`README.md#test-postgres`](README.md#test-postgres).

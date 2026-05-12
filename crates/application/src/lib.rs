@@ -5,10 +5,81 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dodex_domain::DepthSnapshot;
+use dodex_domain::DomainError;
 use dodex_domain::MarketAddress;
 use dodex_domain::MarketStatus;
 use dodex_domain::MarketsPage;
+use dodex_domain::Permission;
+use dodex_domain::SensitiveBytes;
 use dodex_domain::Symbol;
+use uuid::Uuid;
+
+/// Per-request authorization state assembled by the HMAC middleware and
+/// consumed by handlers via the Salvo depot. Carries the resolved
+/// account, its custodied trading PN (with decrypted signing key), and
+/// the granted permissions. `pn_seckey` zeroes on drop.
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub account_id: Uuid,
+    pub api_key_id: i64,
+    pub trading_pn: TradingPn,
+    pub permissions: Vec<Permission>,
+}
+
+/// The custodied trading PN bound to an account. `pn_pubkey` and `pn_dih`
+/// are decimal-encoded uint256 strings — the format `bee-dex` accepts
+/// for chain-side calls.
+#[derive(Debug, Clone)]
+pub struct TradingPn {
+    pub pn_address: String,
+    pub pn_pubkey: String,
+    pub pn_dih: String,
+    pub pn_seckey: SensitiveBytes,
+}
+
+impl AuthContext {
+    pub fn has_permission(&self, perm: Permission) -> bool {
+        self.permissions.contains(&perm)
+    }
+
+    /// Enforce a required permission. Returns `DomainError::AuthRequired`
+    /// when the key does not carry it; the api error layer maps that to
+    /// `-1002 / 401` per `docs/api-spec.md`.
+    pub fn require(&self, perm: Permission) -> Result<(), DomainError> {
+        if self.has_permission(perm) {
+            Ok(())
+        } else {
+            Err(DomainError::AuthRequired)
+        }
+    }
+}
+
+/// Inputs the HTTP layer hands to the authenticator. The service stays
+/// thin: it extracts these fields out of the Salvo request and passes
+/// them in unaltered. `raw_query_string` is canonicalized inside the
+/// authenticator so the canonical/HMAC concern does not leak into the
+/// service layer; `body` is the on-the-wire byte sequence (never
+/// re-serialized JSON).
+#[derive(Debug, Clone)]
+pub struct AuthenticateRequest {
+    pub api_key: String,
+    pub timestamp_ms: i64,
+    pub recv_window_ms: Option<u64>,
+    pub signature_hex: String,
+    pub raw_query_string: String,
+    pub body: Vec<u8>,
+    pub now_ms: i64,
+}
+
+/// Verifies one HMAC-authenticated request and resolves it to the
+/// account's [`AuthContext`]. Matches the verification pipeline in
+/// `docs/tech-specs/auth.md §Authentication`. Implementations are
+/// expected to be cheap to clone (e.g. wrap a connection pool in
+/// `Arc`) so the trait object can sit in app state.
+#[async_trait]
+pub trait Authenticator: Send + Sync {
+    async fn authenticate(&self, request: AuthenticateRequest) -> Result<AuthContext, DomainError>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MarketsSort {
@@ -110,5 +181,48 @@ where
 {
     pub async fn execute(&self, query: GetDepthQuery) -> Result<DepthSnapshot, anyhow::Error> {
         self.repo.get_depth(&query.market_address, &query.symbol, query.limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context_with(perms: Vec<Permission>) -> AuthContext {
+        AuthContext {
+            account_id: Uuid::nil(),
+            api_key_id: 0,
+            trading_pn: TradingPn {
+                pn_address: "0:test".into(),
+                pn_pubkey: "0".into(),
+                pn_dih: "0".into(),
+                pn_seckey: SensitiveBytes::new(vec![]),
+            },
+            permissions: perms,
+        }
+    }
+
+    #[test]
+    fn require_grants_when_present() {
+        let ctx = context_with(vec![Permission::UserData, Permission::Trade]);
+        assert!(ctx.require(Permission::UserData).is_ok());
+        assert!(ctx.require(Permission::Trade).is_ok());
+    }
+
+    #[test]
+    fn require_rejects_when_absent() {
+        let ctx = context_with(vec![Permission::UserData]);
+        let err = ctx.require(Permission::Trade).unwrap_err();
+        assert_eq!(err, DomainError::AuthRequired);
+    }
+
+    #[test]
+    fn require_rejects_when_empty() {
+        // A key issued with no permissions should fail every check — even
+        // USER_DATA. This protects /account/ endpoints from a misconfigured
+        // empty-permission key being silently allowed.
+        let ctx = context_with(vec![]);
+        assert!(ctx.require(Permission::UserData).is_err());
+        assert!(ctx.require(Permission::Trade).is_err());
     }
 }
