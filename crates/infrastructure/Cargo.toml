@@ -1,0 +1,25 @@
+[package]
+name = "dodex-infrastructure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+num-bigint.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tvm_abi.workspace = true
+tvm_block.workspace = true
+tvm_executor.workspace = true
+tvm_types.workspace = true
+tvm_vm.workspace = true
+dodex-application = { path = "../application" }
+dodex-domain = { path = "../domain" }

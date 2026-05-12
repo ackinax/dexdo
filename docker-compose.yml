@@ -1,0 +1,33 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    environment:
+      APP_CONFIG: /app/config/api.local.yaml
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    healthcheck:
+      # Probe the running API rather than spawning a second `dodex-api`
+      # process: the binary ignores CLI args and would just try to bind
+      # 8080 again (or hang) on every healthcheck.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readiness"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  indexer:
+    build:
+      context: .
+      dockerfile: docker/indexer.Dockerfile
+    environment:
+      APP_CONFIG: /app/config/indexer.local.yaml
+      RUST_LOG: info
+    volumes:
+      - ./config:/app/config:ro
+    restart: unless-stopped

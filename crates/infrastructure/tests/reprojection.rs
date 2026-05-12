@@ -1,0 +1,380 @@
+// 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
+//
+// Integration tests for IndexerRepository::reproject_pending. Gated on the
+// TEST_DATABASE_URL env var: when unset, every test prints a skip notice and
+// returns early. Set it to a Postgres URL the suite is allowed to migrate
+// (the suite calls `database::run_migrations`). Tests use unique per-test
+// prefixes for msg_ids and addresses so they can run concurrently against
+// the same database without colliding.
+//
+// Tests serialise on REPROJECTION_LOCK because reproject_pending uses
+// `for update skip locked` — a parallel test could otherwise observe a
+// half-applied state (its row locked by another test's outer transaction
+// that has not committed yet).
+//
+//   TEST_DATABASE_URL=postgres://user:pass@localhost:5432/db \
+//       cargo test -p dodex-infrastructure --test reprojection
+
+use std::env;
+use std::time::Duration;
+
+use dodex_infrastructure::database;
+use dodex_infrastructure::indexer_repo::IndexerRepository;
+use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use tokio::sync::Mutex;
+
+static REPROJECTION_LOCK: Mutex<()> = Mutex::const_new(());
+
+async fn setup() -> Option<PgPool> {
+    let url = match env::var("TEST_DATABASE_URL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            eprintln!("skipping: TEST_DATABASE_URL not set");
+            return None;
+        }
+    };
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&url)
+        .await
+        .expect("TEST_DATABASE_URL connect");
+    database::run_migrations(&pool).await.expect("run migrations");
+    Some(pool)
+}
+
+async fn purge(pool: &PgPool, queries: &[(&str, &str)]) {
+    for (sql, key) in queries {
+        sqlx::query(sql).bind(*key).execute(pool).await.expect("purge");
+    }
+}
+
+async fn insert_raw(
+    pool: &PgPool,
+    msg_id: &str,
+    src: &str,
+    event_type: &str,
+    decoded: &serde_json::Value,
+) {
+    sqlx::query(
+        r#"insert into raw_events
+               (msg_id, chain_order, created_at_chain, src_address, dst_address,
+                event_type, body_json, decoded)
+           values ($1, $2, to_timestamp($3), $4, $4, $5, '{}'::jsonb, $6)"#,
+    )
+    .bind(msg_id)
+    // Per-msg deterministic key; lex-sortable so reproject ORDER BY chain_order
+    // gives a stable order. Real payloads come from the GraphQL gateway's
+    // `msg_chain_order` field.
+    .bind(format!("5f80{msg_id:0>28}"))
+    .bind(1_700_000_000_f64)
+    .bind(src)
+    .bind(event_type)
+    .bind(decoded)
+    .execute(pool)
+    .await
+    .expect("insert raw_events");
+}
+
+async fn processed_at_is_set(pool: &PgPool, msg_id: &str) -> bool {
+    sqlx::query_scalar("select processed_at is not null from raw_events where msg_id = $1")
+        .bind(msg_id)
+        .fetch_one(pool)
+        .await
+        .expect("read processed_at")
+}
+
+#[tokio::test]
+async fn applied_outcome_stamps_processed_at_and_writes_read_model() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_applied_oracle";
+    let oracle_addr = format!("0:{test}_oracle");
+    let oracle_name = format!("{test}-name");
+    let msg_id = format!("{test}-msg");
+
+    purge(
+        &pool,
+        &[
+            ("delete from oracles where address = $1", oracle_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id.as_str()),
+        ],
+    )
+    .await;
+
+    let decoded = json!({
+        "oracle": oracle_addr,
+        "pubkey": "0x0000000000000000000000000000000000000000000000000000000000001234",
+        "name": oracle_name,
+    });
+    insert_raw(&pool, &msg_id, &oracle_addr, "RootOracle.OracleDeployed", &decoded).await;
+
+    repo.reproject_pending(1000).await.expect("reproject");
+
+    assert!(processed_at_is_set(&pool, &msg_id).await, "Applied outcome must stamp processed_at");
+
+    let oracle_exists: bool =
+        sqlx::query_scalar("select exists(select 1 from oracles where address = $1)")
+            .bind(&oracle_addr)
+            .fetch_one(&pool)
+            .await
+            .expect("oracle exists");
+    assert!(oracle_exists, "projector must populate oracles on Applied");
+}
+
+#[tokio::test]
+async fn deferred_row_is_replayed_after_parent_arrives() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_deferred_eventlist";
+    let oracle_addr = format!("0:{test}_oracle");
+    let oracle_name = format!("{test}-oracle");
+    let oracle_deploy_msg = format!("{test}-oracle-deploy");
+    let eventlist_addr = format!("0:{test}_evlist");
+    let msg_id = format!("{test}-evlist-msg");
+
+    purge(
+        &pool,
+        &[
+            ("delete from oracle_event_lists where address = $1", eventlist_addr.as_str()),
+            ("delete from oracles where address = $1", oracle_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id.as_str()),
+        ],
+    )
+    .await;
+
+    let decoded = json!({
+        "eventListAddress": eventlist_addr,
+        "index": "1",
+    });
+    insert_raw(&pool, &msg_id, &oracle_addr, "Oracle.OracleEventListDeployed", &decoded).await;
+
+    // Pass 1: parent OracleDeployed has not been seen → Deferred.
+    repo.reproject_pending(1000).await.expect("reproject pass 1");
+    assert!(
+        !processed_at_is_set(&pool, &msg_id).await,
+        "deferred row must keep processed_at null until the parent appears"
+    );
+
+    let evlist_count: i64 =
+        sqlx::query_scalar("select count(*) from oracle_event_lists where address = $1")
+            .bind(&eventlist_addr)
+            .fetch_one(&pool)
+            .await
+            .expect("count event lists pass 1");
+    assert_eq!(evlist_count, 0, "no projection should happen while parent is missing");
+
+    // Insert the parent oracle directly (simulating the OracleDeployed projector).
+    sqlx::query(
+        r#"insert into oracles (name, address, deploy_msg_id, pubkey)
+           values ($1, $2, $3, $4)"#,
+    )
+    .bind(&oracle_name)
+    .bind(&oracle_addr)
+    .bind(&oracle_deploy_msg)
+    .bind("0xff")
+    .execute(&pool)
+    .await
+    .expect("insert parent oracle");
+
+    // Pass 2: parent now exists → Applied.
+    repo.reproject_pending(1000).await.expect("reproject pass 2");
+    assert!(
+        processed_at_is_set(&pool, &msg_id).await,
+        "processed_at must be stamped once the parent is present"
+    );
+
+    let evlist_count: i64 =
+        sqlx::query_scalar("select count(*) from oracle_event_lists where address = $1")
+            .bind(&eventlist_addr)
+            .fetch_one(&pool)
+            .await
+            .expect("count event lists pass 2");
+    assert_eq!(evlist_count, 1, "Applied outcome must populate oracle_event_lists");
+}
+
+#[tokio::test]
+async fn already_processed_rows_are_not_picked_up() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_already_processed";
+    let oracle_addr = format!("0:{test}_oracle");
+    let msg_id = format!("{test}-msg");
+
+    purge(
+        &pool,
+        &[
+            ("delete from oracles where address = $1", oracle_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id.as_str()),
+        ],
+    )
+    .await;
+
+    let frozen_ts = "2020-01-01T00:00:00+00:00";
+    let decoded = json!({
+        "oracle": oracle_addr,
+        "pubkey": "0x00",
+        "name": format!("{test}-name"),
+    });
+
+    sqlx::query(
+        r#"insert into raw_events
+               (msg_id, chain_order, created_at_chain, src_address, dst_address,
+                event_type, body_json, decoded, processed_at)
+           values ($1, $2, to_timestamp(1700000000), $3, $3, $4, '{}'::jsonb, $5,
+                   $6::timestamptz)"#,
+    )
+    .bind(&msg_id)
+    .bind(format!("5f80{msg_id:0>28}"))
+    .bind(&oracle_addr)
+    .bind("RootOracle.OracleDeployed")
+    .bind(&decoded)
+    .bind(frozen_ts)
+    .execute(&pool)
+    .await
+    .expect("insert pre-processed raw_events");
+
+    repo.reproject_pending(1000).await.expect("reproject");
+
+    let processed_at_str: String =
+        sqlx::query_scalar("select processed_at::text from raw_events where msg_id = $1")
+            .bind(&msg_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read processed_at");
+    assert!(
+        processed_at_str.starts_with("2020-01-01"),
+        "processed_at on already-processed row must not be overwritten, got {processed_at_str}"
+    );
+
+    let oracle_exists: bool =
+        sqlx::query_scalar("select exists(select 1 from oracles where address = $1)")
+            .bind(&oracle_addr)
+            .fetch_one(&pool)
+            .await
+            .expect("oracle exists");
+    assert!(!oracle_exists, "projector must not run for rows that already carry processed_at");
+}
+
+#[tokio::test]
+async fn unknown_event_type_is_marked_processed() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_unknown_event";
+    let msg_id = format!("{test}-msg");
+
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
+
+    // Nullifier.VoucherGenerated is decoded by the ABI but has no projector
+    // wired up → projectors::project_event returns Unknown.
+    insert_raw(
+        &pool,
+        &msg_id,
+        "0:reproj_unknown_event_src",
+        "Nullifier.VoucherGenerated",
+        &json!({}),
+    )
+    .await;
+
+    repo.reproject_pending(1000).await.expect("reproject");
+
+    assert!(
+        processed_at_is_set(&pool, &msg_id).await,
+        "Unknown outcome must stamp processed_at to keep the row out of the retry queue"
+    );
+}
+
+#[tokio::test]
+async fn orderfilled_deferred_replays_after_orderplaced() {
+    // Locks in the OrderBook deferred-replay contract: an OrderFilled that
+    // arrives before its OrderPlaced must stay queued (processed_at = null),
+    // and the next reprojection sweep — once the live_orders row exists —
+    // must apply it. Without this, /api/v1/depth would inflate liquidity by
+    // ignoring fills that landed out of order on the wire.
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_deferred_orderfilled";
+    let orderbook_addr = format!("0:{test}_book");
+    let order_id = "42";
+    let msg_id = format!("{test}-fill-msg");
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id.as_str()),
+        ],
+    )
+    .await;
+
+    let decoded = json!({
+        "orderId": order_id,
+        "filledAmount": "30",
+    });
+    insert_raw(&pool, &msg_id, &orderbook_addr, "OrderBook.OrderFilled", &decoded).await;
+
+    // Pass 1: live_orders has no matching row → Deferred.
+    repo.reproject_pending(1000).await.expect("reproject pass 1");
+    assert!(
+        !processed_at_is_set(&pool, &msg_id).await,
+        "deferred OrderFilled must keep processed_at null until the order exists"
+    );
+
+    let live_count: i64 =
+        sqlx::query_scalar("select count(*) from live_orders where orderbook_address = $1")
+            .bind(&orderbook_addr)
+            .fetch_one(&pool)
+            .await
+            .expect("count live_orders pass 1");
+    assert_eq!(live_count, 0, "no live_orders row should exist before OrderPlaced lands");
+
+    // Insert the parent live_orders row directly (simulating the OrderPlaced
+    // projector). amount_remaining = 100 so the deferred fill of 30 will leave
+    // 70 once the replay applies.
+    sqlx::query(
+        r#"insert into live_orders
+               (orderbook_address, order_id, outcome_id, is_buy, price,
+                amount_remaining, status, last_chain_order)
+           values ($1, $2::numeric, 1, true, 100::numeric,
+                   100::numeric, 'OPEN', '5f800000000000000001')"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("insert parent live_orders");
+
+    // Pass 2: parent now exists → fill applies.
+    repo.reproject_pending(1000).await.expect("reproject pass 2");
+    assert!(
+        processed_at_is_set(&pool, &msg_id).await,
+        "processed_at must be stamped once the order exists and the fill applies"
+    );
+
+    let row: (String, String) = sqlx::query_as(
+        "select amount_remaining::text, status from live_orders
+              where orderbook_address = $1 and order_id = $2::numeric",
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read live_orders state");
+    assert_eq!(
+        row.0, "70",
+        "deferred OrderFilled must subtract filledAmount from amount_remaining once replayed"
+    );
+    assert_eq!(row.1, "OPEN", "partial fill must keep the order OPEN");
+}

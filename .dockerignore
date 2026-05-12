@@ -1,0 +1,7 @@
+*logs*
+venv
+tests
+.temp
+**/target
+.codex*
+.claude*

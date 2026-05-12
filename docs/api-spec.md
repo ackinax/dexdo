@@ -71,7 +71,7 @@ floating-point precision loss.
 Dodex uses the following market identifiers:
 
 - `marketAddress` is the stable market identifier across the entire lifecycle. Used in all market-specific requests. Example: `0:market-address`.
-- `orderBookAddress` is the order-book address returned by `/api/v1/markets`. It is always present in the API response; clients MUST use `status` to determine whether the order book is currently available for trading.
+- `orderBookAddress` is the deterministic order-book address returned by `/api/v1/markets`. It is always present on any market that appears in API responses — the backend stamps it on the first reconcile, before the OrderBook contract is active on-chain. The only state where it can be null internally is the pre-reconcile window, and such markets are hidden from the API. Clients MUST use `status` to determine whether the order book is currently available for trading; a non-null `orderBookAddress` does not by itself imply the book is open.
 - `marketName` is the market name. Example: `PM-2026-ELECTION`.
 - `symbol` is the outcome-token symbol and is formed as `<marketName>-<OUTCOME_NAME>`. Example: `PM-2026-ELECTION-YES`.
 
@@ -197,7 +197,7 @@ Query parameters:
 | `marketAddress` | STRING | NO | Return one market only. Mutually exclusive with the filter and pagination parameters below. |
 | `status` | STRING | NO | Comma-separated list of statuses to include. Example: `TRADING,AWAITING_FREEZE`. |
 | `quoteAsset` | STRING | NO | Filter by quote asset. Example: `USDC`. |
-| `oracleName` | STRING | NO | Filter by oracle name. |
+| `oracleName` | STRING | NO | Filter by oracle name. A market matches if **any** of its confirming oracles has this name — a multi-oracle PMP is included as long as one of its `event.oracles[]` entries matches. |
 | `closingBefore` | LONG | NO | Return only markets with `timings.resultEnd < closingBefore` (unix seconds). |
 | `sort` | STRING | NO | Sort field. One of: `resultStart` (default, ASC), `createdAt` (DESC). |
 | `cursor` | STRING | NO | Opaque pagination cursor returned by a previous call. |
@@ -230,9 +230,11 @@ Response:
         "eventId": "0xabc...",
         "eventName": "2026 US Presidential Election",
         "description": "Will candidate X win?",
-        "oracleName": "ElectionOracle",
-        "oracleAddress": "0:oracle-addr",
-        "oracleFee": "100"
+        "oracles": [{
+          "name": "ElectionOracle",
+          "address": "0:oracle-addr",
+          "fee": "100"
+        }]
       },
       "terminal": null,
       "outcomes": [
@@ -272,7 +274,7 @@ Response fields:
 | `nextCursor` | STRING \| null | Pagination cursor for the next page. `null` when `hasMore` is `false`. |
 | `hasMore` | BOOLEAN | Whether more pages follow. |
 | `marketAddress` | STRING | Stable market identifier. |
-| `orderBookAddress` | STRING | Order-book address. Always returned; availability depends on market `status`. |
+| `orderBookAddress` | STRING | Deterministic order-book address. Always present on markets visible to the API (the backend stamps it on the first reconcile). Trading availability depends on market `status`. |
 | `marketName` | STRING | Technical market name. Not the user-facing title; see `event.eventName`. |
 | `status` | ENUM | Market phase. See [Market Status](#market-status). |
 | `quoteAsset` | STRING | Quote-asset symbol for display. |
@@ -334,13 +336,37 @@ All timestamps are unix seconds.
   "eventId": "0xabc...",
   "eventName": "2026 US Presidential Election",
   "description": "Will candidate X win?",
-  "oracleName": "ElectionOracle",
-  "oracleAddress": "0:oracle-addr",
-  "oracleFee": "100"
+  "oracles": [
+    {
+      "name": "ElectionOracle",
+      "address": "0:oracle-a",
+      "fee": "100"
+    },
+    {
+        "name": "BackupElectionOracle",
+        "address": "0:oracle-b",
+        "fee": "200"
+    }
+  ]
 }
 ```
 
-`eventName` and `description` are the user-facing labels for the market.
+| Field | Type | Description |
+| --- | --- | --- |
+| `eventId` | STRING | `0x`-prefixed uint256 hex digest. Computed on-chain as a hash of `eventName`, `description`, `deadline`, `outcomeNames`; therefore identical across every oracle that confirms the same event. |
+| `eventName` | STRING \| null | User-facing event title. Shared across all confirming oracles by the hash invariant above. `null` until at least one `EventAdded` has landed. |
+| `description` | STRING \| null | User-facing description. Same shared-by-hash invariant as `eventName`. |
+| `oracles` | ARRAY of [OracleEntry](#oracleentry) | One entry per oracle that confirmed this PMP. A PMP can require confirmation from multiple `OracleEventList` contracts; each adds an entry with its own `fee`. Empty array means no oracle has confirmed yet (the row exists in `markets` but no `EventConfirmed` has landed). |
+
+###### OracleEntry
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | STRING \| null | Oracle name from `oracles.name`. `null` if the indexer has not yet reconciled the oracle row. |
+| `address` | STRING \| null | Oracle contract address. |
+| `fee` | DECIMAL \| null | Oracle fee for this confirmation, as a uint128 decimal string. Different oracles can charge different fees for the same event. |
+
+If any two entries in `oracles[]` for the same market disagree on `eventName` or `description`, the backend fails the request closed with `MarketInconsistent` (HTTP 503) — that disagreement contradicts the hash invariant and indicates indexer corruption.
 
 ##### Terminal
 
@@ -441,7 +467,7 @@ Response:
 {
   "marketAddress": "0:market-address",
   "symbol": "PM-2026-ELECTION-YES",
-  "lastUpdateId": 1027024,
+  "lastUpdateId": "5f8000000000017c5a",
   "bids": [
     ["0.614", "100.00"],
     ["0.613", "25.50"]
@@ -452,6 +478,10 @@ Response:
   ]
 }
 ```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `lastUpdateId` | STRING | Opaque chain-order cursor. Lex-comparable: a larger string means a newer event has touched this `(marketAddress, symbol)`. Empty string when no order event has landed yet. Clients SHOULD compare for equality to detect "no change" and string-lex order to detect "moved forward"; they SHOULD NOT parse it as an integer. |
 
 Each bid or ask item is:
 
