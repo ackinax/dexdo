@@ -9,6 +9,7 @@ use dodex_domain::DomainError;
 use dodex_domain::MarketAddress;
 use dodex_domain::MarketStatus;
 use dodex_domain::MarketsPage;
+use dodex_domain::OpenOrder;
 use dodex_domain::Permission;
 use dodex_domain::SensitiveBytes;
 use dodex_domain::Symbol;
@@ -121,6 +122,11 @@ pub trait MarketReadRepository: Send + Sync {
         symbol: &Symbol,
         limit: u16,
     ) -> Result<DepthSnapshot, anyhow::Error>;
+
+    async fn list_open_orders(
+        &self,
+        query: &OpenOrdersQuery,
+    ) -> Result<OpenOrdersPage, anyhow::Error>;
 }
 
 #[async_trait]
@@ -137,6 +143,13 @@ impl<T: ?Sized + MarketReadRepository> MarketReadRepository for Arc<T> {
     ) -> Result<DepthSnapshot, anyhow::Error> {
         (**self).get_depth(market_address, symbol, limit).await
     }
+
+    async fn list_open_orders(
+        &self,
+        query: &OpenOrdersQuery,
+    ) -> Result<OpenOrdersPage, anyhow::Error> {
+        (**self).list_open_orders(query).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +157,32 @@ pub struct GetDepthQuery {
     pub market_address: MarketAddress,
     pub symbol: Symbol,
     pub limit: u16,
+}
+
+pub const OPEN_ORDERS_DEFAULT_LIMIT: u16 = 100;
+pub const OPEN_ORDERS_MAX_LIMIT: u16 = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenOrdersCursor(pub String);
+
+#[derive(Debug, Clone)]
+pub struct OpenOrdersQuery {
+    pub owner_pn_address: String,
+    pub market: Option<OpenOrdersMarketFilter>,
+    pub limit: u16,
+    pub cursor: Option<OpenOrdersCursor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenOrdersMarketFilter {
+    pub market_address: MarketAddress,
+    pub symbol: Symbol,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenOrdersPage {
+    pub orders: Vec<OpenOrder>,
+    pub next_cursor: Option<OpenOrdersCursor>,
 }
 
 pub struct GetMarketsUseCase<R> {
@@ -181,6 +220,64 @@ where
 {
     pub async fn execute(&self, query: GetDepthQuery) -> Result<DepthSnapshot, anyhow::Error> {
         self.repo.get_depth(&query.market_address, &query.symbol, query.limit).await
+    }
+}
+
+pub struct GetOpenOrdersUseCase<R> {
+    repo: R,
+}
+
+impl<R> GetOpenOrdersUseCase<R> {
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+}
+
+impl<R> GetOpenOrdersUseCase<R>
+where
+    R: MarketReadRepository,
+{
+    pub async fn execute(
+        &self,
+        ctx: &AuthContext,
+        market_address: Option<MarketAddress>,
+        symbol: Option<Symbol>,
+        limit: Option<i64>,
+        cursor: Option<&str>,
+    ) -> Result<OpenOrdersPage, anyhow::Error> {
+        let market = match (market_address, symbol) {
+            (None, None) => None,
+            (Some(market_address), Some(symbol)) => {
+                Some(OpenOrdersMarketFilter { market_address, symbol })
+            }
+            _ => return Err(anyhow::anyhow!(DomainError::MissingParameter)),
+        };
+
+        let limit = match limit {
+            None => OPEN_ORDERS_DEFAULT_LIMIT,
+            Some(v) if (1..=i64::from(OPEN_ORDERS_MAX_LIMIT)).contains(&v) => v as u16,
+            Some(_) => return Err(anyhow::anyhow!(DomainError::MissingParameter)),
+        };
+
+        let cursor = match cursor {
+            None => None,
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow::anyhow!(DomainError::MissingParameter));
+                }
+                Some(OpenOrdersCursor(trimmed.to_string()))
+            }
+        };
+
+        self.repo
+            .list_open_orders(&OpenOrdersQuery {
+                owner_pn_address: ctx.trading_pn.pn_address.clone(),
+                market,
+                limit,
+                cursor,
+            })
+            .await
     }
 }
 
