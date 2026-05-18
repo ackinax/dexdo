@@ -8,6 +8,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use dodex_application::MarketForPlacement;
 use dodex_application::MarketReadRepository;
 use dodex_application::MarketsListing;
 use dodex_application::MarketsRequest;
@@ -38,6 +39,7 @@ use dodex_domain::TimeInForce;
 use dodex_domain::Timings;
 use num_bigint::BigUint;
 use sqlx::PgPool;
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct PostgresReadModelRepository {
@@ -55,6 +57,7 @@ struct MarketRow {
     id: i64,
     pmp_address: String,
     orderbook_address: Option<String>,
+    oracle_list_hash: Option<String>,
     market_name: Option<String>,
     token_type: i32,
     token_code: String,
@@ -270,6 +273,102 @@ impl MarketReadRepository for PostgresReadModelRepository {
         })
     }
 
+    async fn resolve_for_new_order(
+        &self,
+        market_address: &MarketAddress,
+        symbol: &Symbol,
+        now: i64,
+    ) -> Result<MarketForPlacement, anyhow::Error> {
+        // Single round-trip for the trading hot path: join `markets` and
+        // `market_outcomes` on `(pmp_address, symbol)`. Oracle / event
+        // aggregation (which `list_markets` performs) is irrelevant
+        // here — the use case only consumes `event_id`,
+        // `oracle_list_hash`, `token_type`, the outcome row, and a
+        // status derived from the timing columns we pull below.
+        let row: Option<PlacementRow> = sqlx::query_as(
+            r#"select m.oracle_list_hash::text as oracle_list_hash,
+                      m.token_type             as token_type,
+                      m.event_id::text         as event_id,
+                      m.stake_start            as stake_start,
+                      m.stake_end              as stake_end,
+                      m.result_start           as result_start,
+                      m.result_end             as result_end,
+                      m.frozen_at              as frozen_at,
+                      m.resolved_at            as resolved_at,
+                      m.cancelled_at           as cancelled_at,
+                      m.is_cancelled           as is_cancelled,
+                      mo.outcome_id            as outcome_id,
+                      mo.outcome_name          as outcome_name,
+                      mo.price_precision       as price_precision,
+                      mo.quantity_precision    as quantity_precision,
+                      mo.tick_size             as tick_size,
+                      mo.step_size             as step_size,
+                      mo.min_notional          as min_notional,
+                      mo.max_batch_size        as max_batch_size
+                 from markets m
+                 join market_outcomes mo on mo.market_id_fk = m.id
+                where m.pmp_address = $1
+                  and mo.symbol = $2
+                  and m.last_reconciled_at is not null"#,
+        )
+        .bind(market_address.0.as_str())
+        .bind(symbol.0.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .context("resolve_for_new_order: select market+outcome")?;
+
+        let Some(row) = row else {
+            // Same collapse the depth handler uses: missing market vs
+            // missing symbol-within-market are indistinguishable to the
+            // client and the spec does not require we tell them apart.
+            return Err(anyhow!(DomainError::InvalidMarketOrSymbol));
+        };
+
+        let status = compute_status(
+            row.cancelled_at,
+            row.is_cancelled,
+            row.resolved_at,
+            row.stake_start,
+            row.stake_end,
+            row.result_start,
+            row.result_end,
+            row.frozen_at,
+            now,
+        );
+
+        // Log so ops can triage reconciler partial-writes; the empty
+        // string then feeds the use case's `is_empty` invariant check.
+        let oracle_list_hash = match row.oracle_list_hash {
+            Some(raw) if !raw.trim().is_empty() => raw,
+            other => {
+                warn!(
+                    pmp_address = %market_address.0,
+                    null = other.is_none(),
+                    "resolve_for_new_order: oracle_list_hash NULL/blank on reconciled row",
+                );
+                String::new()
+            }
+        };
+
+        Ok(MarketForPlacement {
+            event_id: row.event_id,
+            oracle_list_hash,
+            token_type: row.token_type,
+            status,
+            outcome: Outcome {
+                outcome_id: row.outcome_id as u32,
+                outcome_name: row.outcome_name,
+                symbol: symbol.clone(),
+                price_precision: row.price_precision as u8,
+                quantity_precision: row.quantity_precision as u8,
+                tick_size: row.tick_size,
+                step_size: row.step_size,
+                min_notional: row.min_notional,
+                max_batch_size: row.max_batch_size as u16,
+            },
+        })
+    }
+
     async fn list_open_orders(
         &self,
         query: &OpenOrdersQuery,
@@ -405,6 +504,29 @@ impl MarketReadRepository for PostgresReadModelRepository {
 
         Ok(OpenOrdersPage { orders, next_cursor })
     }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct PlacementRow {
+    oracle_list_hash: Option<String>,
+    token_type: i32,
+    event_id: String,
+    stake_start: Option<i64>,
+    stake_end: Option<i64>,
+    result_start: Option<i64>,
+    result_end: Option<i64>,
+    frozen_at: Option<i64>,
+    resolved_at: Option<i64>,
+    cancelled_at: Option<i64>,
+    is_cancelled: bool,
+    outcome_id: i32,
+    outcome_name: String,
+    price_precision: i32,
+    quantity_precision: i32,
+    tick_size: String,
+    step_size: String,
+    min_notional: String,
+    max_batch_size: i32,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -749,6 +871,7 @@ fn market_select_sql(where_clause: &str, tail: &str) -> String {
                m.id                                          as id,
                m.pmp_address                                 as pmp_address,
                m.orderbook_address                           as orderbook_address,
+               m.oracle_list_hash::text                      as oracle_list_hash,
                m.market_id                                   as market_name,
                m.token_type                                  as token_type,
                m.token_code                                  as token_code,
@@ -885,6 +1008,26 @@ fn assemble_market(
         }
     };
 
+    // `oracle_list_hash` is reconciler-only and has no CHECK constraint
+    // pinning it post-reconcile (unlike `orderbook_address`). A
+    // NULL/blank value here must NOT fail-close the read endpoints —
+    // `/api/v1/markets` and `/api/v1/depth` do not surface this field
+    // and would silently hide an otherwise-valid market. The trading
+    // path needs the value populated and enforces that itself in the
+    // application layer (`CreateOrderUseCase::execute`'s `is_empty`
+    // check on the `MarketForPlacement` projection produced by
+    // `resolve_for_new_order`), so we render NULL as the empty string
+    // here and let the trading-side check emit `MarketInconsistent`
+    // only when an order is being placed.
+    let oracle_list_hash = row
+        .oracle_list_hash
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(numeric_to_hex)
+        .transpose()?
+        .unwrap_or_default();
+
     let status = derive_status(&row, now);
     let timings = build_timings(&row, status);
     let terminal = build_terminal(&row, status, now);
@@ -906,6 +1049,7 @@ fn assemble_market(
     Ok(Market {
         market_address: MarketAddress(row.pmp_address),
         order_book_address,
+        oracle_list_hash,
         market_name: MarketName(market_name),
         status,
         quote_asset: row.token_code,
@@ -919,24 +1063,49 @@ fn assemble_market(
 }
 
 fn derive_status(row: &MarketRow, now: i64) -> MarketStatus {
+    compute_status(
+        row.cancelled_at,
+        row.is_cancelled,
+        row.resolved_at,
+        row.stake_start,
+        row.stake_end,
+        row.result_start,
+        row.result_end,
+        row.frozen_at,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_status(
+    cancelled_at: Option<i64>,
+    is_cancelled: bool,
+    resolved_at: Option<i64>,
+    stake_start: Option<i64>,
+    stake_end: Option<i64>,
+    result_start: Option<i64>,
+    result_end: Option<i64>,
+    frozen_at: Option<i64>,
+    now: i64,
+) -> MarketStatus {
     // Either signal is enough to flip the market terminal: `cancelled_at` is
     // set by the cancellation-event projector, `is_cancelled` is set by the
     // reconciler from `PMP.getDetails().isCancelled`. If the event was never
     // observed (or has not been replayed yet) the on-chain flag is still
     // authoritative, and the API spec requires the CANCELLED + terminal
     // response for cancelled markets.
-    if row.cancelled_at.is_some() || row.is_cancelled {
+    if cancelled_at.is_some() || is_cancelled {
         return MarketStatus::Cancelled;
     }
-    if row.resolved_at.is_some() {
+    if resolved_at.is_some() {
         return MarketStatus::Resolved;
     }
-    let Some(stake_start) = row.stake_start else {
+    let Some(stake_start) = stake_start else {
         return MarketStatus::Pending;
     };
-    let stake_end = row.stake_end.unwrap_or(stake_start);
-    let result_start = row.result_start.unwrap_or(stake_end);
-    let result_end = row.result_end.unwrap_or(result_start);
+    let stake_end = stake_end.unwrap_or(stake_start);
+    let result_start = result_start.unwrap_or(stake_end);
+    let result_end = result_end.unwrap_or(result_start);
 
     // PoolsFrozen gate: tech-spec.md invariant #2 ties RESOLVING (and by
     // extension the post-result_end EXPIRED) to `frozenAt != null`, and
@@ -946,7 +1115,7 @@ fn derive_status(row: &MarketRow, now: i64) -> MarketStatus {
     // listing endpoint would return a market whose Rust-derived status
     // disagrees with its `frozenAt = null` timings and trips the API spec's
     // status⇄timings consistency contract.
-    if row.frozen_at.is_none() {
+    if frozen_at.is_none() {
         if now >= stake_end {
             return MarketStatus::AwaitingFreeze;
         } else if now >= stake_start {
@@ -1137,6 +1306,7 @@ mod tests {
             id: 1,
             pmp_address: "0:pmp".into(),
             orderbook_address: None,
+            oracle_list_hash: None,
             market_name: Some("PM".into()),
             token_type: 3,
             token_code: "USDC".into(),

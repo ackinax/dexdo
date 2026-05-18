@@ -156,14 +156,22 @@ Recommended common error codes:
 | `-1000` | Unknown error. | 500 |
 | `-1002` | Authentication required. | 401 |
 | `-1003` | Required auth parameter missing. | 401 |
+| `-1007` | Request timed out before completion. | 504 |
 | `-1009` | Request body too large. | 413 |
 | `-1021` | Timestamp outside recvWindow. | 401 |
 | `-1022` | Invalid signature. | 401 |
 | `-1102` | Mandatory parameter was not sent. | 400 |
 | `-1111` | Precision is over the maximum defined for this asset. | 400 |
 | `-1121` | Invalid market or symbol. | 404 |
+| `-1130` | Invalid value for a query or body parameter. | 400 |
+| `-1500` | Market data is temporarily inconsistent. | 503 |
 | `-2010` | Order would immediately fail validation. | 400 |
 | `-2011` | Unknown order. | 404 |
+| `-2014` | Trading note busy with a previous order; retry shortly. | 429 |
+
+`-1007` means the request did not complete in time. The order may still have been accepted by the exchange. Retry `POST /api/v1/order` with the same `newOrderClientId` — the server will deduplicate so the same order is not placed twice.
+
+`-2014` means another order from the same account is still being processed. Retry after a short delay; the in-flight order will appear in `/api/v1/openOrders` shortly.
 
 Authentication errors are split intentionally: `-1003` signals a malformed
 request envelope (missing or unparseable `X-DODEX-APIKEY`, `timestamp`,
@@ -589,20 +597,21 @@ Response:
 
 ```json
 {
-  "marketAddress": "0:market-address",
-  "symbol": "PM-2026-ELECTION-YES",
-  "orderId": "123456789",
   "clientOrderId": "mm-order-0001",
   "transactTime": 1710000000000,
-  "price": "0.615",
-  "origQty": "1.500000",
-  "executedQty": "0.000000",
-  "status": "NEW",
-  "timeInForce": "GTC",
-  "type": "LIMIT",
-  "side": "BUY"
+  "status": "PENDING_NEW"
 }
 ```
+
+Response fields:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `clientOrderId` | STRING | Either the `newOrderClientId` sent in the request, or a server-generated identifier when none was provided. Use it to look up the order in `/api/v1/openOrders` until the server-assigned `orderId` is available. |
+| `transactTime` | LONG | Server timestamp (Unix ms) when the order was accepted. |
+| `status` | ENUM | Always [`PENDING_NEW`](#order-status) on success. |
+
+The response confirms acceptance only. The full order state — `orderId`, fills, accepted price — becomes available through [`GET /api/v1/openOrders`](#current-open-orders) shortly after; look up by `clientOrderId`.
 
 ### Cancel Order
 
@@ -1022,6 +1031,7 @@ Response:
 
 | Value | Description |
 | --- | --- |
+| `PENDING_NEW` | Order accepted by the exchange and not yet on the book. Will transition to `NEW` (or `PARTIALLY_FILLED` if it immediately matches) once visible in `/api/v1/openOrders`. |
 | `NEW` | Order is open and has no fills. |
 | `PARTIALLY_FILLED` | Order is open and partially filled. |
 | `FILLED` | Order is completely filled. |
