@@ -27,9 +27,9 @@ use dodex_application::MarketForPlacement;
 use dodex_application::MarketReadRepository;
 use dodex_application::MarketsRequest;
 use dodex_application::NewOrderPayload;
-use dodex_application::OpenOrdersPage;
-use dodex_application::OpenOrdersQuery;
 use dodex_application::OrderForCancel;
+use dodex_application::OrdersPage;
+use dodex_application::OrdersQuery;
 use dodex_application::TradingPn;
 use dodex_domain::DepthSnapshot;
 use dodex_domain::DomainError;
@@ -128,8 +128,8 @@ impl MarketReadRepository for FakeRepo {
         Ok(order)
     }
 
-    async fn list_open_orders(&self, _: &OpenOrdersQuery) -> Result<OpenOrdersPage, anyhow::Error> {
-        unimplemented!("list_open_orders is not exercised by cancel_order_http tests")
+    async fn list_orders(&self, _: &OrdersQuery) -> Result<OrdersPage, anyhow::Error> {
+        unimplemented!("list_orders is not exercised by cancel_order_http tests")
     }
 }
 
@@ -182,7 +182,7 @@ fn trading_order(client_order_id: Option<&str>) -> OrderForCancel {
         event_id: "0xevent".into(),
         oracle_list_hash: "0xfeedface".into(),
         token_type: 3,
-        status: MarketStatus::Trading,
+        market_status: MarketStatus::Trading,
         client_order_id: client_order_id.map(|s| s.to_string()),
     }
 }
@@ -364,7 +364,7 @@ async fn unknown_order_returns_404_minus_2011() {
 #[tokio::test]
 async fn non_trading_market_returns_400_minus_2010() {
     let mut order = trading_order(None);
-    order.status = MarketStatus::Resolving;
+    order.market_status = MarketStatus::Resolving;
     let repo: SharedRepo = Arc::new(FakeRepo::with(order));
     let sender: SharedChainSender = Arc::new(RecordingCancelSender::ok());
     let service = setup_with(repo, sender);

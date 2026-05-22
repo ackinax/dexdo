@@ -227,7 +227,7 @@ fn classify_chain_outcome<T>(
 /// so a `tvm_exit` error here carries the exact `require(...)` exit
 /// code the chain raised. Mapping it to a specific `DomainError` lets
 /// the HTTP caller distinguish "balance insufficient" from "PN busy"
-/// from "transport blew up" without polling `/api/v1/openOrders` for
+/// from "transport blew up" without polling `/api/v1/orders` for
 /// absence.
 ///
 /// Unrecognized chain codes and non-`tvm_exit` failures (gateway

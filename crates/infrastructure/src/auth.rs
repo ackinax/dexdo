@@ -183,12 +183,12 @@ impl Authenticator for PostgresAuthenticator {
             );
             DomainError::Unexpected
         })?;
-        let pn_seckey = SensitiveBytes::seckey(pn_seckey_plain).map_err(|err| {
+        let pn_seckey = SensitiveBytes::seckey(pn_seckey_plain).inspect_err(|err| {
             tracing::error!(
+                error = ?err,
                 account_id = %row.account_id,
                 "auth failed: pn_seckey plaintext has wrong length",
             );
-            err
         })?;
 
         // 7. Parse permissions. Unknown enum labels are skipped with a
@@ -574,8 +574,7 @@ mod tests {
     #[test]
     fn mask_still_redacts_middle_of_minimum_length_key() {
         // 12-char keys must still have at least 4 chars redacted in
-        // the middle; the earlier implementation showed the entire
-        // input verbatim.
+        // the middle; short keys must never be shown verbatim.
         let m = mask("dk_live_1234");
         assert_eq!(m, "dk_liv...34");
     }

@@ -22,19 +22,23 @@ use dodex_application::CreateOrderUseCase;
 use dodex_application::GetDepthQuery;
 use dodex_application::GetDepthUseCase;
 use dodex_application::GetMarketsUseCase;
-use dodex_application::GetOpenOrdersUseCase;
+use dodex_application::GetOrdersInput;
+use dodex_application::GetOrdersUseCase;
 use dodex_application::MarketReadRepository;
 use dodex_application::MarketsFilter;
 use dodex_application::MarketsListing;
 use dodex_application::MarketsRequest;
 use dodex_application::MarketsSort;
 use dodex_application::NewOrderInput;
+use dodex_application::OrdersCursor;
+use dodex_application::OrdersMarketFilter;
 use dodex_domain::DomainError;
 use dodex_domain::Market;
 use dodex_domain::MarketAddress;
 use dodex_domain::MarketEvent;
 use dodex_domain::MarketStatus;
-use dodex_domain::OpenOrder;
+use dodex_domain::Order;
+use dodex_domain::OrderParts;
 use dodex_domain::OrderSide;
 use dodex_domain::OrderStatus;
 use dodex_domain::OrderType;
@@ -192,7 +196,7 @@ struct DepthResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OpenOrderResponse {
+struct OrderResponse {
     market_address: String,
     symbol: String,
     order_id: String,
@@ -211,8 +215,8 @@ struct OpenOrderResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct OpenOrdersPageResponse {
-    orders: Vec<OpenOrderResponse>,
+struct OrdersPageResponse {
+    orders: Vec<OrderResponse>,
     next_cursor: Option<String>,
 }
 
@@ -473,10 +477,10 @@ async fn get_depth(req: &mut Request, depot: &mut Depot) -> Result<Json<DepthRes
 }
 
 #[handler]
-async fn get_open_orders(
+async fn get_orders(
     req: &mut Request,
     depot: &mut Depot,
-) -> Result<Json<OpenOrdersPageResponse>, ApiError> {
+) -> Result<Json<OrdersPageResponse>, ApiError> {
     let ctx = require_auth(depot, Permission::UserData)?.clone();
     let state = depot
         .obtain::<AppState>()
@@ -486,59 +490,106 @@ async fn get_open_orders(
         })?
         .clone();
 
-    let market_address = non_empty_query(req, "marketAddress").map(MarketAddress);
-    let symbol = non_empty_query(req, "symbol").map(Symbol);
-    // Map any limit-parse failure to MissingParameter so the documented
-    // -1102 fires for both out-of-range (e.g., 501) and unparseable
-    // (e.g., "abc") inputs. `optional_typed_query` distinguishes them
-    // structurally as InvalidParameter (-1130), which conflicts with the
-    // openOrders error contract.
-    let limit = optional_typed_query::<i64>(req, "limit")
-        .map_err(|_| ApiError::from(DomainError::MissingParameter))?;
-    // Cursor is the lex-comparable placed_chain_order value from a prior
-    // page response. An empty / whitespace-only `?cursor=` is treated as
-    // malformed (-1102 / 400) rather than "no cursor". The use case does
-    // the trim + non-empty check.
+    let market_address = non_blank_query(req, "marketAddress")?.map(MarketAddress);
+    let symbol = non_blank_query(req, "symbol")?.map(Symbol);
+    let market_filter = OrdersMarketFilter::pair(market_address, symbol).map_err(ApiError::from)?;
+    // status: raw CSV, validated by OrderStatusFilter::from_csv inside the
+    // use case. Absent / blank → "all statuses".
+    let status = req.query::<String>("status");
+    // `optional_typed_query` returns `Err(InvalidParameter)` when the
+    // raw value is present but unparseable (e.g. `limit=abc`). That maps
+    // to -1130 ("Invalid value for a query or body parameter") per the
+    // api-spec.md error table, which is the precise diagnosis for a
+    // non-numeric `limit`. Out-of-range numeric inputs (e.g. `limit=501`
+    // or `limit=0`) still come back as -1102 because the use case applies
+    // the `[1, 500]` bound check after parsing succeeds; see
+    // `DomainError::MissingParameter` for the Binance-shaped wire message.
+    let limit = optional_typed_query::<i64>(req, "limit")?;
+    // cursor: raw string forwarded to `OrdersCursor::new` inside the
+    // use case, which trims and rejects blank as `MissingParameter`.
+    // The blank-rejects-loudly contract lives in the cursor type, not
+    // at this call site; `marketAddress` / `symbol` enforce the same
+    // contract one layer up via `non_blank_query` because the use
+    // case never sees their raw strings.
     let cursor = req.query::<String>("cursor");
 
-    let use_case = GetOpenOrdersUseCase::new(state.repo);
+    let use_case = GetOrdersUseCase::new(state.repo);
     let page = use_case
-        .execute(&ctx, market_address, symbol, limit, cursor.as_deref())
+        .execute(GetOrdersInput {
+            owner_pn_address: ctx.trading_pn.pn_address.clone(),
+            market_filter,
+            status,
+            limit,
+            cursor,
+        })
         .await
         .map_err(|err| {
             if let Some(domain) = err.downcast_ref::<DomainError>() {
                 return ApiError::from(*domain);
             }
-            error!(?err, "get_open_orders failed");
+            error!(?err, "get_orders failed");
             ApiError::from(DomainError::Unexpected)
         })?;
 
-    Ok(Json(OpenOrdersPageResponse {
-        orders: page.orders.into_iter().map(open_order_to_dto).collect(),
-        next_cursor: page.next_cursor.map(|c| c.0),
+    Ok(Json(OrdersPageResponse {
+        orders: page.orders.into_iter().map(order_to_dto).collect(),
+        next_cursor: page.next_cursor.map(OrdersCursor::into_string),
     }))
 }
 
-fn open_order_to_dto(order: OpenOrder) -> OpenOrderResponse {
-    OpenOrderResponse {
-        market_address: order.market_address.0,
-        symbol: order.symbol.0,
-        order_id: order.order_id,
-        client_order_id: order.client_order_id,
-        price: order.price,
-        orig_qty: order.orig_qty,
-        executed_qty: order.executed_qty,
-        status: order.status.as_str(),
-        time_in_force: order.time_in_force.as_str(),
-        order_type: order.order_type.as_str(),
-        side: order.side.as_str(),
-        time: order.time,
-        update_time: order.update_time,
+fn order_to_dto(order: Order) -> OrderResponse {
+    let OrderParts {
+        market_address,
+        symbol,
+        order_id,
+        client_order_id,
+        price,
+        orig_qty,
+        executed_qty,
+        status,
+        time_in_force,
+        order_type,
+        side,
+        time,
+        update_time,
+        ..
+    } = order.into_parts();
+
+    OrderResponse {
+        market_address: market_address.0,
+        symbol: symbol.0,
+        order_id,
+        client_order_id,
+        price,
+        orig_qty,
+        executed_qty,
+        status: status.as_str(),
+        time_in_force: time_in_force.as_str(),
+        order_type: order_type.as_str(),
+        side: side.as_str(),
+        time,
+        update_time,
     }
 }
 
 fn non_empty_query(req: &mut Request, key: &str) -> Option<String> {
     req.query::<String>(key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Strict variant of [`non_empty_query`]: a present-but-blank value is
+/// rejected as `MissingParameter` instead of being silently collapsed
+/// to "absent". Mirrors `OrdersCursor::new`'s contract — a client that
+/// sends `?marketAddress=&symbol=` is signalling a bug (an unbound
+/// template variable), not "no filter". See read-api.md §error table.
+fn non_blank_query(req: &mut Request, key: &str) -> Result<Option<String>, ApiError> {
+    let Some(raw) = req.query::<String>(key) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::from(DomainError::MissingParameter));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// Parse an optional typed query parameter the strict way:
@@ -585,7 +636,7 @@ struct CreateOrderRequest {
 /// `PENDING_NEW` for a successful submission — the order is in the
 /// chain queue, not yet on the book). The full order shape with
 /// chain-assigned `orderId` becomes available through
-/// `GET /api/v1/openOrders` once `OrderBook.OrderPlaced` projects.
+/// `GET /api/v1/orders` once `OrderBook.OrderPlaced` projects.
 /// See `docs/tech-specs/write-api.md §Response` for the rationale.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -599,10 +650,10 @@ struct CreateOrderResponse {
 /// parallel to [`CreateOrderResponse`]: we only return facts the
 /// caller does not already have. `clientOrderId` is the value
 /// recorded on placement (`live_orders.client_order_id`) — useful
-/// for correlation with the prior POST. The final state arrives
-/// later through `/api/v1/openOrders` (the order disappears) and
-/// `/api/v1/allOrders` (CANCELED, or FILLED if matching raced the
-/// cancel). See `docs/tech-specs/write-api.md §Response` for
+/// for correlation with the prior POST. The final state —
+/// `CANCELED`, or `FILLED` if matching raced the cancel — becomes
+/// visible through `GET /api/v1/orders` once `OrderBook.OrderCancelled`
+/// projects. See `docs/tech-specs/write-api.md §Response` for
 /// `DELETE /api/v1/order`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -635,7 +686,7 @@ fn require_auth(depot: &Depot, permission: Permission) -> Result<&AuthContext, A
 /// three-field response (clientOrderId / transactTime / status) per
 /// [write-api.md §Response]. The chain-assigned `orderId` is not in
 /// this response by design — it arrives later through
-/// `GET /api/v1/openOrders` once the indexer projects
+/// `GET /api/v1/orders` once the indexer projects
 /// `OrderBook.OrderPlaced`.
 #[handler]
 async fn create_order(
@@ -802,7 +853,7 @@ pub fn build_router(state: AppState) -> Router {
                         .post(create_order)
                         .delete(delete_order),
                 )
-                .push(Router::with_path("api/v1/openOrders").get(get_open_orders)),
+                .push(Router::with_path("api/v1/orders").get(get_orders)),
         )
 }
 

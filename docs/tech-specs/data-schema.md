@@ -137,7 +137,7 @@ The actual events inside each EventList. Two writers:
 | `is_deleted` | `boolean` default `false` | Soft-delete flag for events that disappear from the EventList. |
 | `last_seen_at` | `timestamptz` | Updated on every projector pass that touches the row. |
 | `confirmed_pmp_address` | `text` | Set by the `EventConfirmed` event. Links an event to the PMP that markets it. |
-| `confirmed_at` | `timestamptz` | Stamp time (currently wall-clock; see review note in `docs/review-fixes-2026-05-11.md`). |
+| `confirmed_at` | `timestamptz` | Stamp time recorded when the projector observes the confirmation event. |
 | `meta_reconciled_at` | `timestamptz` | Per-row marker — set unconditionally by the OracleEventList reconciler after a successful getter pass, even when `describe`/`trust_addr` come back NULL on chain. Drives the pending-row predicate so legitimately-null fields don't cause infinite re-fetch. |
 | `created_at` / `updated_at` | `timestamptz` | Bookkeeping. |
 
@@ -166,7 +166,7 @@ One row per PMP (Prediction Market Pool) contract observed on chain. Discovered 
 | `token_code` | `text` | Quote-asset code (denormalised from `ref_tokens` for read speed). |
 | `event_id` | `numeric(78,0)` | Oracle event id this market resolves against. |
 | `oracle_list_hash` | `numeric(78,0)` | EventList hash used in OrderBook derivation. NULL pre-reconcile. |
-| `orderbook_address` | `text` | The deterministic OrderBook address returned by `PMP.getOrderBookAddress()`. Written by the market reconciler on the first successful pass, including pre-`PoolsFrozen` rows. Nullable only during the pre-reconcile window; Predicat  `last_reconciled_at IS NULL OR orderbook_address IS NOT NULL` enforces that every market visible to the API has a non-null `orderBookAddress`. A partial UNIQUE index on `orderbook_address WHERE orderbook_address IS NOT NULL`, pinning the contract-side per-market invariant — `/api/v1/openOrders` joins `live_orders` to `markets` on this column and relies on the at-most-one-row guarantee. |
+| `orderbook_address` | `text` | The deterministic OrderBook address returned by `PMP.getOrderBookAddress()`. Written by the market reconciler on the first successful pass, including pre-`PoolsFrozen` rows. Nullable only during the pre-reconcile window; the CHECK predicate `last_reconciled_at IS NULL OR orderbook_address IS NOT NULL` enforces that every market visible to the API has a non-null `orderBookAddress`. A partial UNIQUE index on `orderbook_address WHERE orderbook_address IS NOT NULL` pins the contract-side per-market invariant — `/api/v1/orders` joins `live_orders` to `markets` on this column and relies on the at-most-one-row guarantee. |
 | `approved` | `boolean` default `false` | Approval flag from `getDetails()`; flipped to `true` by the `TimingsSet` event. |
 | `is_cancelled` | `boolean` default `false` | On-chain cancellation flag from `getDetails()`. Either this or `cancelled_at` being set is enough to flip the derived status to `CANCELLED`. |
 | `stake_start` / `stake_end` / `result_start` / `result_end` | `bigint` (nullable) | Lifecycle timings (unix seconds). Written only by the `TimingsSet` event; reconciler does **not** touch these (H2 fix). NULL on all four = PENDING. |
@@ -191,7 +191,7 @@ Indices:
 | `markets_status_idx` (`approved, is_cancelled`) | Coarse status filters. |
 | `markets_pending_reconcile_idx` (partial: `last_reconciled_at IS NULL`) | Drives the market reconciler's pending-row SELECT. |
 | `markets_terminal_idx` (partial: `resolved_at IS NOT NULL OR cancelled_at IS NOT NULL`) | Terminal-status filters. |
-| `markets_orderbook_address_unique` (partial UNIQUE: `orderbook_address IS NOT NULL`) | Pins the per-market invariant; relied on by `/api/v1/openOrders`'s all-markets join. |
+| `markets_orderbook_address_unique` (partial UNIQUE: `orderbook_address IS NOT NULL`) | Pins the per-market invariant; relied on by `/api/v1/orders`'s all-markets join. |
 
 ### `market_outcomes`
 
@@ -218,10 +218,11 @@ Index: `market_outcomes_market_id_fk_idx` speeds up loading all outcome rows for
 ### `live_orders`
 
 Per-order read model backing `/api/v1/depth` and account-scoped
-`GET /api/v1/openOrders`. One row per chain-side order, mutated in place as
+`GET /api/v1/orders`. One row per chain-side order, mutated in place as
 `OrderPlaced`, `OrderFilled`, and `OrderCancelled` events arrive. Rows are never
-deleted — `FILLED` / `CANCELLED` entries remain to preserve cursor monotonicity (the depth
-handler reads `max(last_chain_order)` across **all** rows for the `(orderbook, outcome)` pair).
+deleted — `FILLED` / `CANCELLED` entries remain so that history queries and the depth
+handler (`max(last_chain_order)` across **all** rows for the `(orderbook, outcome)` pair)
+both see them.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -231,29 +232,35 @@ handler reads `max(last_chain_order)` across **all** rows for the `(orderbook, o
 | `is_buy` | `boolean` | Side. `true` = bid, `false` = ask. |
 | `price` | `numeric(78,0)` | Order price as the contract emitted it (raw uint256). Scaled to a decimal at API render time. |
 | `amount_initial` | `numeric(78,0)` | Original order quantity from `OrderBook.OrderPlaced`. Used with `amount_remaining` to render `origQty` and `executedQty` in account order endpoints. |
-| `amount_remaining` | `numeric(78,0)` | Quantity still open. Set by the `OrderPlaced` event, decremented by the `OrderFilled` event, zeroed by the `OrderCancelled` event. |
+| `amount_remaining` | `numeric(78,0)` | Quantity not yet filled. Set by the `OrderPlaced` event and decremented by the `OrderFilled` event. `OrderCancelled` preserves the current value as the cancelled remainder so `/api/v1/orders.executedQty` can be derived as `amount_initial - amount_remaining`; depth ignores the row because `status != 'OPEN'`. See the [orders cancel-remainder cutover note](../migrations/orders-cancel-remainder-cutover.md) for data-bearing deployment guidance. |
 | `client_order_id` | `text` | Optional client-supplied id. |
 | `owner_pn_address` | `text` | Trading PrivateNote address that owns the order. Initially NULL from `OrderBook.OrderPlaced`; attached by `PrivateNote.OrderPlacedConfirmed` using the event source address. NULL rows can still contribute to public depth, but cannot appear in account-scoped order responses. |
-| `status` | `text` CHECK `IN ('OPEN', 'FILLED', 'CANCELLED')` | Order lifecycle. Depth aggregation filters on `status = 'OPEN' AND amount_remaining > 0`. |
+| `status` | `text` CHECK `IN ('OPEN', 'FILLED', 'CANCELLED')` | Order lifecycle. Depth aggregation filters on `status = 'OPEN' AND amount_remaining > 0`. The CHECK is extended to include `'REJECTED'` by the contracts-side follow-up documented in [read-api.md §REJECTED — future work](read-api.md#rejected--future-work); until then no row carries that value. |
 | `last_chain_order` | `text` NOT NULL | Chain-order key (`msg_chain_order` from the gateway) of the most recent OrderBook event that touched this order. Lex-monotonic via `greatest(existing, new)` on OrderBook writes. Feeds `lastUpdateId` in depth responses as a STRING. |
-| `chain_created_at` | `timestamptz` | On-chain block time of the originating `OrderBook.OrderPlaced`. Drives `time` in `/api/v1/openOrders`. Display-only. NULL for pre-migration rows. |
-| `chain_updated_at` | `timestamptz` | On-chain block time of the most recent order book event that affected the order — OrderPlaced, OrderFilled, OrderCancelled. Advanced via greatest(...). Drives updateTime in /api/v1/openOrders. Display-only. NULL for pre-migration rows. |
-| `placed_chain_order` | `text not null` | `msg_chain_order` of the `OrderPlaced` event that created the row. First-write-wins (`coalesce` on conflict). Sole sort key + cursor for `/api/v1/openOrders`. |
+| `chain_created_at` | `timestamptz` | On-chain block time of the originating `OrderBook.OrderPlaced`. Drives `time` in `/api/v1/orders`. Display-only. NULL for pre-migration rows. |
+| `chain_updated_at` | `timestamptz` | On-chain block time of the most recent order book event that affected the order — OrderPlaced, OrderFilled, OrderCancelled. Advanced via greatest(...). Drives updateTime in /api/v1/orders. Display-only. NULL for pre-migration rows. |
+| `placed_chain_order` | `text not null` | `msg_chain_order` of the `OrderPlaced` event that created the row. First-write-wins (`coalesce` on conflict). Sole sort key + cursor for `/api/v1/orders` (DESC). |
 | `created_at` / `updated_at` | `timestamptz` | Bookkeeping. |
 
 Index: `live_orders_open_book_idx` — partial index on `(orderbook_address, outcome_id, is_buy, price DESC)` with predicate `status = 'OPEN'`. Sized for the depth query: top-N price levels per side and outcome.
 
-Index: `live_orders_open_owner_idx` — partial index on `(owner_pn_address, placed_chain_order)`
-with predicate `owner_pn_address IS NOT NULL AND status = 'OPEN' AND amount_remaining > 0`.
+Index: `live_orders_owner_idx` — partial index on `(owner_pn_address, placed_chain_order DESC)`
+with predicate `owner_pn_address IS NOT NULL AND chain_created_at IS NOT NULL`.
 
-Serves as the seek path for the cursor-based `/api/v1/openOrders` query: a single-
-column lexicographic range scan over `placed_chain_order`. The partial predicate
-confines the index to rows the endpoint can return.
+Serves as the seek path for the cursor-based `/api/v1/orders` query (DESC by chain-order): a single-
+column lexicographic range scan over `placed_chain_order`. The partial predicate confines the index
+to owner-attributed rows whose timestamps are renderable. Status filtering (`OPEN` vs `FILLED` vs
+`CANCELLED` vs the future `REJECTED`) is intentionally a heap-side predicate so that one index
+covers both the default "all statuses" query and any CSV-driven subset; per-owner row counts are
+small enough that this is cheaper than maintaining a wider composite index.
 
-The `chain_created_at IS NOT NULL AND chain_updated_at IS NOT NULL` conditions
-previously attached to this index were moved into the SQL query as heap filters,
-keeping the index independent of the display-only timestamp columns. This avoids
-unnecessary index maintenance when `chain_updated_at` advances on every `OrderFilled` event.
+The `chain_updated_at IS NOT NULL` condition stays in the SQL query as a heap filter, keeping the
+index independent of a display-only timestamp column that advances on every `OrderFilled` event.
+
+Cancel projection preserves [`amount_remaining`](#live_orders), so
+`executedQty = amount_initial - amount_remaining` holds across cancellation.
+Data-bearing cutover guidance lives in
+[`orders-cancel-remainder-cutover.md`](../migrations/orders-cancel-remainder-cutover.md).
 
 ### `order_book_snapshots`
 
@@ -319,5 +326,6 @@ Every schema change ships as a new numbered migration file. Conventions:
 - For new columns, prefer `add column if not exists` with a sensible default — never break startup on an empty database.
 - Partial indices are preferred over full ones for "pending row" predicates; they shrink with reconciliation progress.
 - Add a header comment on every migration explaining *why* the change is needed and which code path requires it. Migrations are read by reviewers and operators as much as the code is.
+- Pre-deploy check: index builds inside sqlx transactions can block writers until the build finishes. For hot tables, estimate the lock window from production row counts before deploying or run the change through a non-transactional migration path.
 
 The full migration set (`migrations/*.sql`) is the canonical reference; this document summarises intent but does not replace it.

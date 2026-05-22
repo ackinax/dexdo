@@ -18,8 +18,13 @@
 use std::env;
 use std::time::Duration;
 
+use dodex_application::MarketReadRepository;
+use dodex_application::OrderStatusFilter;
+use dodex_application::OrdersLimit;
+use dodex_application::OrdersQuery;
 use dodex_infrastructure::database;
 use dodex_infrastructure::indexer_repo::IndexerRepository;
+use dodex_infrastructure::postgres_repo::PostgresReadModelRepository;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -85,6 +90,42 @@ async fn processed_at_is_set(pool: &PgPool, msg_id: &str) -> bool {
         .fetch_one(pool)
         .await
         .expect("read processed_at")
+}
+
+async fn insert_reconciled_market(pool: &PgPool, pmp: &str, symbol: &str, book: &str) {
+    let market_id: i64 = sqlx::query_scalar(
+        r#"insert into markets
+               (pmp_address, market_id, name, token_type, token_code,
+                event_id, oracle_list_hash, orderbook_address,
+                stake_start, stake_end, result_start, result_end,
+                last_reconciled_at)
+           values ($1, $1, $1, 3, 'USDC',
+                   1::numeric, 0::numeric, $2,
+                   1700000100, 1700000200, 1700000300, 1700000400,
+                   now())
+           returning id"#,
+    )
+    .bind(pmp)
+    .bind(book)
+    .fetch_one(pool)
+    .await
+    .expect("insert market");
+
+    sqlx::query(
+        r#"insert into market_outcomes
+               (market_id_fk, pmp_address, outcome_id, outcome_name, symbol,
+                price_precision, quantity_precision, tick_size, step_size,
+                min_notional, max_batch_size)
+           values ($1, $2, 1, 'YES', $3,
+                   3, 2, '0.001', '0.01',
+                   '1.00', 100)"#,
+    )
+    .bind(market_id)
+    .bind(pmp)
+    .bind(symbol)
+    .execute(pool)
+    .await
+    .expect("insert market_outcomes");
 }
 
 #[tokio::test]
@@ -454,7 +495,7 @@ async fn orderplaced_confirmed_deferred_replays_and_attaches_owner() {
 #[tokio::test]
 async fn orderplaced_sets_chain_timestamps_from_event_time() {
     // Locks in the contract that apply_order_placed reads chain time off the
-    // EventNode rather than using `now()`. The API's openOrders.time / .updateTime
+    // EventNode rather than using `now()`. The API's orders.time / .updateTime
     // depend on these columns being set at projection time.
     let _guard = REPROJECTION_LOCK.lock().await;
     let Some(pool) = setup().await else { return };
@@ -662,7 +703,7 @@ async fn orderplaced_chain_created_at_is_first_write_wins() {
 #[tokio::test]
 async fn orderplaced_placed_chain_order_is_first_write_wins() {
     // A replayed OrderPlaced carrying a different msg_chain_order must
-    // NOT overwrite placed_chain_order. The cursor for /openOrders is
+    // NOT overwrite placed_chain_order. The cursor for /orders is
     // built from placed_chain_order, and a moving value would let a
     // paginated reader re-see an already-returned row.
     let _guard = REPROJECTION_LOCK.lock().await;
@@ -915,6 +956,685 @@ async fn ordercancelled_advances_chain_updated_at() {
 }
 
 #[tokio::test]
+async fn orderplaced_fill_cancel_pipeline_reports_partial_executed_qty() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let indexer = IndexerRepository::new(pool.clone());
+    let read_model = PostgresReadModelRepository::new(pool.clone());
+
+    let test = "reproj_partial_cancel_orders";
+    let orderbook_addr = format!("0:{test}_book");
+    let pmp = format!("0:{test}_pmp");
+    let symbol = format!("{test}_YES");
+    let owner_pn = format!("0:{test}_owner");
+    let order_id = "23";
+    let msg_id_place = format!("{test}-a-place-msg");
+    let msg_id_fill = format!("{test}-b-fill-msg");
+    let msg_id_cancel = format!("{test}-c-cancel-msg");
+    let msg_id_confirm = format!("{test}-d-confirm-msg");
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_place.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_fill.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_cancel.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_confirm.as_str()),
+            ("delete from market_outcomes where symbol = $1", symbol.as_str()),
+            ("delete from markets where pmp_address = $1", pmp.as_str()),
+        ],
+    )
+    .await;
+
+    insert_reconciled_market(&pool, &pmp, &symbol, &orderbook_addr).await;
+    insert_raw(
+        &pool,
+        &msg_id_place,
+        &orderbook_addr,
+        "OrderBook.OrderPlaced",
+        &json!({
+            "orderId": order_id,
+            "outcomeId": "1",
+            "isBuy": true,
+            "price": "100",
+            "amount": "1000",
+            "clientOrderId": "partial-cancel",
+        }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_id_fill,
+        &orderbook_addr,
+        "OrderBook.OrderFilled",
+        &json!({ "orderId": order_id, "filledAmount": "300" }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_id_cancel,
+        &orderbook_addr,
+        "OrderBook.OrderCancelled",
+        &json!({ "orderId": order_id }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_id_confirm,
+        &owner_pn,
+        "PrivateNote.OrderPlacedConfirmed",
+        &json!({ "orderBook": orderbook_addr, "orderId": order_id }),
+    )
+    .await;
+
+    indexer.reproject_pending(1000).await.expect("reproject");
+
+    let page = read_model
+        .list_orders(&OrdersQuery {
+            owner_pn_address: owner_pn,
+            market: None,
+            status: OrderStatusFilter::All,
+            limit: OrdersLimit::from_const(100),
+            cursor: None,
+        })
+        .await
+        .expect("list_orders");
+
+    assert_eq!(page.orders.len(), 1);
+    let order = &page.orders[0];
+    assert_eq!(order.status().as_str(), "CANCELED");
+    assert_eq!(order.orig_qty(), "10.00");
+    assert_eq!(
+        order.executed_qty(),
+        "3.00",
+        "executedQty must reflect the fill before cancellation, not the canceled remainder"
+    );
+    assert!(page.next_cursor.is_none());
+}
+
+/// Pins the "filled wins" race semantics promised by
+/// docs/tech-specs/write-api.md §Response. The chain contract should
+/// keep this case off the wire (`_doCancel` returns without emitting
+/// `OrderCancelled` once the order is gone from the book), but the
+/// projector must also fail closed: if both events do reach the
+/// indexer, the terminal status surfaced to clients is `FILLED`, not
+/// `CANCELED`.
+#[tokio::test]
+async fn orderplaced_full_fill_then_cancel_keeps_filled_status() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let indexer = IndexerRepository::new(pool.clone());
+    let read_model = PostgresReadModelRepository::new(pool.clone());
+
+    let test = "reproj_full_fill_then_cancel";
+    let orderbook_addr = format!("0:{test}_book");
+    let pmp = format!("0:{test}_pmp");
+    let symbol = format!("{test}_YES");
+    let owner_pn = format!("0:{test}_owner");
+    let order_id = "24";
+    let msg_id_place = format!("{test}-a-place-msg");
+    let msg_id_fill = format!("{test}-b-fill-msg");
+    let msg_id_cancel = format!("{test}-c-cancel-msg");
+    let msg_id_confirm = format!("{test}-d-confirm-msg");
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_place.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_fill.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_cancel.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_confirm.as_str()),
+            ("delete from market_outcomes where symbol = $1", symbol.as_str()),
+            ("delete from markets where pmp_address = $1", pmp.as_str()),
+        ],
+    )
+    .await;
+
+    insert_reconciled_market(&pool, &pmp, &symbol, &orderbook_addr).await;
+    insert_raw(
+        &pool,
+        &msg_id_place,
+        &orderbook_addr,
+        "OrderBook.OrderPlaced",
+        &json!({
+            "orderId": order_id,
+            "outcomeId": "1",
+            "isBuy": true,
+            "price": "100",
+            "amount": "1000",
+            "clientOrderId": "full-fill-then-cancel",
+        }),
+    )
+    .await;
+    // Full fill — amount_remaining hits 0 and status flips to FILLED.
+    insert_raw(
+        &pool,
+        &msg_id_fill,
+        &orderbook_addr,
+        "OrderBook.OrderFilled",
+        &json!({ "orderId": order_id, "filledAmount": "1000" }),
+    )
+    .await;
+    // OrderCancelled arrives after the full fill — must NOT regress
+    // status to CANCELLED.
+    insert_raw(
+        &pool,
+        &msg_id_cancel,
+        &orderbook_addr,
+        "OrderBook.OrderCancelled",
+        &json!({ "orderId": order_id }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_id_confirm,
+        &owner_pn,
+        "PrivateNote.OrderPlacedConfirmed",
+        &json!({ "orderBook": orderbook_addr, "orderId": order_id }),
+    )
+    .await;
+
+    indexer.reproject_pending(1000).await.expect("reproject");
+
+    let page = read_model
+        .list_orders(&OrdersQuery {
+            owner_pn_address: owner_pn,
+            market: None,
+            status: OrderStatusFilter::All,
+            limit: OrdersLimit::from_const(100),
+            cursor: None,
+        })
+        .await
+        .expect("list_orders");
+
+    assert_eq!(page.orders.len(), 1);
+    let order = &page.orders[0];
+    assert_eq!(
+        order.status().as_str(),
+        "FILLED",
+        "filled wins: a cancel arriving after a full fill must not demote the row to CANCELED"
+    );
+    assert_eq!(order.orig_qty(), "10.00");
+    assert_eq!(order.executed_qty(), "10.00", "fully filled");
+    assert!(page.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn orderplaced_cancel_then_fill_keeps_canceled_status_and_remainder() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let indexer = IndexerRepository::new(pool.clone());
+    let read_model = PostgresReadModelRepository::new(pool.clone());
+
+    let test = "reproj_orderplaced_cancel_then_fill";
+    let pmp = format!("0:{test}_pmp");
+    let symbol = format!("{test}_YES");
+    let orderbook_addr = format!("0:{test}_book");
+    let owner_pn = format!("0:{test}_owner");
+    let order_id = "51";
+    let msg_id_place = format!("{test}-aplace-msg");
+    let msg_id_cancel = format!("{test}-bcancel-msg");
+    let msg_id_fill = format!("{test}-cfill-msg");
+    let msg_id_confirm = format!("{test}-dconfirm-msg");
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_place.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_cancel.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_fill.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_confirm.as_str()),
+            ("delete from market_outcomes where symbol = $1", symbol.as_str()),
+            ("delete from markets where pmp_address = $1", pmp.as_str()),
+        ],
+    )
+    .await;
+
+    insert_reconciled_market(&pool, &pmp, &symbol, &orderbook_addr).await;
+    insert_raw(
+        &pool,
+        &msg_id_place,
+        &orderbook_addr,
+        "OrderBook.OrderPlaced",
+        &json!({
+            "orderId": order_id,
+            "outcomeId": "1",
+            "isBuy": true,
+            "price": "100",
+            "amount": "1000",
+            "clientOrderId": "cancel-then-fill",
+        }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_id_cancel,
+        &orderbook_addr,
+        "OrderBook.OrderCancelled",
+        &json!({ "orderId": order_id }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_id_fill,
+        &orderbook_addr,
+        "OrderBook.OrderFilled",
+        &json!({ "orderId": order_id, "filledAmount": "1000" }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_id_confirm,
+        &owner_pn,
+        "PrivateNote.OrderPlacedConfirmed",
+        &json!({ "orderBook": orderbook_addr, "orderId": order_id }),
+    )
+    .await;
+
+    indexer.reproject_pending(1000).await.expect("reproject");
+
+    let page = read_model
+        .list_orders(&OrdersQuery {
+            owner_pn_address: owner_pn,
+            market: None,
+            status: OrderStatusFilter::All,
+            limit: OrdersLimit::from_const(100),
+            cursor: None,
+        })
+        .await
+        .expect("list_orders");
+
+    assert_eq!(page.orders.len(), 1);
+    let order = &page.orders[0];
+    assert_eq!(order.status().as_str(), "CANCELED");
+    assert_eq!(order.orig_qty(), "10.00");
+    assert_eq!(
+        order.executed_qty(),
+        "0.00",
+        "a stale fill after cancellation must not erase the canceled remainder"
+    );
+    assert!(page.next_cursor.is_none());
+
+    // executed_qty is `greatest(amount_initial - amount_remaining, 0)` in
+    // SQL, so a co-mutation of `amount_initial` (kept = 1000) and
+    // `amount_remaining` (zeroed by a stale fill) would still render
+    // executed_qty = 0. Assert the stored `amount_remaining` directly
+    // to pin the storage truth.
+    let amount_remaining: String = sqlx::query_scalar(
+        "select amount_remaining::text from live_orders
+              where orderbook_address = $1 and order_id = $2::numeric",
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read amount_remaining");
+    assert_eq!(
+        amount_remaining, "1000",
+        "OrderCancelled before OrderFilled preserves the unfilled remainder",
+    );
+}
+
+#[tokio::test]
+async fn orderfilled_on_filled_row_preserves_remainder() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let indexer = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_fill_filled_guard";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_fill = format!("{test}-fill-msg");
+    let order_id = "77";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_fill.as_str()),
+        ],
+    )
+    .await;
+
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 1000::numeric,
+                   300::numeric, 55::numeric, '0:filled-owner', 'FILLED',
+                   '5f80000000000000000000000000000001',
+                   '5f80000000000000000000000000000001',
+                   to_timestamp(1700000000), to_timestamp(1700000000))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("insert filled row");
+
+    // Event timestamp strictly later than the seeded chain_updated_at
+    // (1_700_000_000s) so the unconditional `greatest(...)` form would
+    // move chain_updated_at forward. The CASE in apply_order_filled must
+    // hold it at the seed value because the row is already FILLED.
+    insert_raw_with_ts(
+        &pool,
+        &msg_id_fill,
+        &orderbook_addr,
+        "OrderBook.OrderFilled",
+        1_700_001_000,
+        &json!({ "orderId": order_id, "filledAmount": "100" }),
+    )
+    .await;
+
+    indexer.reproject_pending(1000).await.expect("reproject");
+
+    let (status, amount_remaining, chain_updated_ms, last_chain_order): (
+        String,
+        String,
+        i64,
+        String,
+    ) = sqlx::query_as(
+        r#"select status,
+                      amount_remaining::text,
+                      (extract(epoch from chain_updated_at) * 1000)::bigint,
+                      last_chain_order
+                 from live_orders where orderbook_address = $1"#,
+    )
+    .bind(&orderbook_addr)
+    .fetch_one(&pool)
+    .await
+    .expect("read row");
+
+    assert_eq!(status, "FILLED");
+    assert_eq!(amount_remaining, "300", "stale fill must not mutate terminal remainder");
+    assert_eq!(
+        chain_updated_ms, 1_700_000_000_000,
+        "stale fill on terminal row must not move public updateTime",
+    );
+    // last_chain_order is gated by the same terminal CASE — a stale
+    // fill must not move /depth lastUpdateId for the pair either.
+    assert_eq!(
+        last_chain_order, "5f80000000000000000000000000000001",
+        "stale fill on terminal row must not advance last_chain_order",
+    );
+}
+
+#[tokio::test]
+async fn ordercancelled_does_not_rewrite_rejected_row() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let indexer = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_cancel_rejected_guard";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_cancel = format!("{test}-cancel-msg");
+    let order_id = "0";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_cancel.as_str()),
+        ],
+    )
+    .await;
+
+    sqlx::query("alter table live_orders drop constraint if exists live_orders_status_check")
+        .execute(&pool)
+        .await
+        .expect("drop status check for future-status fixture");
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 1000::numeric,
+                   0::numeric, 55::numeric, '0:rejected-owner', 'REJECTED',
+                   '5f80000000000000000000000000000001',
+                   '5f80000000000000000000000000000001',
+                   to_timestamp(1700000000), to_timestamp(1700000000))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("insert rejected row");
+
+    // Event timestamp strictly later than the seeded chain_updated_at so
+    // a regression to an unconditional `greatest(...)` on chain_updated_at
+    // would move the public updateTime; the CASE must keep it pinned to
+    // the seed value because the row is REJECTED.
+    insert_raw_with_ts(
+        &pool,
+        &msg_id_cancel,
+        &orderbook_addr,
+        "OrderBook.OrderCancelled",
+        1_700_001_000,
+        &json!({ "orderId": order_id }),
+    )
+    .await;
+
+    let result = indexer.reproject_pending(1000).await;
+
+    // Capture the read result without panicking — the CHECK constraint must
+    // be restored before any assertion fires, or a failure here would leak
+    // a constraint-less table into every subsequent test in the suite.
+    let row_result: Result<(String, i64, String), sqlx::Error> = sqlx::query_as(
+        r#"select status,
+                  (extract(epoch from chain_updated_at) * 1000)::bigint,
+                  last_chain_order
+             from live_orders where orderbook_address = $1"#,
+    )
+    .bind(&orderbook_addr)
+    .fetch_one(&pool)
+    .await;
+
+    sqlx::query(
+        "update live_orders set status = 'OPEN' where orderbook_address = $1 and status = 'REJECTED'",
+    )
+    .bind(&orderbook_addr)
+    .execute(&pool)
+    .await
+    .expect("restore row status before constraint");
+    sqlx::query(
+        r#"alter table live_orders
+             add constraint live_orders_status_check
+             check (status in ('OPEN', 'FILLED', 'CANCELLED'))"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("restore status check");
+
+    let (status, chain_updated_ms, last_chain_order) =
+        row_result.expect("read status + chain_updated_at + last_chain_order");
+    result.expect("reproject");
+    assert_eq!(status, "REJECTED", "cancel projector must preserve future rejected rows");
+    assert_eq!(
+        chain_updated_ms, 1_700_000_000_000,
+        "stale cancel on terminal row must not move public updateTime",
+    );
+    assert_eq!(
+        last_chain_order, "5f80000000000000000000000000000001",
+        "stale cancel on terminal row must not advance last_chain_order",
+    );
+}
+
+/// A duplicate `OrderCancelled` arriving on an already-`CANCELLED`
+/// row must be a true no-op — status was already correct, and the
+/// row's `last_chain_order` / `chain_updated_at` must NOT advance via
+/// `greatest()`, since that would move `/depth lastUpdateId` and
+/// `/orders updateTime` for an event the public state ignores. The
+/// existing `apply_order_filled` terminal-row guard already gates on
+/// `('FILLED', 'CANCELLED', 'REJECTED')`; this test pins the symmetric
+/// behaviour for `apply_order_cancelled`.
+#[tokio::test]
+async fn ordercancelled_is_noop_on_already_canceled_row() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let indexer = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_cancel_canceled_guard";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_cancel = format!("{test}-cancel-msg");
+    let order_id = "80";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_cancel.as_str()),
+        ],
+    )
+    .await;
+
+    // Seed a CANCELLED row with a known last_chain_order and
+    // chain_updated_at. The duplicate cancel event below carries a
+    // strictly-later chain timestamp and chain_order; the four
+    // mutation columns must all be held.
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 1000::numeric,
+                   400::numeric, 9::numeric, '0:canceled-owner', 'CANCELLED',
+                   '5f80000000000000000000000000000080',
+                   '5f80000000000000000000000000000080',
+                   to_timestamp(1700000000), to_timestamp(1700000500))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("seed CANCELLED row");
+
+    // Strictly-later raw event timestamp + chain_order. Without the
+    // 'CANCELLED' added to the terminal set, both last_chain_order
+    // and chain_updated_at would advance via greatest().
+    insert_raw_with_ts(
+        &pool,
+        &msg_id_cancel,
+        &orderbook_addr,
+        "OrderBook.OrderCancelled",
+        1_700_001_000,
+        &json!({ "orderId": order_id }),
+    )
+    .await;
+
+    indexer.reproject_pending(1000).await.expect("reproject");
+
+    let (status, amount_remaining, chain_updated_ms, last_chain_order): (
+        String,
+        String,
+        i64,
+        String,
+    ) = sqlx::query_as(
+        r#"select status,
+                      amount_remaining::text,
+                      (extract(epoch from chain_updated_at) * 1000)::bigint,
+                      last_chain_order
+                 from live_orders where orderbook_address = $1"#,
+    )
+    .bind(&orderbook_addr)
+    .fetch_one(&pool)
+    .await
+    .expect("read row");
+
+    assert_eq!(status, "CANCELLED");
+    assert_eq!(amount_remaining, "400", "amount_remaining preserved");
+    assert_eq!(
+        chain_updated_ms, 1_700_000_500_000,
+        "duplicate cancel on CANCELLED row must not move public updateTime",
+    );
+    assert_eq!(
+        last_chain_order, "5f80000000000000000000000000000080",
+        "duplicate cancel on CANCELLED row must not advance last_chain_order",
+    );
+}
+
+#[tokio::test]
+async fn orderfilled_does_not_rewrite_rejected_row() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let indexer = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_fill_rejected_guard";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_fill = format!("{test}-fill-msg");
+    let order_id = "0";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_fill.as_str()),
+        ],
+    )
+    .await;
+
+    sqlx::query("alter table live_orders drop constraint if exists live_orders_status_check")
+        .execute(&pool)
+        .await
+        .expect("drop status check for future-status fixture");
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 1000::numeric,
+                   0::numeric, 55::numeric, '0:rejected-owner', 'REJECTED',
+                   '5f80000000000000000000000000000001',
+                   '5f80000000000000000000000000000001',
+                   to_timestamp(1700000000), to_timestamp(1700000000))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("insert rejected row");
+
+    insert_raw(
+        &pool,
+        &msg_id_fill,
+        &orderbook_addr,
+        "OrderBook.OrderFilled",
+        &json!({ "orderId": order_id, "filledAmount": "100" }),
+    )
+    .await;
+
+    let result = indexer.reproject_pending(1000).await;
+
+    let status_result: Result<String, sqlx::Error> =
+        sqlx::query_scalar("select status from live_orders where orderbook_address = $1")
+            .bind(&orderbook_addr)
+            .fetch_one(&pool)
+            .await;
+
+    sqlx::query(
+        "update live_orders set status = 'OPEN' where orderbook_address = $1 and status = 'REJECTED'",
+    )
+    .bind(&orderbook_addr)
+    .execute(&pool)
+    .await
+    .expect("restore row status before constraint");
+    sqlx::query(
+        r#"alter table live_orders
+             add constraint live_orders_status_check
+             check (status in ('OPEN', 'FILLED', 'CANCELLED'))"#,
+    )
+    .execute(&pool)
+    .await
+    .expect("restore status check");
+
+    let status = status_result.expect("read status");
+    result.expect("reproject");
+    assert_eq!(status, "REJECTED", "fill projector must preserve future rejected rows");
+}
+
+#[tokio::test]
 async fn orderplaced_confirmed_is_idempotent_when_already_attributed() {
     // The PN-confirm projector must not overwrite an existing owner_pn_address
     // (defence against a second confirmation event with a different src landing
@@ -985,4 +1705,373 @@ async fn orderplaced_confirmed_is_idempotent_when_already_attributed() {
     .await
     .expect("read owner");
     assert_eq!(owner, original_owner, "owner must not change once attributed");
+}
+
+#[tokio::test]
+async fn orderplaced_replay_refused_on_terminal_row() {
+    // Pins the ON CONFLICT WHERE guard at apply_order_placed: a stale
+    // OrderPlaced replay landing on a row that is already FILLED /
+    // CANCELLED / REJECTED is treated as a no-op so an isolated
+    // partial replay cannot demote the public status back to OPEN.
+    // The wipe-and-reproject path documented in
+    // docs/migrations/orders-cancel-remainder-cutover.md is unaffected
+    // because step 2 (`delete`) ensures the row does not yet exist when
+    // OrderPlaced lands.
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_orderplaced_replay_refused_on_terminal";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_place = format!("{test}-place-msg");
+    let order_id = "77";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_place.as_str()),
+        ],
+    )
+    .await;
+
+    // Seed a terminal row directly. amount_remaining=0 and status=FILLED
+    // mimic a fully-filled order whose lifecycle was previously projected.
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 50::numeric,
+                   0::numeric, 9::numeric, '0:terminal-owner', 'FILLED',
+                   '5f80000000000000000000000000000077',
+                   '5f80000000000000000000000000000077',
+                   to_timestamp(1700000000), to_timestamp(1700000500))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("seed FILLED row");
+
+    insert_raw(
+        &pool,
+        &msg_id_place,
+        &orderbook_addr,
+        "OrderBook.OrderPlaced",
+        &json!({
+            "orderId": order_id, "outcomeId": "1", "isBuy": true,
+            "price": "100", "amount": "50", "clientOrderId": "9",
+        }),
+    )
+    .await;
+
+    repo.reproject_pending(1000).await.expect("reproject");
+
+    let (status, amount_remaining): (String, String) = sqlx::query_as(
+        r#"select status, amount_remaining::text
+             from live_orders
+            where orderbook_address = $1 and order_id = $2::numeric"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read terminal row");
+
+    assert_eq!(status, "FILLED", "WHERE-guarded ON CONFLICT preserves terminal status");
+    assert_eq!(
+        amount_remaining, "0",
+        "WHERE-guarded ON CONFLICT preserves terminal amount_remaining"
+    );
+}
+
+/// A sentinel-shape row (`status='OPEN'` with `amount_remaining=0`,
+/// produced by an operator edit or a legacy projector) must not be
+/// auto-healed to FILLED by an incoming `OrderFilled`. The status CASE
+/// in `apply_order_filled` short-circuits when `lo.amount_remaining =
+/// 0`, so the row stays OPEN+0 — invisible to /orders via the
+/// `fully_filled` guard in `order_from_row` — and a non-zero
+/// `filled_amount` cannot fabricate a full fill that the chain never
+/// emitted.
+#[tokio::test]
+async fn orderfilled_does_not_auto_heal_sentinel_row() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_orderfilled_sentinel_row";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_fill = format!("{test}-fill-msg");
+    let order_id = "79";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_fill.as_str()),
+        ],
+    )
+    .await;
+
+    // Sentinel row: status='OPEN' AND amount_remaining=0. Pre-fix, any
+    // positive filled_amount would satisfy `0 - x <= 0` in the status
+    // CASE and flip status to FILLED, surfacing the row as a fake
+    // fully-filled order with executed_qty = amount_initial.
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 100::numeric,
+                   0::numeric, 9::numeric, '0:sentinel-owner', 'OPEN',
+                   '5f80000000000000000000000000000079',
+                   '5f80000000000000000000000000000079',
+                   to_timestamp(1700000000), to_timestamp(1700000500))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("seed sentinel row");
+
+    insert_raw(
+        &pool,
+        &msg_id_fill,
+        &orderbook_addr,
+        "OrderBook.OrderFilled",
+        &json!({ "orderId": order_id, "filledAmount": "60" }),
+    )
+    .await;
+
+    repo.reproject_pending(1000).await.expect("reproject");
+
+    let (status, amount_remaining): (String, String) = sqlx::query_as(
+        r#"select status, amount_remaining::text
+             from live_orders
+            where orderbook_address = $1 and order_id = $2::numeric"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read sentinel row");
+
+    assert_eq!(status, "OPEN", "sentinel row must not auto-heal to FILLED");
+    assert_eq!(amount_remaining, "0", "sentinel row's amount_remaining stays clamped at 0",);
+}
+
+/// The ON CONFLICT WHERE guard also refuses to overwrite a
+/// partially-filled OPEN row. Without the `amount_remaining =
+/// amount_initial` conjunct, replaying `OrderPlaced` alone against a
+/// partial-fill row would silently reset `amount_remaining` back to
+/// `amount_initial` and erase the fill history.
+#[tokio::test]
+async fn orderplaced_replay_refused_on_partial_fill_row() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_orderplaced_replay_refused_on_partial_fill";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_place = format!("{test}-place-msg");
+    let order_id = "78";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_place.as_str()),
+        ],
+    )
+    .await;
+
+    // Seed a partial-fill OPEN row directly: amount_initial=100,
+    // amount_remaining=40 (i.e., 60 already filled). status stays OPEN
+    // because the order is not yet fully filled.
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 100::numeric,
+                   40::numeric, 9::numeric, '0:partial-fill-owner', 'OPEN',
+                   '5f80000000000000000000000000000078',
+                   '5f80000000000000000000000000000078',
+                   to_timestamp(1700000000), to_timestamp(1700000500))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("seed partial-fill row");
+
+    insert_raw(
+        &pool,
+        &msg_id_place,
+        &orderbook_addr,
+        "OrderBook.OrderPlaced",
+        &json!({
+            "orderId": order_id, "outcomeId": "1", "isBuy": true,
+            "price": "100", "amount": "100", "clientOrderId": "9",
+        }),
+    )
+    .await;
+
+    repo.reproject_pending(1000).await.expect("reproject");
+
+    let (status, amount_remaining): (String, String) = sqlx::query_as(
+        r#"select status, amount_remaining::text
+             from live_orders
+            where orderbook_address = $1 and order_id = $2::numeric"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read partial-fill row");
+
+    assert_eq!(status, "OPEN", "partial-fill row stays OPEN");
+    assert_eq!(
+        amount_remaining, "40",
+        "ON CONFLICT must not overwrite amount_remaining on a partial-fill row",
+    );
+}
+
+/// `apply_order_placed_confirmed` must refuse a confirmation event
+/// whose `src` is empty. Without the explicit empty-string filter,
+/// `as_deref().context(...)` would only catch `None`, an empty `src`
+/// would bind `owner_pn_address = ""` into `live_orders`, and the row
+/// would be unreachable from any `/orders` query
+/// (`owner_pn_address = $caller_pn` never matches) or
+/// `resolve_for_cancel` (same predicate). The reproject loop reports
+/// the event as failed and the existing OrderBook row keeps its
+/// NULL owner — recoverable by a well-formed replay.
+#[tokio::test]
+async fn orderplaced_confirmed_rejects_empty_src() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_orderplaced_confirmed_empty_src";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_confirm = format!("{test}-confirm-msg");
+    let order_id = "81";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_confirm.as_str()),
+        ],
+    )
+    .await;
+
+    // Seed an OrderBook-produced row with NULL owner (typical state
+    // before the PrivateNote confirmation arrives).
+    sqlx::query(
+        r#"insert into live_orders
+             (orderbook_address, order_id, outcome_id, is_buy, price, amount_initial,
+              amount_remaining, client_order_id, owner_pn_address, status,
+              placed_chain_order, last_chain_order, chain_created_at, chain_updated_at)
+           values ($1, $2::numeric, 1::numeric, true, 100::numeric, 1000::numeric,
+                   1000::numeric, 9::numeric, NULL, 'OPEN',
+                   '5f80000000000000000000000000000081',
+                   '5f80000000000000000000000000000081',
+                   to_timestamp(1700000000), to_timestamp(1700000000))"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("seed unattributed OrderBook row");
+
+    // Raw event with empty src_address — the bug path.
+    sqlx::query(
+        r#"insert into raw_events
+               (msg_id, chain_order, created_at_chain, src_address, dst_address,
+                event_type, body_json, decoded)
+           values ($1, $2, to_timestamp(1700000500), '', '',
+                   'PrivateNote.OrderPlacedConfirmed', '{}'::jsonb, $3)"#,
+    )
+    .bind(&msg_id_confirm)
+    .bind(format!("5f80{msg_id_confirm:0>28}"))
+    .bind(json!({ "orderBook": orderbook_addr, "orderId": order_id }))
+    .execute(&pool)
+    .await
+    .expect("insert raw event with empty src");
+
+    let stats = repo.reproject_pending(1000).await.expect("reproject");
+    assert_eq!(
+        stats.failed, 1,
+        "empty-src OrderPlacedConfirmed must be reported as a failed projection",
+    );
+
+    let owner: Option<String> = sqlx::query_scalar(
+        r#"select owner_pn_address from live_orders
+            where orderbook_address = $1 and order_id = $2::numeric"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read row owner");
+    assert!(
+        owner.is_none(),
+        "owner_pn_address must remain NULL — empty string is not a legal attribution",
+    );
+}
+
+/// `apply_order_placed` accepts `clientOrderId` only as a string (or
+/// `None` / `null`). A non-string JSON payload is schema drift, not a
+/// legitimate "no clientOrderId" — the four-arm match must reject the
+/// event so the user-correlatable id never silently lands NULL. The
+/// reproject loop reports it as failed and the live_orders row is
+/// never created.
+#[tokio::test]
+async fn orderplaced_rejects_non_string_client_order_id() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_orderplaced_non_string_coid";
+    let orderbook_addr = format!("0:{test}_book");
+    let msg_id_place = format!("{test}-place-msg");
+    let order_id = "88";
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook_addr.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_id_place.as_str()),
+        ],
+    )
+    .await;
+
+    insert_raw(
+        &pool,
+        &msg_id_place,
+        &orderbook_addr,
+        "OrderBook.OrderPlaced",
+        // clientOrderId as integer 12345 — schema drift, not absent.
+        &json!({
+            "orderId": order_id, "outcomeId": "1", "isBuy": true,
+            "price": "100", "amount": "50", "clientOrderId": 12345,
+        }),
+    )
+    .await;
+
+    let stats = repo.reproject_pending(1000).await.expect("reproject");
+    assert_eq!(stats.failed, 1, "non-string clientOrderId must be reported as a failed projection");
+
+    let row_count: i64 = sqlx::query_scalar(
+        r#"select count(*) from live_orders
+            where orderbook_address = $1 and order_id = $2::numeric"#,
+    )
+    .bind(&orderbook_addr)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count live_orders");
+    assert_eq!(row_count, 0, "no live_orders row may materialise when clientOrderId is non-string",);
 }

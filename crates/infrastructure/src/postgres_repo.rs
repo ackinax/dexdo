@@ -13,10 +13,13 @@ use dodex_application::MarketReadRepository;
 use dodex_application::MarketsListing;
 use dodex_application::MarketsRequest;
 use dodex_application::MarketsSort;
-use dodex_application::OpenOrdersCursor;
-use dodex_application::OpenOrdersPage;
-use dodex_application::OpenOrdersQuery;
 use dodex_application::OrderForCancel;
+use dodex_application::OrderStatusFilter;
+use dodex_application::OrdersCursor;
+use dodex_application::OrdersPage;
+use dodex_application::OrdersQuery;
+use dodex_application::QueryableOrderStatus;
+use dodex_domain::decimal_string_is_zero;
 use dodex_domain::CancelReason;
 use dodex_domain::DepthSnapshot;
 use dodex_domain::DomainError;
@@ -26,10 +29,11 @@ use dodex_domain::MarketEvent;
 use dodex_domain::MarketName;
 use dodex_domain::MarketStatus;
 use dodex_domain::MarketsPage;
-use dodex_domain::OpenOrder;
-use dodex_domain::OpenOrderStatus;
 use dodex_domain::OracleEntry;
+use dodex_domain::Order;
+use dodex_domain::OrderIdentity;
 use dodex_domain::OrderSide;
+use dodex_domain::OrderStatus;
 use dodex_domain::OrderType;
 use dodex_domain::Outcome;
 use dodex_domain::PriceLevel;
@@ -40,6 +44,7 @@ use dodex_domain::TimeInForce;
 use dodex_domain::Timings;
 use num_bigint::BigUint;
 use sqlx::PgPool;
+use tracing::error;
 use tracing::warn;
 
 #[derive(Debug, Clone)]
@@ -466,15 +471,12 @@ impl MarketReadRepository for PostgresReadModelRepository {
             event_id: row.event_id,
             oracle_list_hash,
             token_type: row.token_type,
-            status,
+            market_status: status,
             client_order_id,
         })
     }
 
-    async fn list_open_orders(
-        &self,
-        query: &OpenOrdersQuery,
-    ) -> Result<OpenOrdersPage, anyhow::Error> {
+    async fn list_orders(&self, query: &OrdersQuery) -> Result<OrdersPage, anyhow::Error> {
         let target = match &query.market {
             Some(filter) => {
                 let target: Option<(Option<String>, i32)> = sqlx::query_as(
@@ -486,11 +488,11 @@ impl MarketReadRepository for PostgresReadModelRepository {
                           and mo.symbol = $2
                           and m.last_reconciled_at is not null"#,
                 )
-                .bind(filter.market_address.0.as_str())
-                .bind(filter.symbol.0.as_str())
+                .bind(filter.market_address().0.as_str())
+                .bind(filter.symbol().0.as_str())
                 .fetch_optional(&self.pool)
                 .await
-                .context("resolve openOrders market filter")?;
+                .context("resolve orders market filter")?;
 
                 let Some((orderbook_address, outcome_id)) = target else {
                     return Err(anyhow!(DomainError::InvalidMarketOrSymbol));
@@ -503,92 +505,109 @@ impl MarketReadRepository for PostgresReadModelRepository {
             None => None,
         };
 
-        let limit_plus_one = i64::from(query.limit) + 1;
+        let limit_plus_one = i64::from(query.limit.get()) + 1;
+        let status_sql = match build_status_predicate(&query.status) {
+            Some(clause) => format!(" AND ({clause}) "),
+            None => String::new(),
+        };
 
         // The microsecond extraction `(extract(epoch from <timestamptz>) *
-        // 1000000)::bigint` below was once cursor-load-bearing. It now
-        // feeds response fields `time` / `updateTime` only — the cursor
-        // is placed_chain_order (text). Deployment is pinned to PG15+
-        // (Supabase) and PG16 (docker-compose.test.yml); both return
-        // numeric from extract(epoch ...), so the bigint cast is exact.
-        let rows: Vec<OpenOrderRow> = match target {
-            Some((orderbook_address, outcome_id)) => sqlx::query_as(
-                r#"select m.pmp_address as market_address,
+        // 1000000)::bigint` feeds response fields `time` / `updateTime`
+        // only; the cursor is placed_chain_order (text). Deployment is
+        // pinned to PG15+ (Supabase) and PG16 (docker-compose.test.yml);
+        // both return numeric from extract(epoch ...), so the bigint cast
+        // is exact.
+        // The filtered/unfiltered SQL blocks are intentionally duplicated:
+        // their bind arity differs, while the projection/predicate contract
+        // must stay obvious because it backs the public /orders shape.
+        let rows: Vec<OrderRow> = match target {
+            Some((orderbook_address, outcome_id)) => {
+                let sql = format!(
+                    r#"select m.pmp_address as market_address,
                           mo.symbol as symbol,
                           lo.order_id::text as order_id,
                           coalesce(lo.client_order_id, '') as client_order_id,
                           lo.price::text as price,
                           lo.amount_initial::text as orig_qty,
                           greatest(lo.amount_initial - lo.amount_remaining, 0)::text as executed_qty,
+                          (lo.amount_remaining = 0) as fully_filled,
+                          (lo.amount_remaining > lo.amount_initial) as corrupt_remainder,
                           lo.is_buy as is_buy,
                           (extract(epoch from lo.chain_created_at) * 1000000)::bigint as chain_created_at_us,
                           (extract(epoch from lo.chain_updated_at) * 1000000)::bigint as chain_updated_at_us,
                           lo.placed_chain_order as placed_chain_order,
                           mo.price_precision as price_precision,
-                          mo.quantity_precision as quantity_precision
+                          mo.quantity_precision as quantity_precision,
+                          lo.status as raw_status
                      from live_orders lo
                      join markets m on m.orderbook_address = lo.orderbook_address
                      join market_outcomes mo
                        on mo.market_id_fk = m.id
                       and mo.outcome_id = lo.outcome_id
                     where lo.owner_pn_address = $1
-                      and lo.status = 'OPEN'
-                      and lo.amount_remaining > 0
                       and lo.chain_created_at is not null
                       and lo.chain_updated_at is not null
                       and m.last_reconciled_at is not null
                       and lo.orderbook_address = $2
                       and lo.outcome_id = $3
-                      and ($4::text is null or lo.placed_chain_order > $4::text)
-                    order by lo.placed_chain_order asc
-                    limit $5"#,
-            )
-            .bind(query.owner_pn_address.as_str())
-            .bind(orderbook_address)
-            .bind(outcome_id)
-            .bind(query.cursor.as_ref().map(|c| c.0.as_str()))
-            .bind(limit_plus_one)
-            .fetch_all(&self.pool)
-            .await
-            .context("select filtered open orders")?,
-            None => sqlx::query_as(
-                r#"select m.pmp_address as market_address,
+                      and ($4::text is null or lo.placed_chain_order < $4::text)
+                      {status_sql}
+                    order by lo.placed_chain_order desc
+                    limit $5"#
+                );
+                sqlx::query_as::<_, OrderRow>(&sql)
+                    .bind(query.owner_pn_address.as_str())
+                    .bind(orderbook_address)
+                    .bind(outcome_id)
+                    .bind(query.cursor.as_ref().map(OrdersCursor::as_str))
+                    .bind(limit_plus_one)
+                    .fetch_all(&self.pool)
+                    .await
+                    .context("select filtered orders")?
+            }
+            None => {
+                let sql = format!(
+                    r#"select m.pmp_address as market_address,
                           mo.symbol as symbol,
                           lo.order_id::text as order_id,
                           coalesce(lo.client_order_id, '') as client_order_id,
                           lo.price::text as price,
                           lo.amount_initial::text as orig_qty,
                           greatest(lo.amount_initial - lo.amount_remaining, 0)::text as executed_qty,
+                          (lo.amount_remaining = 0) as fully_filled,
+                          (lo.amount_remaining > lo.amount_initial) as corrupt_remainder,
                           lo.is_buy as is_buy,
                           (extract(epoch from lo.chain_created_at) * 1000000)::bigint as chain_created_at_us,
                           (extract(epoch from lo.chain_updated_at) * 1000000)::bigint as chain_updated_at_us,
                           lo.placed_chain_order as placed_chain_order,
                           mo.price_precision as price_precision,
-                          mo.quantity_precision as quantity_precision
+                          mo.quantity_precision as quantity_precision,
+                          lo.status as raw_status
                      from live_orders lo
                      join markets m on m.orderbook_address = lo.orderbook_address
                      join market_outcomes mo
                        on mo.market_id_fk = m.id
                       and mo.outcome_id = lo.outcome_id
                     where lo.owner_pn_address = $1
-                      and lo.status = 'OPEN'
-                      and lo.amount_remaining > 0
                       and lo.chain_created_at is not null
                       and lo.chain_updated_at is not null
                       and m.last_reconciled_at is not null
-                      and ($2::text is null or lo.placed_chain_order > $2::text)
-                    order by lo.placed_chain_order asc
-                    limit $3"#,
-            )
-            .bind(query.owner_pn_address.as_str())
-            .bind(query.cursor.as_ref().map(|c| c.0.as_str()))
-            .bind(limit_plus_one)
-            .fetch_all(&self.pool)
-            .await
-            .context("select all open orders")?,
+                      and ($2::text is null or lo.placed_chain_order < $2::text)
+                      {status_sql}
+                    order by lo.placed_chain_order desc
+                    limit $3"#
+                );
+                sqlx::query_as::<_, OrderRow>(&sql)
+                    .bind(query.owner_pn_address.as_str())
+                    .bind(query.cursor.as_ref().map(OrdersCursor::as_str))
+                    .bind(limit_plus_one)
+                    .fetch_all(&self.pool)
+                    .await
+                    .context("select all orders")?
+            }
         };
 
-        let limit = usize::from(query.limit);
+        let limit = usize::from(query.limit.get());
         let has_more = rows.len() > limit;
         let mut orders_raw = rows;
         if has_more {
@@ -596,15 +615,52 @@ impl MarketReadRepository for PostgresReadModelRepository {
         }
 
         let next_cursor = if has_more {
-            orders_raw.last().map(|row| OpenOrdersCursor(row.placed_chain_order.clone()))
+            // `GetOrdersUseCase::execute` clamps `limit` to
+            // `[1, ORDERS_MAX_LIMIT]` before constructing the query;
+            // combined with `has_more = rows.len() > limit`, the
+            // post-truncate page is non-empty. A non-HTTP caller
+            // bypassing the use case would turn this into a panic —
+            // the application-side tests
+            // `get_orders_defaults_limit_when_absent` and
+            // `get_orders_rejects_limit_out_of_range` pin that invariant.
+            let row = orders_raw.last().expect("has_more implies non-empty page");
+            Some(OrdersCursor::from_db_token(row.placed_chain_order.clone()).map_err(|err| {
+                error!(
+                    market = %row.market_address,
+                    order_id = %row.order_id,
+                    placed_chain_order = %row.placed_chain_order,
+                    "live_orders row has invalid placed_chain_order for nextCursor"
+                );
+                anyhow!(err)
+            })?)
         } else {
             None
         };
 
-        let orders =
-            orders_raw.into_iter().map(open_order_from_row).collect::<Result<Vec<_>, _>>()?;
+        // `order_from_row` returns `None` for projector-bug rows (logs an
+        // error! inside). `next_cursor` was captured above from the
+        // pre-filter tail, so a corrupt boundary row advances the cursor
+        // past itself instead of freezing pagination — pinned by
+        // `cursor_advances_past_corrupt_row_at_page_tail`.
+        let raw_len = orders_raw.len();
+        let orders = orders_raw.into_iter().filter_map(order_from_row).collect::<Vec<_>>();
+        let skipped = raw_len.saturating_sub(orders.len());
+        if skipped > 0 {
+            error!(
+                skipped_rows = skipped,
+                returned_rows = orders.len(),
+                "list_orders skipped corrupt live_orders rows while rendering page"
+            );
+        }
 
-        Ok(OpenOrdersPage { orders, next_cursor })
+        // (empty orders, Some(cursor)) is the corrupt-window page:
+        // every row in this `has_more=true` page was filtered by
+        // `order_from_row` (per-row error! already logged inside the
+        // mapper). Surface the page anyway so the client can paginate
+        // past the corrupt window via the cursor — `next_cursor` was
+        // captured from the last retained row *before* the filter
+        // pass for exactly this case (read-api.md §SQL).
+        Ok(OrdersPage { orders, next_cursor })
     }
 }
 
@@ -655,7 +711,7 @@ struct DepthLevelRow {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct OpenOrderRow {
+struct OrderRow {
     market_address: String,
     symbol: String,
     order_id: String,
@@ -663,6 +719,17 @@ struct OpenOrderRow {
     price: String,
     orig_qty: String,
     executed_qty: String,
+    /// Primary discriminator: `true` either drops a corrupt OPEN row
+    /// (amount_remaining = 0 with status still OPEN) or, in the
+    /// amount_initial = amount_remaining = 0 sentinel case, prevents
+    /// the row from being mis-bucketed as NEW. NEW vs PARTIALLY_FILLED
+    /// for surviving OPEN rows is then derived from `executed_qty`.
+    fully_filled: bool,
+    /// `amount_remaining > amount_initial` evaluated in SQL. A `true` here
+    /// is a storage-invariant violation: more units claim to remain than
+    /// were ever placed, so `executed_qty` (clamped to 0 in SQL) would
+    /// otherwise render a corrupt row as a clean `NEW`. Fail closed.
+    corrupt_remainder: bool,
     is_buy: bool,
     // Microseconds since the epoch — sourced from chain_created_at /
     // chain_updated_at (timestamptz). The API renders `time` / `updateTime`
@@ -673,6 +740,47 @@ struct OpenOrderRow {
     placed_chain_order: String,
     price_precision: i32,
     quantity_precision: i32,
+    /// Raw status string from the live_orders table (e.g. "OPEN", "FILLED",
+    /// "CANCELLED", "REJECTED"). The public `OrderStatus` is derived from
+    /// this in combination with `fully_filled` (for OPEN rows).
+    raw_status: String,
+}
+
+/// Build the SQL fragment that filters `live_orders` rows by the requested
+/// status set. Returns `None` when every status is allowed — the caller
+/// then emits no status predicate at all.
+///
+/// The fragment is composed from compile-time `const &str` literals chosen
+/// by an exhaustive `match`; no user-supplied bytes ever reach the SQL.
+fn build_status_predicate(filter: &OrderStatusFilter) -> Option<String> {
+    let statuses = match filter {
+        OrderStatusFilter::All => return None,
+        OrderStatusFilter::Only(statuses) => statuses,
+    };
+    // Mirrors docs/tech-specs/read-api.md §Status mapping. BTreeSet
+    // iteration is QueryableOrderStatus's Ord-derived enum-declaration
+    // order, which is load-bearing for deterministic SQL composition.
+    const NEW: &str = "(lo.status = 'OPEN' AND lo.amount_remaining = lo.amount_initial)";
+    const PARTIALLY_FILLED: &str = "(lo.status = 'OPEN' AND lo.amount_remaining < lo.amount_initial AND lo.amount_remaining > 0)";
+    const FILLED: &str = "lo.status = 'FILLED'";
+    const CANCELED: &str = "lo.status = 'CANCELLED'";
+    // Public status token, but structurally empty until the contracts-side
+    // follow-up extends the live_orders.status CHECK to admit REJECTED rows.
+    const REJECTED: &str = "lo.status = 'REJECTED'";
+
+    let disjuncts: Vec<&'static str> = statuses
+        .iter()
+        .copied()
+        .map(|status| match status {
+            QueryableOrderStatus::New => NEW,
+            QueryableOrderStatus::PartiallyFilled => PARTIALLY_FILLED,
+            QueryableOrderStatus::Filled => FILLED,
+            QueryableOrderStatus::Canceled => CANCELED,
+            QueryableOrderStatus::Rejected => REJECTED,
+        })
+        .collect();
+
+    Some(disjuncts.join(" OR "))
 }
 
 fn filter_orderbook(s: String) -> Option<String> {
@@ -702,42 +810,171 @@ fn scale_uint_to_decimal(raw: &str, scale: u32) -> String {
     }
 }
 
-fn open_order_from_row(row: OpenOrderRow) -> Result<OpenOrder, anyhow::Error> {
-    let quantity_scale = u32::try_from(row.quantity_precision.max(0)).unwrap_or(0);
-    let status = if decimal_string_is_zero(&row.executed_qty) {
-        OpenOrderStatus::New
-    } else {
-        OpenOrderStatus::PartiallyFilled
+/// Project a `live_orders` row into the public [`Order`] DTO.
+///
+/// Returns `None` for rows that fail invariants the projector should
+/// guarantee (OPEN with `amount_remaining = 0`, or an unrecognised
+/// `raw_status`). The skip is logged inside this function; callers
+/// just `filter_map(order_from_row)` to drop bad rows from the page.
+/// "Skip" is encoded as `None` rather than a synthetic
+/// `Err(Unexpected)` so the semantics live in the type and the caller
+/// composes with `filter_map` directly instead of erasing a synthetic
+/// error.
+fn order_from_row(row: OrderRow) -> Option<Order> {
+    if row.corrupt_remainder {
+        error!(
+            order_id = %row.order_id,
+            market = %row.market_address,
+            raw_status = %row.raw_status,
+            "live_orders row has amount_remaining > amount_initial (storage invariant violated); skipping"
+        );
+        return None;
+    }
+    let price_scale = precision_to_scale(row.price_precision, "price", &row)?;
+    let quantity_scale = precision_to_scale(row.quantity_precision, "quantity", &row)?;
+
+    // Derive the public OrderStatus from the stored raw_status and
+    // (for OPEN rows) the SQL-side `fully_filled` boolean.
+    let status = match row.raw_status.as_str() {
+        "OPEN" => {
+            // `fully_filled` (amount_remaining == 0) is checked before
+            // `executed_is_zero` because amount_initial = amount_remaining = 0
+            // satisfies both predicates: ordering the executed-zero branch
+            // first would mis-bucket the row as NEW with origQty=0 and
+            // never reach this guard. Per read-api.md §Field projection,
+            // any OPEN row with amount_remaining == 0 is a projector bug
+            // — fail closed at error! (storage-invariant violation,
+            // per-occurrence is the right granularity for operator triage).
+            if row.fully_filled {
+                error!(
+                    order_id = %row.order_id,
+                    market = %row.market_address,
+                    "live_orders row has status=OPEN with amount_remaining=0 (projector bug); skipping"
+                );
+                return None;
+            }
+            let executed_is_zero = match decimal_string_is_zero(&row.executed_qty) {
+                Ok(value) => value,
+                Err(err) => {
+                    error!(
+                        order_id = %row.order_id,
+                        market = %row.market_address,
+                        executed_qty = %row.executed_qty,
+                        error = ?err,
+                        "live_orders row has malformed executed quantity; skipping"
+                    );
+                    return None;
+                }
+            };
+            if executed_is_zero {
+                OrderStatus::New
+            } else {
+                OrderStatus::PartiallyFilled
+            }
+        }
+        "FILLED" => OrderStatus::Filled,
+        "CANCELLED" => OrderStatus::Canceled,
+        // Awaiting the contracts-side follow-up that extends the CHECK
+        // constraint; current migrated rows cannot legally reach this arm.
+        "REJECTED" => {
+            if row.order_id != "0" {
+                error!(
+                    order_id = %row.order_id,
+                    market = %row.market_address,
+                    "REJECTED live_orders row has unexpected chain order_id; skipping"
+                );
+                return None;
+            }
+            OrderStatus::Rejected
+        }
+        other => {
+            // Unknown raw_status: either schema drift the read path
+            // hasn't caught up with, or read-model corruption. Either
+            // way it's an invariant violation — error!, not warn!.
+            error!(
+                order_id = %row.order_id,
+                market = %row.market_address,
+                raw_status = %other,
+                "live_orders row has unrecognised status; skipping"
+            );
+            return None;
+        }
     };
 
-    Ok(OpenOrder {
-        market_address: MarketAddress(row.market_address),
-        symbol: Symbol(row.symbol),
-        order_id: row.order_id,
-        client_order_id: row.client_order_id,
-        price: scale_uint_to_decimal(
-            &row.price,
-            u32::try_from(row.price_precision.max(0)).unwrap_or(0),
-        ),
-        orig_qty: scale_uint_to_decimal(&row.orig_qty, quantity_scale),
-        executed_qty: scale_uint_to_decimal(&row.executed_qty, quantity_scale),
+    let identity = if status == OrderStatus::Rejected {
+        OrderIdentity::Rejected
+    } else {
+        OrderIdentity::Chain(row.order_id)
+    };
+
+    let order = Order::new(
+        MarketAddress(row.market_address.clone()),
+        Symbol(row.symbol),
+        identity,
+        row.client_order_id,
+        scale_uint_to_decimal(&row.price, price_scale),
+        scale_uint_to_decimal(&row.orig_qty, quantity_scale),
+        scale_uint_to_decimal(&row.executed_qty, quantity_scale),
         status,
-        time_in_force: TimeInForce::Gtc,
-        order_type: OrderType::Limit,
-        side: if row.is_buy { OrderSide::Buy } else { OrderSide::Sell },
+        TimeInForce::Gtc,
+        OrderType::Limit,
+        if row.is_buy { OrderSide::Buy } else { OrderSide::Sell },
         // The API contract is unix milliseconds; storage and cursor are at
         // microsecond precision. Truncating div is fine — sub-ms detail is
         // not exposed externally.
-        time: row.chain_created_at_us / 1_000,
-        update_time: row.chain_updated_at_us / 1_000,
-    })
+        row.chain_created_at_us / 1_000,
+        row.chain_updated_at_us / 1_000,
+    );
+
+    match order {
+        Ok(order) => Some(order),
+        Err(err) => {
+            error!(
+                market = %row.market_address,
+                error = ?err,
+                "live_orders row violates Order DTO invariants; skipping"
+            );
+            None
+        }
+    }
 }
 
-fn decimal_string_is_zero(s: &str) -> bool {
-    match BigUint::parse_bytes(s.as_bytes(), 10) {
-        Some(v) => v == BigUint::from(0_u8),
-        None => true,
+/// Upper bound on `market_outcomes.price_precision` /
+/// `quantity_precision` accepted by the read path. Matches the SQL
+/// NUMERIC(38, …) cap — financial decimal precision never reaches this
+/// in practice, but `scale_uint_to_decimal` allocates `O(scale)` bytes
+/// per row via `"0".repeat(...)`, so an unbounded value on a corrupt
+/// row would OOM the API process on the first page that touches it.
+/// The `market_outcomes` column has no `CHECK` in 0001_initial.sql; this
+/// is the read-side defence.
+const MAX_DECIMAL_PRECISION: u32 = 38;
+
+fn precision_to_scale(raw: i32, field: &str, row: &OrderRow) -> Option<u32> {
+    let scale = match u32::try_from(raw) {
+        Ok(scale) => scale,
+        Err(_) => {
+            error!(
+                order_id = %row.order_id,
+                market = %row.market_address,
+                precision_field = field,
+                precision = raw,
+                "live_orders row has negative decimal precision; skipping"
+            );
+            return None;
+        }
+    };
+    if scale > MAX_DECIMAL_PRECISION {
+        error!(
+            order_id = %row.order_id,
+            market = %row.market_address,
+            precision_field = field,
+            precision = raw,
+            max = MAX_DECIMAL_PRECISION,
+            "live_orders row has decimal precision above MAX_DECIMAL_PRECISION; skipping to prevent unbounded allocation in scale_uint_to_decimal"
+        );
+        return None;
     }
+    Some(scale)
 }
 
 impl PostgresReadModelRepository {
@@ -1491,9 +1728,9 @@ mod tests {
 
     #[test]
     fn expired_at_result_end_boundary() {
-        // Spec: EXPIRED applies once the market reaches `resultEnd`. `now == result_end`
-        // must flip to EXPIRED; the previous `>` boundary kept it RESOLVING by one
-        // tick. This pins the inclusive boundary against future regressions.
+        // Spec: EXPIRED applies once the market reaches `resultEnd`.
+        // `now == result_end` must flip to EXPIRED. This pins the
+        // inclusive boundary against future regressions.
         let mut r = row(Some(200), Some(300), Some(400), Some(500));
         r.frozen_at = Some(310);
         assert_eq!(derive_status(&r, 500), MarketStatus::Expired);
@@ -1597,8 +1834,8 @@ mod tests {
     #[test]
     fn validate_non_pending_with_null_timings_fails() {
         // Catches the `build_timings -> None` path when a non-PENDING status
-        // is paired with one NULL timing column. The reviewer's reported
-        // shape: terminal/non-pending status surfacing with `timings: null`.
+        // is paired with one NULL timing column, which would otherwise
+        // surface a terminal/non-pending status with `timings: null`.
         let err = validate_invariants(MarketStatus::AwaitingFreeze, &None, &None).unwrap_err();
         assert_eq!(err, DomainError::MarketInconsistent);
     }
@@ -1606,9 +1843,9 @@ mod tests {
     #[test]
     fn validate_resolved_without_outcome_id_fails() {
         // api-spec.md:391: `resolvedOutcomeId` MUST be set when kind=RESOLVED.
-        // `build_terminal` just maps `Option<i32> -> Option<u32>`, so a NULL
-        // `resolved_outcome_id` row used to surface as a Resolved terminal
-        // with `resolvedOutcomeId: null` — the client cannot tell who won.
+        // `build_terminal` just maps `Option<i32> -> Option<u32>`, so this
+        // validator must fail closed before a Resolved terminal can carry
+        // `resolvedOutcomeId: null`.
         let err = validate_invariants(
             MarketStatus::Resolved,
             &Some(timings_full(Some(250))),
@@ -1634,12 +1871,10 @@ mod tests {
 
     #[test]
     fn validate_cancelled_without_reason_fails() {
-        // The reviewer's new case: a CANCELLED row whose `cancel_reason`
-        // column is a string outside `{PMP_CANCELLED, EVENT_CANCELLED}` is
-        // parsed to `None` by `build_terminal::CancelReason::parse`. Looking
-        // at `row.cancel_reason.is_none()` alone (the previous check) would
-        // miss this — the row has a value, just an invalid one. Validating
-        // the *built* DTO catches it.
+        // A CANCELLED row whose `cancel_reason` column is a string outside
+        // `{PMP_CANCELLED, EVENT_CANCELLED}` is parsed to `None` by
+        // `build_terminal::CancelReason::parse`. Validating the built DTO
+        // catches the invalid terminal shape.
         let err = validate_invariants(
             MarketStatus::Cancelled,
             &Some(timings_full(Some(250))),
@@ -1747,6 +1982,114 @@ mod tests {
         assert_eq!(filter_orderbook("0:abc".into()).as_deref(), Some("0:abc"));
     }
 
+    fn order_row(raw_status: &str, executed_qty: &str) -> OrderRow {
+        OrderRow {
+            market_address: "0:market".into(),
+            symbol: "YES".into(),
+            order_id: "123".into(),
+            client_order_id: "456".into(),
+            price: "100".into(),
+            orig_qty: "1000".into(),
+            executed_qty: executed_qty.into(),
+            fully_filled: false,
+            corrupt_remainder: false,
+            is_buy: true,
+            chain_created_at_us: 1_700_000_000_000_000,
+            chain_updated_at_us: 1_700_000_001_000_000,
+            placed_chain_order: "5f80000000000000000000000000000123".into(),
+            price_precision: 2,
+            quantity_precision: 2,
+            raw_status: raw_status.into(),
+        }
+    }
+
+    #[test]
+    fn order_from_row_accepts_decimal_executed_qty_for_open_rows() {
+        let mut row = order_row("OPEN", "0.00");
+        row.orig_qty = "10.00".into();
+        row.quantity_precision = 0;
+        let order = order_from_row(row).expect("decimal zero must not be treated as malformed");
+        assert_eq!(order.status().as_str(), "NEW");
+        assert_eq!(order.executed_qty(), "0.00");
+    }
+
+    #[test]
+    fn order_from_row_skips_rejected_rows_with_chain_order_id() {
+        let row = order_row("REJECTED", "0");
+        assert!(order_from_row(row).is_none(), "corrupt REJECTED chain id must be skipped");
+    }
+
+    #[test]
+    fn order_from_row_skips_negative_precision() {
+        let mut row = order_row("OPEN", "0");
+        row.quantity_precision = -2;
+        assert!(order_from_row(row).is_none(), "negative quantity precision must be corruption");
+    }
+
+    #[test]
+    fn order_from_row_skips_negative_price_precision() {
+        let mut row = order_row("OPEN", "0");
+        row.price_precision = -1;
+        row.quantity_precision = 2;
+        assert!(order_from_row(row).is_none(), "negative price precision must be corruption");
+    }
+
+    /// `market_outcomes.*_precision` has no SQL `CHECK`, so an absurd
+    /// positive value would slip past the DB into `scale_uint_to_decimal`,
+    /// where `"0".repeat(scale)` allocates `O(scale)` bytes per row and
+    /// can OOM the API process. The read-path guard rejects values above
+    /// `MAX_DECIMAL_PRECISION` before the scaler is called.
+    #[test]
+    fn order_from_row_skips_precision_above_max() {
+        let mut row = order_row("OPEN", "0");
+        row.price_precision = i32::try_from(MAX_DECIMAL_PRECISION).unwrap() + 1;
+        row.quantity_precision = 2;
+        assert!(
+            order_from_row(row).is_none(),
+            "price_precision above MAX_DECIMAL_PRECISION must skip the row",
+        );
+
+        let mut row = order_row("OPEN", "0");
+        row.price_precision = 3;
+        row.quantity_precision = i32::MAX;
+        assert!(order_from_row(row).is_none(), "quantity_precision at i32::MAX must skip the row",);
+    }
+
+    #[test]
+    fn order_from_row_skips_corrupt_remainder_rows() {
+        let mut row = order_row("OPEN", "0");
+        row.corrupt_remainder = true;
+        assert!(
+            order_from_row(row).is_none(),
+            "amount_remaining > amount_initial must not render as NEW"
+        );
+    }
+
+    /// `amount_initial = amount_remaining = 0` satisfies both
+    /// `executed_qty == 0` and `fully_filled == true`. The projector-bug
+    /// guard must take precedence; otherwise the row surfaces as a
+    /// valid NEW order with origQty=0 instead of being log-and-skipped
+    /// per read-api.md §Field projection.
+    #[test]
+    fn order_from_row_skips_open_with_zero_initial_and_zero_remainder() {
+        let mut row = order_row("OPEN", "0");
+        row.orig_qty = "0".into();
+        row.fully_filled = true;
+        assert!(
+            order_from_row(row).is_none(),
+            "OPEN with amount_initial = amount_remaining = 0 must be projector-bug-skipped"
+        );
+    }
+
+    #[test]
+    fn order_from_row_accepts_rejected_sentinel_identity() {
+        let mut row = order_row("REJECTED", "0");
+        row.order_id = "0".into();
+        let order = order_from_row(row).expect("REJECTED sentinel row should render");
+        assert_eq!(order.status().as_str(), "REJECTED");
+        assert_eq!(order.order_id(), "");
+    }
+
     #[test]
     fn scale_uint_to_decimal_handles_all_magnitudes() {
         // scale = 0 is a passthrough.
@@ -1818,8 +2161,8 @@ mod tests {
 
     #[test]
     fn listing_query_default_has_no_params() {
-        // Regression: previously bound `now` as $1 even when STATUS_CASE was absent,
-        // producing 08P01 "bind message supplies 1 parameters, but prepared statement requires 0".
+        // The default listing query has no dynamic filters, so it must not
+        // carry any bind parameters.
         let l = listing(MarketsFilter::default(), None);
         let (sql, params) = build_listing_query(&l).unwrap();
         assert!(params.is_empty(), "no filters → no binds; got {params:?}");
