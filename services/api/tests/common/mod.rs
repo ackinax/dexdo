@@ -9,6 +9,7 @@
 
 #![allow(dead_code)]
 
+pub mod cleanup;
 pub mod deploy_market;
 pub mod e2e_setup;
 pub mod test_pns;
@@ -27,6 +28,7 @@ use dodex_api::testkit::SharedChainSender;
 use dodex_api::testkit::SharedRepo;
 use dodex_application::CancelOrderPayload;
 use dodex_application::ChainOrderSender;
+use dodex_application::NewBatchOrderPayload;
 use dodex_application::NewOrderPayload;
 use dodex_domain::DomainError;
 use dodex_infrastructure::auth::PostgresAuthenticator;
@@ -108,6 +110,10 @@ impl ChainOrderSender for NoopChainSender {
     }
 
     async fn cancel_order(&self, _: CancelOrderPayload) -> Result<(), DomainError> {
+        Ok(())
+    }
+
+    async fn submit_batch_order(&self, _: NewBatchOrderPayload) -> Result<(), DomainError> {
         Ok(())
     }
 }

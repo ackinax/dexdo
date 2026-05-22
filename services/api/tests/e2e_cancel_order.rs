@@ -1,17 +1,18 @@
 // End-to-end smoke test for `DELETE /api/v1/order` against a real
-// shellnet OrderBook. Mirrors `e2e_order.rs` for setup (deploy fresh
-// PMP + OrderBook, provision api_key, post a LIMIT GTC order, poll
-// `getOrdersByOwner` until the chain accepts it), then drives the
-// **HTTP cancel path** through the production router and verifies
-// that the order disappears from `getOrdersByOwner` — proving the
-// `DELETE /order` handler → use case → `BeeDexChainSender::cancel_order`
-// → chain → `OrderBook.OrderCancelled` round-trip end to end.
+// shellnet OrderBook. Deploys a fresh PMP + OrderBook, provisions an
+// HMAC api_key, posts a LIMIT GTC order, polls `getOrdersByOwner`
+// until the chain accepts it, then drives the **HTTP cancel path**
+// through the production router and verifies that the order
+// disappears from `getOrdersByOwner` — proving the `DELETE /order`
+// handler → use case → `BeeDexChainSender::cancel_order` → chain →
+// `OrderBook.OrderCancelled` round-trip end to end.
 //
-// Marked `#[ignore]` because it needs the same setup as `e2e_order`:
+// Marked `#[ignore]` because it needs:
 //   - TEST_DATABASE_URL (test Postgres up — see README.md#test-postgres)
 //   - reachable shellnet endpoint
 //   - the bundled fixture `tests/fixtures/test_pns.json` (PN with
-//     enough NACKL — see `e2e_order.rs` and `mint_pn_pool`).
+//     enough NACKL — see `tests/fixtures/README.md` for fixture setup
+//     and topping up via `mint_pn_pool`).
 //
 // Run explicitly:
 //
@@ -67,12 +68,13 @@ async fn cancel_order_against_shellnet() {
     };
 
     // ---- Phase 1: deploy a fresh market and place an order so we
-    // ---- have something concrete to cancel. The placement step
-    // ---- is intentionally minimal here — exhaustive POST coverage
-    // ---- lives in `e2e_order.rs`; this test owns the DELETE path.
-    // Slot 1 belongs to this test (`e2e_order.rs` owns slot 0) so
-    // parallel `cargo test -- --ignored` runs do not contend on the
-    // same PN's chain-side `_busy` lock.
+    // ---- have something concrete to cancel. The placement step is
+    // ---- intentionally minimal here — exhaustive POST coverage lives
+    // ---- in the dedicated POST e2e test; this one owns DELETE.
+    // Slot 1 per the slot-ownership table in
+    // `tests/fixtures/README.md#pn-slot-ownership` — every e2e test
+    // claims a unique PN so a parallel `cargo test -- --ignored` run
+    // never contends on the same PN's chain-side `_busy` lock.
     let pn_pool = TestPnPool::load();
     let trader = pn_pool.slot(1).clone();
     let market = deploy_ephemeral_market(
@@ -92,6 +94,7 @@ async fn cancel_order_against_shellnet() {
     let chain_sender: SharedChainSender = Arc::new(
         BeeDexChainSender::new(
             vec![SHELLNET_ENDPOINT.to_string()],
+            Duration::from_secs(30),
             Duration::from_secs(30),
             Duration::from_secs(30),
         )
@@ -156,28 +159,26 @@ async fn cancel_order_against_shellnet() {
     use bee_dex::Dex as RawDex;
     let raw_dex = RawDex::new(vec![SHELLNET_ENDPOINT.to_string()]).expect("RawDex::new");
     let coid_u128: u128 = coid.parse().expect("coid u128");
-    let mut chain_order_id: Option<u128> = None;
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let owned = match raw_dex
-            .get_orders_by_owner(&market.order_book_address, trader.deposit_identifier_hash.clone())
-            .await
-        {
-            Ok(o) => o,
-            Err(err) => {
-                eprintln!("[e2e_cancel_order] get_orders_by_owner errored (retry): {err:?}");
-                continue;
-            }
-        };
-        if let Some(found) = owned.orders.iter().find(|o| o.client_order_id == coid_u128) {
-            chain_order_id = Some(found.order_id);
-            break;
-        }
-    }
-    let order_id = chain_order_id.expect(
-        "order with the supplied clientOrderId did not surface in getOrdersByOwner within 60s — \
-         can't drive the cancel path without a chain-assigned orderId",
-    );
+    use common::cleanup::PollOutcome;
+    let order_id = match common::cleanup::poll_orders_find(
+        &raw_dex,
+        &market,
+        &trader,
+        "e2e_cancel_order",
+        |orders| orders.iter().find(|o| o.client_order_id == coid_u128).map(|o| o.order_id),
+    )
+    .await
+    {
+        PollOutcome::Found(id) => id,
+        PollOutcome::NotFound => panic!(
+            "order with the supplied clientOrderId did not surface in getOrdersByOwner within \
+             60s — can't drive the cancel path without a chain-assigned orderId",
+        ),
+        PollOutcome::ChainSilent => panic!(
+            "surface-poll never got a successful `get_orders_by_owner` response — can't drive \
+             the cancel path without a chain-assigned orderId",
+        ),
+    };
 
     // The DELETE handler's `resolve_for_cancel` does an ownership
     // lookup against `live_orders` — which is normally populated by
@@ -255,27 +256,20 @@ async fn cancel_order_against_shellnet() {
     // ---- Phase 3: poll until the chain removes the order. 60s
     // ---- budget — `cancelOrder` is queued on the chain side
     // ---- (`OrderBook.executeBatch`), the same shape as placement.
-    let mut cancelled = false;
-    for _ in 0..30 {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let owned = match raw_dex
-            .get_orders_by_owner(&market.order_book_address, trader.deposit_identifier_hash.clone())
-            .await
-        {
-            Ok(o) => o,
-            Err(err) => {
-                eprintln!("[e2e_cancel_order] cancel-poll errored (retry): {err:?}");
-                continue;
-            }
-        };
-        if !owned.orders.iter().any(|o| o.client_order_id == coid_u128) {
-            cancelled = true;
-            break;
-        }
+    match common::cleanup::poll_orders(&raw_dex, &market, &trader, "e2e_cancel_order", |orders| {
+        !orders.iter().any(|o| o.client_order_id == coid_u128)
+    })
+    .await
+    {
+        PollOutcome::Found(()) => {}
+        PollOutcome::NotFound => panic!(
+            "order with client_order_id={coid} did not disappear from getOrdersByOwner within \
+             60s after DELETE /api/v1/order — chain may have queued cancel but not yet \
+             executed it",
+        ),
+        PollOutcome::ChainSilent => panic!(
+            "absence-poll never got a successful `get_orders_by_owner` response — cannot \
+             verify cancellation of client_order_id={coid}",
+        ),
     }
-    assert!(
-        cancelled,
-        "order with client_order_id={coid} did not disappear from getOrdersByOwner within 60s \
-         after DELETE /api/v1/order — chain may have queued cancel but not yet executed it",
-    );
 }

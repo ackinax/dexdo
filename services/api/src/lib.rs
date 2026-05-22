@@ -15,9 +15,12 @@ use std::time::UNIX_EPOCH;
 use anyhow::Context;
 use dodex_application::AuthContext;
 use dodex_application::Authenticator;
+use dodex_application::BatchOrderInputItem;
 use dodex_application::CancelOrderInput;
 use dodex_application::CancelOrderUseCase;
 use dodex_application::ChainOrderSender;
+use dodex_application::CreateBatchOrdersInput;
+use dodex_application::CreateBatchOrdersUseCase;
 use dodex_application::CreateOrderUseCase;
 use dodex_application::GetDepthQuery;
 use dodex_application::GetDepthUseCase;
@@ -246,9 +249,10 @@ impl ApiError {
             // failed" (502).
             DomainError::RequestTimeout => StatusCode::GATEWAY_TIMEOUT,
             // Per-PN serialisation is a chain invariant: only one
-            // `placeOrder` per trading PN can be in flight. 429 is the
-            // canonical "you sent too many to this PN; back off and
-            // retry" — distinct from a 401 (auth) or 400 (bad order).
+            // chain operation per trading PN can be in flight at a
+            // time. 429 is the canonical "you sent too many to this
+            // PN; back off and retry" — distinct from a 401 (auth)
+            // or 400 (bad order).
             DomainError::OrderPnBusy => StatusCode::TOO_MANY_REQUESTS,
             DomainError::Unexpected => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
@@ -664,6 +668,44 @@ struct CancelOrderResponse {
     status: &'static str,
 }
 
+/// Request body for `POST /api/v1/batchOrders`. One market+symbol per
+/// request, every item is placed on that single book — matches the
+/// chain ABI's `PrivateNote.placeBatch(eventId, oracleListHash,
+/// tokenType, OrderBookOrder[])`. Per-item field names mirror
+/// `POST /api/v1/order` so a marshalling client can reuse the same
+/// type for both endpoints.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchOrdersRequest {
+    market_address: Option<String>,
+    symbol: Option<String>,
+    orders: Option<Vec<BatchOrdersRequestItem>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchOrdersRequestItem {
+    new_order_client_id: Option<String>,
+    side: Option<String>,
+    quantity: Option<String>,
+    price: Option<String>,
+    #[serde(rename = "type")]
+    order_type: Option<String>,
+    time_in_force: Option<String>,
+}
+
+/// Response item for `POST /api/v1/batchOrders`. Same `PENDING_NEW`
+/// envelope as the single-order endpoint — see
+/// [`CreateOrderResponse`] for the rationale. Returned in request
+/// order; the array has one element per accepted item.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchOrderResponseItem {
+    client_order_id: String,
+    transact_time: i64,
+    status: &'static str,
+}
+
 /// Read the authenticated identity from the depot and enforce the
 /// endpoint's required permission in one call. Protected handlers
 /// must call this rather than `depot.obtain::<AuthContext>()`
@@ -825,6 +867,145 @@ async fn delete_order(
     }))
 }
 
+/// `POST /api/v1/batchOrders`. Parses one `(marketAddress, symbol)`
+/// plus `orders[]`, hands off to `CreateBatchOrdersUseCase`, and shapes
+/// a flat array of `PENDING_NEW` envelopes per
+/// [api-spec §New Batch Orders](../../docs/api-spec.md#new-batch-orders).
+/// The use case enforces non-empty `orders[]` and the
+/// `outcome.max_batch_size` cap; the chain enforces atomic placement.
+#[handler]
+async fn create_batch_orders(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<Vec<BatchOrderResponseItem>>, ApiError> {
+    let ctx = require_auth(depot, Permission::Trade)?.clone();
+    let state = depot
+        .obtain::<AppState>()
+        .map_err(|err| {
+            error!(?err, "missing AppState in depot");
+            ApiError::from(DomainError::Unexpected)
+        })?
+        .clone();
+
+    let body: BatchOrdersRequest = req.parse_json().await.map_err(|err| {
+        // Body has been HMAC-verified upstream; a parse failure is a
+        // client-shape bug. Mirrors the warn in `create_order`.
+        warn!(?err, "POST /api/v1/batchOrders body did not parse");
+        ApiError::from(DomainError::InvalidParameter)
+    })?;
+
+    let (now_seconds, now_ms) = now_pair();
+    let input = build_batch_orders_input(body, ctx, now_seconds, now_ms)?;
+
+    let use_case = CreateBatchOrdersUseCase::new(state.repo, state.chain_sender);
+    let submitted = use_case.execute(input).await.map_err(ApiError::from)?;
+
+    let response = submitted
+        .items
+        .into_iter()
+        .map(|item| BatchOrderResponseItem {
+            client_order_id: item.client_order_id,
+            transact_time: now_ms,
+            status: OrderStatus::PendingNew.as_str(),
+        })
+        .collect();
+    Ok(Json(response))
+}
+
+/// Translate the parsed body + auth context into a
+/// `CreateBatchOrdersInput`. The top-level (`marketAddress`, `symbol`)
+/// resolves once for the whole request; per-item fields go through
+/// the same trim+enum-parse the single-order handler runs. Any
+/// missing or unknown enum value on any item collapses the whole
+/// request with the matching `DomainError` (`MissingParameter`
+/// → -1102 or `InvalidParameter` → -1130). Empty `orders[]` parses
+/// here without complaint; the use case enforces non-empty + the
+/// per-outcome `max_batch_size` cap.
+fn build_batch_orders_input(
+    body: BatchOrdersRequest,
+    ctx: AuthContext,
+    now_seconds: i64,
+    now_ms: i64,
+) -> Result<CreateBatchOrdersInput, ApiError> {
+    let market_address =
+        non_empty(body.market_address).ok_or(ApiError::from(DomainError::MissingParameter))?;
+    let symbol = non_empty(body.symbol).ok_or(ApiError::from(DomainError::MissingParameter))?;
+    let raw_orders = body.orders.ok_or(ApiError::from(DomainError::MissingParameter))?;
+
+    let mut orders = Vec::with_capacity(raw_orders.len());
+    // Per-item enum/missing-field parse runs before the use case so a
+    // batch that fails here never reaches `validate_and_encode_order_item`
+    // (which logs `phase = "validate"`). The matching `warn!`s below
+    // give ops the same `item_index` when a 60-item batch trips on
+    // item 47. `phase = "parse"` lets a single substring query
+    // (`batchOrders rejected`) span the parse, validate, and shape
+    // gates without OR'ing three different messages.
+    for (item_index, item) in raw_orders.into_iter().enumerate() {
+        let side_str = non_empty(item.side).ok_or_else(|| {
+            warn!(phase = "parse", item_index, field = "side", "batchOrders rejected");
+            ApiError::from(DomainError::MissingParameter)
+        })?;
+        let side = OrderSide::parse(&side_str).ok_or_else(|| {
+            warn!(
+                phase = "parse",
+                item_index,
+                field = "side",
+                value = %side_str,
+                "batchOrders rejected",
+            );
+            ApiError::from(DomainError::InvalidParameter)
+        })?;
+        let quantity = non_empty(item.quantity).ok_or_else(|| {
+            warn!(phase = "parse", item_index, field = "quantity", "batchOrders rejected");
+            ApiError::from(DomainError::MissingParameter)
+        })?;
+        let order_type = match item.order_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => OrderType::parse(s).ok_or_else(|| {
+                warn!(
+                    phase = "parse",
+                    item_index,
+                    field = "type",
+                    value = %s,
+                    "batchOrders rejected",
+                );
+                ApiError::from(DomainError::InvalidParameter)
+            })?,
+            None => OrderType::Limit,
+        };
+        let time_in_force =
+            match item.time_in_force.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => Some(TimeInForce::parse(s).ok_or_else(|| {
+                    warn!(
+                        phase = "parse",
+                        item_index,
+                        field = "timeInForce",
+                        value = %s,
+                        "batchOrders rejected",
+                    );
+                    ApiError::from(DomainError::InvalidParameter)
+                })?),
+                None => None,
+            };
+        orders.push(BatchOrderInputItem {
+            side,
+            quantity,
+            price: non_empty(item.price),
+            order_type,
+            time_in_force,
+            client_order_id: non_empty(item.new_order_client_id),
+        });
+    }
+
+    Ok(CreateBatchOrdersInput {
+        trading_pn: ctx.trading_pn,
+        market_address: MarketAddress(market_address),
+        symbol: Symbol(symbol),
+        orders,
+        now_seconds,
+        now_ms,
+    })
+}
+
 /// Assemble the production router around `state`. Kept as a separate
 /// function so integration tests can drive the same router with a
 /// test-DB pool through Salvo's in-process `TestClient`; production
@@ -853,7 +1034,8 @@ pub fn build_router(state: AppState) -> Router {
                         .post(create_order)
                         .delete(delete_order),
                 )
-                .push(Router::with_path("api/v1/orders").get(get_orders)),
+                .push(Router::with_path("api/v1/orders").get(get_orders))
+                .push(Router::with_path("api/v1/batchOrders").post(create_batch_orders)),
         )
 }
 
@@ -894,6 +1076,7 @@ pub async fn run() -> anyhow::Result<()> {
         vec![config.chain.gateway_endpoint.clone()],
         Duration::from_millis(config.chain.place_order_timeout_ms),
         Duration::from_millis(config.chain.cancel_order_timeout_ms),
+        Duration::from_millis(config.chain.place_batch_timeout_ms),
     )?);
     let state = AppState::new(repo, authenticator, chain_sender)
         .with_request_timeout(Duration::from_millis(config.server.request_timeout_ms));

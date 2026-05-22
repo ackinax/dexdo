@@ -1,10 +1,11 @@
 // 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 //
 // Production implementation of `ChainOrderSender` that dispatches
-// `PrivateNote.placeOrder` and `PrivateNote.cancelOrder` through
-// `bee_dex::Dex`. The wrapper does nothing except translate the
-// application-layer payloads into the chain ABI's `ParamsOfPlaceOrder`
-// / `ParamsOfCancelOrder` and forward the call — ABI encoding, signing,
+// `PrivateNote.placeOrder`, `PrivateNote.cancelOrder`, and
+// `PrivateNote.placeBatch` through `bee_dex::Dex`. The wrapper does
+// nothing except translate the application-layer payloads into the
+// chain ABI's `ParamsOfPlaceOrder` / `ParamsOfCancelOrder` /
+// `ParamsOfPlaceBatch` and forward the call — ABI encoding, signing,
 // and gateway transport all live in `bee_dex`.
 //
 // See `docs/tech-specs/write-api.md §Chain submission` for the layering
@@ -12,15 +13,19 @@
 
 use std::time::Duration;
 
+use ackinacki_kit::contracts::dex::order_book::OrderBookOrder;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrder;
+use ackinacki_kit::contracts::dex::private_note::ParamsOfPlaceBatch;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfPlaceOrder;
 use ackinacki_kit::tvm_client::abi::Signer;
 use ackinacki_kit::tvm_client::crypto::KeyPair;
 use async_trait::async_trait;
 use bee_dex::errors::AppError;
 use bee_dex::Dex;
+use dodex_application::BatchOrderPayloadItem;
 use dodex_application::CancelOrderPayload;
 use dodex_application::ChainOrderSender;
+use dodex_application::NewBatchOrderPayload;
 use dodex_application::NewOrderPayload;
 use dodex_domain::DomainError;
 use dodex_domain::SensitiveBytes;
@@ -28,6 +33,7 @@ use num_bigint::BigUint;
 use tokio::time::timeout;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 use tracing::warn;
 use zeroize::Zeroizing;
 
@@ -35,6 +41,7 @@ pub struct BeeDexChainSender {
     dex: Dex,
     place_order_timeout: Duration,
     cancel_order_timeout: Duration,
+    place_batch_timeout: Duration,
 }
 
 impl BeeDexChainSender {
@@ -43,7 +50,7 @@ impl BeeDexChainSender {
     /// `Arc<dyn ChainOrderSender>` at the `AppState` boundary, so the
     /// inner `Dex` does not need its own `Arc`.
     ///
-    /// The two timeouts bound the per-call wait for each chain entry
+    /// The three timeouts bound the per-call wait for each chain entry
     /// point — `bee_dex::Dex` itself has no per-request deadline, so a
     /// partitioned or hung gateway would otherwise stall the HTTP
     /// worker indefinitely. Elapsed surfaces as
@@ -54,10 +61,11 @@ impl BeeDexChainSender {
         endpoints: Vec<String>,
         place_order_timeout: Duration,
         cancel_order_timeout: Duration,
+        place_batch_timeout: Duration,
     ) -> anyhow::Result<Self> {
         let dex = Dex::new(endpoints)
             .map_err(|err| anyhow::anyhow!("bee_dex::Dex::new failed: {err:?}"))?;
-        Ok(Self { dex, place_order_timeout, cancel_order_timeout })
+        Ok(Self { dex, place_order_timeout, cancel_order_timeout, place_batch_timeout })
     }
 }
 
@@ -145,6 +153,84 @@ impl ChainOrderSender for BeeDexChainSender {
             "cancel_order",
         )
     }
+
+    async fn submit_batch_order(&self, payload: NewBatchOrderPayload) -> Result<(), DomainError> {
+        let signer = build_signer(&payload.pn_pubkey, &payload.pn_seckey)?;
+
+        // Consume `payload.orders` by value so per-item `price_raw`
+        // moves into the chain payload instead of being cloned.
+        let pn_address = payload.pn_address;
+        let mut orders = Vec::with_capacity(payload.orders.len());
+        for (item_index, item) in payload.orders.into_iter().enumerate() {
+            orders.push(encode_batch_item(item, item_index)?);
+        }
+
+        let params = ParamsOfPlaceBatch {
+            event_id: payload.event_id,
+            oracle_list_hash: payload.oracle_list_hash,
+            token_type: payload.token_type,
+            orders,
+        };
+
+        // `client_order_ids` is the audit trail when a place_batch
+        // never returns (`RequestTimeout`) or the gateway raises an
+        // unmapped error: without it, ops cannot reconcile which coids
+        // the chain may or may not have committed against the PN's
+        // `_clientOrderIds` map. `classify_chain_outcome` does not
+        // carry coids on its error/timeout logs, so this line is the
+        // only place they appear — emit at `info!` so the production
+        // default filter keeps it. Per-order price/amount are not
+        // logged: they would balloon the line for a large batch and
+        // the chain encodes them in the external message recoverable
+        // from the gateway side anyway.
+        let client_order_ids: Vec<u128> = params.orders.iter().map(|o| o.client_order_id).collect();
+        info!(
+            entry_point = "place_batch",
+            pn = %pn_address,
+            event_id = %params.event_id,
+            oracle_list_hash = %params.oracle_list_hash,
+            token_type = params.token_type,
+            order_count = params.orders.len(),
+            ?client_order_ids,
+            "submitting place_batch",
+        );
+
+        let call = self.dex.place_batch(&pn_address, params, signer);
+        let outcome = timeout(self.place_batch_timeout, call).await;
+        classify_chain_outcome(outcome, self.place_batch_timeout.as_millis() as u64, "place_batch")
+    }
+}
+
+/// Translate one application-layer `BatchOrderPayloadItem` into the
+/// chain `OrderBookOrder` tuple. The `amount_raw` / `client_order_id`
+/// parses are defence-in-depth: `validate_and_encode_order_item`
+/// (application crate) already enforces both stay within `u64::MAX`
+/// per the `bee_dex` / `serde_json` ceiling, so reaching the error
+/// arm means that upstream invariant was bypassed.
+fn encode_batch_item(
+    item: BatchOrderPayloadItem,
+    item_index: usize,
+) -> Result<OrderBookOrder, DomainError> {
+    let amount = item.amount_raw.parse::<u128>().map_err(|err| {
+        error!(item_index, ?err, raw = %item.amount_raw, "amount_raw is not uint128");
+        DomainError::Unexpected
+    })?;
+    let client_order_id = item.client_order_id.parse::<u128>().map_err(|err| {
+        error!(item_index, ?err, raw = %item.client_order_id, "client_order_id is not uint128");
+        DomainError::Unexpected
+    })?;
+    Ok(OrderBookOrder {
+        outcome_id: item.outcome_id,
+        is_buy: item.is_buy,
+        flags: item.flags,
+        price: item.price_raw,
+        amount,
+        // Matches the single-order path — neither field is exposed by
+        // api-spec and both are pinned to 0 at the chain boundary.
+        min_amount: 0,
+        epoch_id: 0,
+        client_order_id,
+    })
 }
 
 /// Build a `Signer::Keys` from the application-layer (`pn_pubkey`,
@@ -195,7 +281,8 @@ fn build_signer(pn_pubkey: &str, pn_seckey: &SensitiveBytes) -> Result<Signer, D
 /// `ChainOrderSender` entirely and would not catch a future refactor
 /// that breaks the wiring between `map_bee_dex_error` and the chain
 /// dispatch. `entry_point` is included in the timeout / unmapped-error
-/// logs so ops can tell place from cancel without correlation.
+/// logs so ops can disambiguate place / cancel / place_batch without
+/// correlation.
 fn classify_chain_outcome<T>(
     outcome: Result<Result<T, AppError>, tokio::time::error::Elapsed>,
     timeout_ms: u64,
@@ -206,7 +293,9 @@ fn classify_chain_outcome<T>(
         Ok(Err(app_err)) => Err(map_bee_dex_error(&app_err, entry_point)),
         Err(_elapsed) => {
             // Gateway did not respond within the configured budget
-            // (`chain.{place,cancel}_order_timeout_ms`). Most often a
+            // (`chain.place_order_timeout_ms`,
+            // `chain.cancel_order_timeout_ms`,
+            // `chain.place_batch_timeout_ms`). Most often a
             // network partition or a gateway-side deadlock. Surface as
             // `RequestTimeout` (504 / -1007) so the client receives the
             // same "retry with the same id" contract as the HTTP
@@ -244,7 +333,11 @@ fn map_bee_dex_error(err: &AppError, entry_point: &'static str) -> DomainError {
         warn!(
             entry_point,
             exit_code = code,
-            ?err,
+            err_message = %err.message,
+            err_details = ?err.details,
+            err_module = ?err.module,
+            err_kind = ?err.kind,
+            tvm_error = ?err.tvm_error,
             domain_error = ?mapped,
             "chain rejected request",
         );
@@ -272,6 +365,20 @@ fn map_tvm_exit_code(code: u16) -> Option<DomainError> {
         // ERR_NOTE_BUSY: another `placeOrder` is in flight for this PN.
         // Distinct retry semantics — 429 / -2014 instead of -2010.
         121 => Some(DomainError::OrderPnBusy),
+        // ERR_INVALID_PARAMS: applies to both `placeOrder` and
+        // `placeBatch`. The PN guards two client-shape invariants
+        // under this code:
+        //   1. `clientOrderId` collision — the chain holds a single
+        //      per-PN `_clientOrderIds` map covering BOTH still-live
+        //      coids from earlier `placeOrder`s and sentinels for an
+        //      in-flight `placeBatch`. So 129 fires for intra-batch
+        //      duplicates AND for a coid the caller already used in
+        //      a prior placement that has not closed yet.
+        //   2. `minAmount != 0` on any MARKET order (the chain's
+        //      MARKET path does not support `minAmount`). Our wire
+        //      payload always sends `minAmount = 0` for every order,
+        //      so practically only (1) reaches us.
+        129 => Some(DomainError::InvalidParameter),
         // ERR_INVALID_OUTCOME_ID: the `outcomeId` we pulled from
         // `market_outcomes` does not exist on the on-chain PMP. That
         // is a read-model integrity bug, not a client bug — fail
@@ -292,6 +399,16 @@ fn map_tvm_exit_code(code: u16) -> Option<DomainError> {
         // and the read-model disagree on the minimum — still surface
         // as a validation error for the client.
         160 => Some(DomainError::OrderValidationFailed),
+        // ERR_BATCH_TOO_LARGE / ERR_EMPTY_BATCH: chain-side
+        // defence-in-depth against the same length checks the use
+        // case pre-applies (`orders.len()` ∈ [1, `max_batch_size`]).
+        // Reaching them means the local guard was bypassed — i.e.
+        // the read-model's `max_batch_size` drifted from the on-chain
+        // ceiling — which is a server-state inconsistency, not a
+        // client error. Surface as `MarketInconsistent` (503 / -1500)
+        // so ops sees it instead of confusing the client with a
+        // -1130 they cannot act on.
+        161 | 162 => Some(DomainError::MarketInconsistent),
         // ERR_AMOUNT_NOT_LOT_MULTIPLE / ERR_PRICE_NOT_TICK_MULTIPLE:
         // amount or price not aligned to chain lattice. Our local
         // precision checks against `step_size` / `tick_size` should
@@ -299,6 +416,10 @@ fn map_tvm_exit_code(code: u16) -> Option<DomainError> {
         // misaligned with the chain. Map to `PrecisionExceeded` so
         // the client gets a -1111 they can act on.
         163 | 164 => Some(DomainError::PrecisionExceeded),
+        // ERR_NOTIONAL_OVERFLOW: `price * amount` overflowed uint256
+        // inside `placeBatch`. Treat as a doomed validation: the
+        // client must scale either side down.
+        168 => Some(DomainError::OrderValidationFailed),
         _ => None,
     }
 }
@@ -376,6 +497,7 @@ mod tests {
             DomainError::OrderValidationFailed
         );
         assert_eq!(map_bee_dex_error(&tvm_exit(121), "place_order"), DomainError::OrderPnBusy);
+        assert_eq!(map_bee_dex_error(&tvm_exit(129), "place_batch"), DomainError::InvalidParameter);
         assert_eq!(
             map_bee_dex_error(&tvm_exit(130), "place_order"),
             DomainError::MarketInconsistent
@@ -397,12 +519,24 @@ mod tests {
             DomainError::OrderValidationFailed
         );
         assert_eq!(
+            map_bee_dex_error(&tvm_exit(161), "place_batch"),
+            DomainError::MarketInconsistent
+        );
+        assert_eq!(
+            map_bee_dex_error(&tvm_exit(162), "place_batch"),
+            DomainError::MarketInconsistent
+        );
+        assert_eq!(
             map_bee_dex_error(&tvm_exit(163), "place_order"),
             DomainError::PrecisionExceeded
         );
         assert_eq!(
             map_bee_dex_error(&tvm_exit(164), "place_order"),
             DomainError::PrecisionExceeded
+        );
+        assert_eq!(
+            map_bee_dex_error(&tvm_exit(168), "place_batch"),
+            DomainError::OrderValidationFailed
         );
     }
 
@@ -452,8 +586,12 @@ mod tests {
         let cases = [
             (102u16, DomainError::OrderValidationFailed), // ERR_LOW_VALUE
             (121, DomainError::OrderPnBusy),              // ERR_NOTE_BUSY
+            (129, DomainError::InvalidParameter),         // ERR_INVALID_PARAMS (batch-coid dupe)
             (130, DomainError::MarketInconsistent),       // ERR_INVALID_OUTCOME_ID
+            (161, DomainError::MarketInconsistent),       // ERR_BATCH_TOO_LARGE
+            (162, DomainError::MarketInconsistent),       // ERR_EMPTY_BATCH
             (163, DomainError::PrecisionExceeded),        // ERR_AMOUNT_NOT_LOT_MULTIPLE
+            (168, DomainError::OrderValidationFailed),    // ERR_NOTIONAL_OVERFLOW
         ];
         for (code, expected) in cases {
             let outcome: Result<Result<(), AppError>, tokio::time::error::Elapsed> =
@@ -491,6 +629,7 @@ mod tests {
         // `RequestTimeout`, flagging the regression.
         let sender = BeeDexChainSender::new(
             vec!["http://invalid.example.test".to_string()],
+            std::time::Duration::from_millis(100),
             std::time::Duration::from_millis(100),
             std::time::Duration::from_millis(100),
         )
