@@ -54,7 +54,7 @@ use dodex_domain::TerminalKind;
 use dodex_domain::TimeInForce;
 use dodex_domain::Timings;
 use dodex_infrastructure::auth::PostgresAuthenticator;
-use dodex_infrastructure::chain_sender::BeeDexChainSender;
+use dodex_infrastructure::chain_sender::DexChainSender;
 use dodex_infrastructure::config::ApiConfig;
 use dodex_infrastructure::crypto::Kek;
 use dodex_infrastructure::database;
@@ -65,6 +65,10 @@ use salvo::http::StatusCode;
 use salvo::prelude::*;
 use salvo::writing::Json;
 use salvo_extra::affix_state::inject;
+use salvo_oapi::endpoint;
+use salvo_oapi::security::ApiKey;
+use salvo_oapi::security::ApiKeyValue;
+use salvo_oapi::security::SecurityScheme;
 use salvo_oapi::Components;
 use salvo_oapi::EndpointOutRegister;
 use salvo_oapi::Info;
@@ -73,10 +77,6 @@ use salvo_oapi::Operation;
 use salvo_oapi::Response as OapiResponse;
 use salvo_oapi::Server as OapiServer;
 use salvo_oapi::ToSchema;
-use salvo_oapi::endpoint;
-use salvo_oapi::security::ApiKey;
-use salvo_oapi::security::ApiKeyValue;
-use salvo_oapi::security::SecurityScheme;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::error;
@@ -913,23 +913,22 @@ struct CancelBatchOrdersRequest {
 impl ToSchema for CancelBatchOrdersRequest {
     fn to_schema(_components: &mut Components) -> salvo_oapi::RefOr<salvo_oapi::schema::Schema> {
         use salvo_oapi::schema::AdditionalProperties;
-        use salvo_oapi::{Array, BasicType, Object};
+        use salvo_oapi::Array;
+        use salvo_oapi::BasicType;
+        use salvo_oapi::Object;
         Object::new()
             .property("marketAddress", Object::new().schema_type(BasicType::String))
             .property("symbol", Object::new().schema_type(BasicType::String))
-            .property(
-                "orderIds",
-                Array::new().items(Object::new().schema_type(BasicType::String)),
-            )
+            .property("orderIds", Array::new().items(Object::new().schema_type(BasicType::String)))
             .additional_properties(AdditionalProperties::FreeForm(false))
             .into()
     }
 }
 
-/// Response item for `DELETE /api/v1/batchOrders`. Same `PENDING_CANCEL`
-/// envelope as the single-order DELETE — see [`CancelOrderResponse`]
-/// for the rationale. Returned in request order; the array has one
-/// element per accepted id.
+// Response item for `DELETE /api/v1/batchOrders`. Same `PENDING_CANCEL`
+// envelope as the single-order DELETE — see `CancelOrderResponse`
+// for the rationale. Returned in request order; the array has one
+// element per accepted id.
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct CancelBatchOrderResponseItem {
@@ -1300,12 +1299,12 @@ fn build_batch_orders_input(
     })
 }
 
-/// Parses one `(marketAddress, symbol)` plus `orderIds[]`, hands off
-/// to `CancelBatchOrdersUseCase`, and shapes a flat array of
-/// `PENDING_CANCEL` envelopes. The use case enforces non-empty
-/// `orderIds[]`, intra-batch dedup, the `outcome.max_batch_size` cap,
-/// and bulk order resolution. The chain (`PrivateNote.cancelBatch`)
-/// accepts the list atomically under one `_busy` window.
+// Parses one `(marketAddress, symbol)` plus `orderIds[]`, hands off
+// to `CancelBatchOrdersUseCase`, and shapes a flat array of
+// `PENDING_CANCEL` envelopes. The use case enforces non-empty
+// `orderIds[]`, intra-batch dedup, the `outcome.max_batch_size` cap,
+// and bulk order resolution. The chain (`PrivateNote.cancelBatch`)
+// accepts the list atomically under one `_busy` window.
 #[endpoint(
     tags("trading"),
     summary = "Cancel a batch of orders atomically",
@@ -1608,11 +1607,7 @@ pub fn openapi_doc() -> OpenApi {
         .push(Router::with_path("readiness").get(readiness))
         .push(Router::with_path("api/v1/markets").get(get_markets))
         .push(Router::with_path("api/v1/depth").get(get_depth))
-        .push(
-            Router::with_path("api/v1/order")
-                .post(create_order)
-                .delete(delete_order),
-        )
+        .push(Router::with_path("api/v1/order").post(create_order).delete(delete_order))
         .push(Router::with_path("api/v1/orders").get(get_orders))
         .push(
             Router::with_path("api/v1/batchOrders")
@@ -1673,7 +1668,7 @@ pub async fn run() -> anyhow::Result<()> {
     let repo: SharedRepo = Arc::new(PostgresReadModelRepository::new(pool.clone()));
     let authenticator: SharedAuth =
         Arc::new(PostgresAuthenticator::new(pool.clone(), kek, &config.auth));
-    let chain_sender: SharedChainSender = Arc::new(BeeDexChainSender::new(
+    let chain_sender: SharedChainSender = Arc::new(DexChainSender::new(
         vec![config.chain.gateway_endpoint.clone()],
         Duration::from_millis(config.chain.place_order_timeout_ms),
         Duration::from_millis(config.chain.cancel_order_timeout_ms),
