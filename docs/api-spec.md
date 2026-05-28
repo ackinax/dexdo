@@ -1294,7 +1294,9 @@ Unsubscribe:
 
 Connection lifecycle:
 
-- The server sends a WebSocket ping every 20 seconds. Clients MUST reply with pong within 60 seconds or the server closes the socket.
+- Frame envelope convention: server→client frames use `e:` (both data `orderUpdate` and control `ping` / `pong`); client→server frames use `method:` (subscriptions and `ping` / `pong`).
+- Heartbeat is application-level JSON. The server sends `{"e":"ping","E":<server_ts_ms>}` every 30s; the client MUST reply with `{"method":"pong","E":<server_ts_ms>}` (echoing the ping's `E`) within 60s, otherwise the server closes the socket with WebSocket close code `4001` ("heartbeat timeout"). `E` is set by the side issuing the ping and echoed verbatim by the responder, so the pinger can measure round-trip time against its own clock — this differs from `E` in `orderUpdate`, where `E` is the server's emission time.
+- If 45s elapse without **any** frame from the server (ping, pong, or `orderUpdate`), the client MUST send `{"method":"ping","E":<client_ts_ms>}` as a liveness probe. The client SHOULD treat the socket as dead and reconnect if it does not receive `{"e":"pong","E":<client_ts_ms>}` within 60s.
 - The server closes the connection after 24 hours of uptime. Clients MUST reconnect and resubscribe.
 
 ### Splice and Gap Detection
@@ -1317,6 +1319,8 @@ on every live event:
   if sq != expected_next: gap detected → resnapshot
   apply; expected_next = sq + 1
 ```
+
+The algorithm above applies to `orderUpdate` frames only. Control frames (`ping`, `pong`) carry no `sq` and do not advance `expected_next` — clients dispatch them on `e` / `method` before running the gap check.
 
 `sq` is monotonic over the life of the account, not the life of the subscription — a reconnect does not reset the counter. The snapshot watermark `lastSq` from `GET /api/v1/orders` is therefore directly comparable with any `sq` the client has previously stored.
 
@@ -1427,7 +1431,7 @@ Field reference:
 
 | Key | Type | Description |
 | --- | --- | --- |
-| `e` | STRING | Event name. Always `"orderUpdate"`. |
+| `e` | STRING | Event name. `"orderUpdate"` for order events; see [Connection](#connection) for `"ping"` / `"pong"` control frames. |
 | `E` | LONG | Event time. Server timestamp when the frame was emitted, Unix ms. |
 | `a` | STRING | Market address. Dodex-specific; no Binance analog. |
 | `s` | STRING | Outcome-token symbol. |
