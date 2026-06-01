@@ -16,6 +16,11 @@
 
 Operational cutover notes for specific schema/projector changes live in [migrations/](migrations/).
 
+## Operations
+
+- [deployment.md](deployment.md) — self-hosting `indexer` + `api` with Docker Compose against your own Acki Nacki GraphQL endpoint and your own Postgres / Supabase.
+- [seed-private-notes.md](seed-private-notes.md) — deploying and funding the on-chain PrivateNote contracts the seed accounts point at, and topping them up with the giver.
+
 ## Contracts
 
 - [contract-specs/](contract-specs/) — on-chain DEX.DO contracts. Event routing in [dex-events-routing.md](contract-specs/dex-events-routing.md); flow/object diagrams as HTML and drawio.

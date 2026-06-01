@@ -1,4 +1,4 @@
-# dodex-indexer
+# DEX.DO-indexer
 
 Writer-side service. It ingests Acki Nacki chain data, decodes DEX events, and
 maintains the Postgres read-model served by `services/api`.
@@ -80,4 +80,6 @@ on connect.
 
 ## Deployment
 
-Use the repository-level deployment process from [README.md](../../README.md).
+Self-hosting the service (Docker Compose, own GraphQL + Postgres/Supabase) is
+covered in [docs/deployment.md](../../docs/deployment.md); the repository-level
+entry point is [README.md](../../README.md).
