@@ -283,7 +283,7 @@ async fn last_update_id_is_scoped_per_outcome() {
                 amount_initial, amount_remaining, status,
                 last_chain_order, placed_chain_order)
            values ($1, 1::numeric, 2, true, 500::numeric,
-                   100::numeric, 100::numeric, 'OPEN',
+                   1000000::numeric, 1000000::numeric, 'OPEN',
                    $2, $2)"#,
     )
     .bind(orderbook)
@@ -308,6 +308,148 @@ async fn last_update_id_is_scoped_per_outcome() {
         .await
         .expect("get_depth NO");
     assert_eq!(no_depth.last_update_id, no_chain_order);
+}
+
+#[tokio::test]
+async fn depth_fails_closed_when_price_precision_exceeds_bps_scale() {
+    // price_precision above the basis-point scale (PRICE_BPS_DECIMALS = 4)
+    // clears the range guard but asks for finer price detail than the chain
+    // carries. The descale step must fail closed (503), never round.
+    let Some(pool) = setup().await else { return };
+    let repo = PostgresReadModelRepository::new(pool.clone());
+
+    let pmp = "0:depth_price_precision_overflow_pmp";
+    let symbol = "DEPTH_PP_OVERFLOW_YES";
+    let orderbook = "0:depth_pp_overflow_book";
+    purge_market(&pool, pmp, symbol).await;
+    insert_market_with_outcome(&pool, pmp, symbol, Some(orderbook)).await;
+    sqlx::query("update market_outcomes set price_precision = 5 where symbol = $1")
+        .bind(symbol)
+        .execute(&pool)
+        .await
+        .expect("widen price_precision past the bps scale");
+
+    let err = repo
+        .get_depth(&MarketAddress(pmp.into()), &Symbol(symbol.into()), 100)
+        .await
+        .expect_err("price_precision finer than the bps scale must fail closed");
+    let domain = err.downcast_ref::<DomainError>().expect("typed DomainError surfaced");
+    assert_eq!(*domain, DomainError::MarketInconsistent);
+}
+
+#[tokio::test]
+async fn depth_fails_closed_when_quantity_precision_exceeds_decimals() {
+    // quantity_precision above the quote asset's decimals (USDC = 6) asks for
+    // more amount detail than the chain carries — a negative drop, fail closed.
+    let Some(pool) = setup().await else { return };
+    let repo = PostgresReadModelRepository::new(pool.clone());
+
+    let pmp = "0:depth_qty_precision_overflow_pmp";
+    let symbol = "DEPTH_QP_OVERFLOW_YES";
+    let orderbook = "0:depth_qp_overflow_book";
+    purge_market(&pool, pmp, symbol).await;
+    insert_market_with_outcome(&pool, pmp, symbol, Some(orderbook)).await;
+    sqlx::query("update market_outcomes set quantity_precision = 7 where symbol = $1")
+        .bind(symbol)
+        .execute(&pool)
+        .await
+        .expect("widen quantity_precision past the quote decimals");
+
+    let err = repo
+        .get_depth(&MarketAddress(pmp.into()), &Symbol(symbol.into()), 100)
+        .await
+        .expect_err("quantity_precision finer than quote decimals must fail closed");
+    let domain = err.downcast_ref::<DomainError>().expect("typed DomainError surfaced");
+    assert_eq!(*domain, DomainError::MarketInconsistent);
+}
+
+#[tokio::test]
+async fn depth_fails_closed_on_off_grid_price() {
+    // Both precisions are in range (so the negative-drop guards pass), but a
+    // stored bid price sits off the chain tick grid: at price_precision=2 the
+    // descale drops two basis-point digits, and "6105" leaves a nonzero "5".
+    // descale_pow10 must reject it at the per-level step rather than re-grid —
+    // a depth snapshot with silently rounded levels would misprice the book.
+    let Some(pool) = setup().await else { return };
+    let repo = PostgresReadModelRepository::new(pool.clone());
+
+    let pmp = "0:depth_off_grid_price_pmp";
+    let symbol = "DEPTH_OFF_GRID_PRICE_YES";
+    let orderbook = "0:depth_off_grid_price_book";
+    purge_market(&pool, pmp, symbol).await;
+    sqlx::query("delete from live_orders where orderbook_address = $1")
+        .bind(orderbook)
+        .execute(&pool)
+        .await
+        .expect("purge live_orders");
+    insert_market_with_outcome(&pool, pmp, symbol, Some(orderbook)).await;
+
+    // amount is on-grid (100_000_000 atoms drops "0000" at amount drop 4); only
+    // the price is off the tick grid, so the failure is attributable to it.
+    sqlx::query(
+        r#"insert into live_orders
+               (orderbook_address, order_id, outcome_id, is_buy, price,
+                amount_initial, amount_remaining, status,
+                last_chain_order, placed_chain_order)
+           values ($1, 1::numeric, 1, true, 6105::numeric,
+                   100000000::numeric, 100000000::numeric, 'OPEN',
+                   '5f800000000000', '5f800000000000')"#,
+    )
+    .bind(orderbook)
+    .execute(&pool)
+    .await
+    .expect("insert off-grid live_orders");
+
+    let err = repo
+        .get_depth(&MarketAddress(pmp.into()), &Symbol(symbol.into()), 100)
+        .await
+        .expect_err("off-grid chain price must fail the depth request closed");
+    let domain = err.downcast_ref::<DomainError>().expect("typed DomainError surfaced");
+    assert_eq!(*domain, DomainError::MarketInconsistent);
+}
+
+#[tokio::test]
+async fn depth_fails_closed_on_off_grid_amount() {
+    // The amount axis is held to the lot grid just as the price axis is held to
+    // the tick grid: price is on the tick grid here but the level amount is off
+    // the lot grid (last atom digit nonzero), so the per-level quantity descale
+    // must reject it rather than re-grid the book.
+    let Some(pool) = setup().await else { return };
+    let repo = PostgresReadModelRepository::new(pool.clone());
+
+    let pmp = "0:depth_off_grid_amount_pmp";
+    let symbol = "DEPTH_OFF_GRID_AMOUNT_YES";
+    let orderbook = "0:depth_off_grid_amount_book";
+    purge_market(&pool, pmp, symbol).await;
+    sqlx::query("delete from live_orders where orderbook_address = $1")
+        .bind(orderbook)
+        .execute(&pool)
+        .await
+        .expect("purge live_orders");
+    insert_market_with_outcome(&pool, pmp, symbol, Some(orderbook)).await;
+
+    // price 6100 is on the grid (drops "00" at price drop 2); amount
+    // 100_000_001 leaves a nonzero "1" after the drop-4 lot descale.
+    sqlx::query(
+        r#"insert into live_orders
+               (orderbook_address, order_id, outcome_id, is_buy, price,
+                amount_initial, amount_remaining, status,
+                last_chain_order, placed_chain_order)
+           values ($1, 1::numeric, 1, true, 6100::numeric,
+                   100000001::numeric, 100000001::numeric, 'OPEN',
+                   '5f800000000000', '5f800000000000')"#,
+    )
+    .bind(orderbook)
+    .execute(&pool)
+    .await
+    .expect("insert off-grid live_orders");
+
+    let err = repo
+        .get_depth(&MarketAddress(pmp.into()), &Symbol(symbol.into()), 100)
+        .await
+        .expect_err("off-grid level amount must fail the depth request closed");
+    let domain = err.downcast_ref::<DomainError>().expect("typed DomainError surfaced");
+    assert_eq!(*domain, DomainError::MarketInconsistent);
 }
 
 #[tokio::test]
