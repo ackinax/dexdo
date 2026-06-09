@@ -20,6 +20,9 @@ use ackinacki_kit::tvm_client::net;
 use ackinacki_kit::tvm_client::ClientContext;
 use serde::Deserialize;
 
+use crate::dapp::account_query_vars;
+use crate::dapp::dex_contract_params;
+
 /// External destination address every `VoucherGenerated` event lands on,
 /// computed by `RootPN.sol::generateVoucher` as
 /// `address.makeAddrExtern(VAULT_voucher_GENERATED, bitCntAddress)`.
@@ -32,6 +35,27 @@ const GQL_EXTOUT_MESSAGES: &str = r#"
     query($address: String!, $last: Int!) {
       blockchain {
         account(address: $address) {
+          messages(msg_type: [ExtOut], last: $last) {
+            edges {
+              node {
+                id
+                boc
+                body
+                dst
+                created_at
+                src_transaction { id }
+              }
+            }
+          }
+        }
+      }
+    }
+"#;
+
+const GQL_EXTOUT_MESSAGES_V3: &str = r#"
+    query($accountId: String!, $dappId: String!, $last: Int!) {
+      blockchain {
+        account(account_id: $accountId, dapp_id: $dappId) {
           messages(msg_type: [ExtOut], last: $last) {
             edges {
               node {
@@ -98,15 +122,14 @@ pub async fn fetch_extout_voucher_events(
     last: u32,
     with_block_id: bool,
 ) -> KitResult<Vec<VoucherExtoutMessage>> {
+    let dapp_id_api = ackinacki_kit::contracts::dapp::supports_dapp_id(&context, MODULE).await?;
+    let query = if dapp_id_api { GQL_EXTOUT_MESSAGES_V3 } else { GQL_EXTOUT_MESSAGES };
+    let mut variables = account_query_vars(dapp_id_api, root_pn_address);
+    variables.insert("last".to_string(), serde_json::json!(last));
+    let variables = serde_json::Value::Object(variables);
     let raw = net::query(
         context.clone(),
-        net::ParamsOfQuery {
-            query: GQL_EXTOUT_MESSAGES.to_string(),
-            variables: Some(serde_json::json!({
-                "address": root_pn_address,
-                "last": last,
-            })),
-        },
+        net::ParamsOfQuery { query: query.to_string(), variables: Some(variables) },
     )
     .await
     .map_err(|e| {
@@ -241,7 +264,7 @@ pub async fn wait_for_voucher_event_by_sk_u_commit(
     timeout: Duration,
 ) -> KitResult<VoucherExtoutMessage> {
     let target = canonicalize_sk_u_commit(sk_u_commit_hex);
-    let root_pn = RootPn::new(context.clone(), root_pn_address);
+    let root_pn = RootPn::new(context.clone(), dex_contract_params(root_pn_address));
     let start = Instant::now();
 
     loop {

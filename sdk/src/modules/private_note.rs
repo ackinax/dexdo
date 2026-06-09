@@ -1,5 +1,4 @@
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelAllOrders;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelBatch;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrder;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrderByClient;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfChangeOwner;
@@ -25,6 +24,7 @@ use ackinacki_kit::tvm_client::abi::Signer;
 use ackinacki_kit::tvm_client::processing::ResultOfSendMessage;
 
 use crate::client::DexContext;
+use crate::dex_contract_params;
 use crate::errors::AppResult;
 use crate::services;
 
@@ -42,11 +42,11 @@ impl<'a> PrivateNoteModule<'a> {
     }
 
     fn root_pn(&self) -> RootPn {
-        RootPn::new_default(self.ctx.tvm_client.clone())
+        RootPn::new(self.ctx.tvm_client.clone(), dex_contract_params(RootPn::DEFAULT_ADDRESS))
     }
 
     fn pn(&self, address: &str) -> PrivateNote {
-        PrivateNote::new(self.ctx.tvm_client.clone(), address)
+        PrivateNote::new(self.ctx.tvm_client.clone(), dex_contract_params(address))
     }
 
     // --- Voucher (entry point from multifactor wallet) ---
@@ -233,16 +233,6 @@ impl<'a> PrivateNoteModule<'a> {
     ) -> AppResult<ResultOfSendMessage> {
         self.ctx.acquire().await;
         services::private_note::cancel_order_by_client(&self.pn(pn_address), params, signer).await
-    }
-
-    pub async fn cancel_batch(
-        &self,
-        pn_address: &str,
-        params: ParamsOfCancelBatch,
-        signer: Signer,
-    ) -> AppResult<ResultOfSendMessage> {
-        self.ctx.acquire().await;
-        services::private_note::cancel_batch(&self.pn(pn_address), params, signer).await
     }
 
     pub async fn cancel_all_orders(

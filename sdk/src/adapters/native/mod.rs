@@ -6,7 +6,6 @@ use ackinacki_kit::contracts::dex::oracle_event_list::ParamsOfAddEvent;
 use ackinacki_kit::contracts::dex::oracle_event_list::ParamsOfConfirmOrCancelEvent;
 use ackinacki_kit::contracts::dex::oracle_event_list::ParamsOfDeleteEvent;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelAllOrders;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelBatch;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrder;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrderByClient;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfChangeOwner;
@@ -40,6 +39,7 @@ use dto::private_note::ResultOfBlockchainWrite;
 
 use crate::client::DexClient;
 use crate::client::DexConfig;
+use crate::dex_contract_params;
 use crate::errors::AppResult;
 
 pub struct Dex {
@@ -219,15 +219,6 @@ impl Dex {
             .map(Into::into)
     }
 
-    pub async fn cancel_batch(
-        &self,
-        pn_address: &str,
-        params: ParamsOfCancelBatch,
-        signer: Signer,
-    ) -> AppResult<ResultOfBlockchainWrite> {
-        self.inner.private_note().cancel_batch(pn_address, params, signer).await.map(Into::into)
-    }
-
     pub async fn cancel_all_orders(
         &self,
         pn_address: &str,
@@ -274,8 +265,9 @@ impl Dex {
         names: Vec<String>,
         token_type: u32,
     ) -> AppResult<String> {
-        let root_pn = ackinacki_kit::contracts::dex::root_pn::RootPn::new_default(
+        let root_pn = ackinacki_kit::contracts::dex::root_pn::RootPn::new(
             self.inner.private_note().ctx_client(),
+            dex_contract_params(ackinacki_kit::contracts::dex::root_pn::RootPn::DEFAULT_ADDRESS),
         );
         let result = root_pn
             .get_pmp_address(ackinacki_kit::contracts::dex::root_pn::ParamsOfGetPmpAddress {
@@ -393,19 +385,13 @@ impl Dex {
     /// shutdown; the OB drains its queue and reports back via
     /// `onOrderBookShutdownComplete`, which flips `order_book_done` to
     /// true. `claim()` is gated on this flag.
-    pub async fn get_pmp_shutdown_state(
-        &self,
-        pmp_address: &str,
-    ) -> AppResult<PmpShutdownState> {
+    pub async fn get_pmp_shutdown_state(&self, pmp_address: &str) -> AppResult<PmpShutdownState> {
         self.inner.pmp().get_shutdown_state(pmp_address).await.map(Into::into)
     }
 
     // ── OrderBook ────────────────────────────────────────────────
 
-    pub async fn get_order_book_details(
-        &self,
-        ob_address: &str,
-    ) -> AppResult<OrderBookDetails> {
+    pub async fn get_order_book_details(&self, ob_address: &str) -> AppResult<OrderBookDetails> {
         self.inner.order_book().get_details(ob_address).await.map(Into::into)
     }
 
@@ -456,9 +442,7 @@ impl Dex {
         deposit_identifier_hash: String,
         client_order_id: u128,
     ) -> AppResult<Option<u128>> {
-        let owned = self
-            .get_orders_by_owner(ob_address, deposit_identifier_hash)
-            .await?;
+        let owned = self.get_orders_by_owner(ob_address, deposit_identifier_hash).await?;
         Ok(owned
             .orders
             .into_iter()

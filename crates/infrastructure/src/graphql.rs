@@ -1,8 +1,17 @@
 // 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 //
 
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use ackinacki_kit::contracts::dapp::SystemDapp;
+use ackinacki_kit::tvm_client::account::get_account;
+use ackinacki_kit::tvm_client::account::ParamsOfGetAccount;
+use ackinacki_kit::tvm_client::net::ErrorCode;
+use ackinacki_kit::tvm_client::ClientConfig;
+use ackinacki_kit::tvm_client::ClientContext;
+use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use reqwest::Client;
@@ -34,20 +43,17 @@ const EVENTS_QUERY: &str = r#"query Events($first: Int!, $after: String) {
   }
 }"#;
 
-const ACCOUNT_BOC_QUERY: &str = r#"query AccountBoc($address: String!) {
-  blockchain {
-    account(address: $address) {
-      info {
-        boc
-      }
-    }
-  }
-}"#;
-
 #[derive(Debug, Clone)]
 pub struct GraphqlClient {
     http: Client,
     endpoint: String,
+    // Lazily-built tvm_client context for account-state reads. Account
+    // BOCs are NOT fetched over GraphQL: the >= 1.0.0 gateway's
+    // `account(){info{boc}}` sub-resolver hangs server-side, while the
+    // REST `/v2/account` route `tvm_client::account::get_account` uses
+    // works on both old and new gateways (it picks the `address=` vs
+    // `account_id=&dapp_id=` wire form from the server version itself).
+    tvm_ctx: Arc<OnceLock<Arc<ClientContext>>>,
 }
 
 impl GraphqlClient {
@@ -57,7 +63,7 @@ impl GraphqlClient {
             .user_agent(concat!("dodex-indexer/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("build http client")?;
-        Ok(Self { http, endpoint: endpoint.into() })
+        Ok(Self { http, endpoint: endpoint.into(), tvm_ctx: Arc::new(OnceLock::new()) })
     }
 
     pub async fn fetch_events(
@@ -95,33 +101,53 @@ impl GraphqlClient {
 
     /// Fetches the account state BOC (base64) for off-chain getter execution.
     /// Returns `None` if the account does not exist or has not been deployed yet.
+    ///
+    /// Goes through `tvm_client::account::get_account` (REST `/v2/account`),
+    /// not GraphQL — see the `tvm_ctx` field doc. DEX contracts live under
+    /// the System dApp (all-zero id); `account_id` is the address without
+    /// its `0:` workchain prefix.
     pub async fn fetch_account_boc(&self, address: &str) -> anyhow::Result<Option<String>> {
-        let payload = json!({
-            "query": ACCOUNT_BOC_QUERY,
-            "variables": { "address": address },
-        });
-
-        let response: GraphqlResponse<AccountBocData> = self
-            .http
-            .post(&self.endpoint)
-            .json(&payload)
-            .send()
-            .await
-            .context("graphql account request failed")?
-            .error_for_status()
-            .context("graphql account returned http error")?
-            .json()
-            .await
-            .context("graphql account response is not valid json")?;
-
-        if let Some(errors) = response.errors
-            && !errors.is_empty()
-        {
-            bail!("graphql account errors: {errors:?}");
+        let ctx = self.tvm_context()?;
+        let account_id = address.strip_prefix("0:").unwrap_or(address);
+        let params = ParamsOfGetAccount {
+            account_id: account_id.to_string(),
+            dapp_id: SystemDapp::System.dapp_id().to_string(),
+        };
+        match get_account(ctx, params).await {
+            Ok(result) => Ok(Some(result.boc)),
+            // A missing (account, dApp) pair surfaces as HTTP 404, which
+            // tvm_client maps to `ErrorCode::NotFound` — that, and only
+            // that, is this method's `None`. Matching on the code rather
+            // than a substring of the message keeps a transient 5xx (whose
+            // body tvm_client echoes verbatim, and which can itself read
+            // "not found" from a proxy/CDN error page) propagating as an
+            // error instead of masquerading as a not-deployed account.
+            Err(e) if e.code() == ErrorCode::NotFound as u32 => Ok(None),
+            Err(e) => Err(anyhow!("get_account for {address}: {e}")),
         }
+    }
 
-        let data = response.data.context("graphql account response missing data")?;
-        Ok(data.blockchain.account.and_then(|a| a.info.and_then(|i| i.boc)))
+    /// tvm_client context for `get_account`, built once per client from the
+    /// GraphQL endpoint's host (`https://host/graphql` → `host`).
+    fn tvm_context(&self) -> anyhow::Result<Arc<ClientContext>> {
+        if let Some(ctx) = self.tvm_ctx.get() {
+            return Ok(ctx.clone());
+        }
+        let host = self
+            .endpoint
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| anyhow!("cannot derive gateway host from `{}`", self.endpoint))?;
+        let mut config = ClientConfig::default();
+        config.network.endpoints = Some(vec![host.to_string()]);
+        let ctx = Arc::new(ClientContext::new(config).context("build tvm client context")?);
+        // Two clones racing here both build a context; the loser's copy is
+        // dropped. Harmless — construction is cheap and side-effect free.
+        let _ = self.tvm_ctx.set(ctx.clone());
+        Ok(ctx)
     }
 }
 
@@ -148,29 +174,6 @@ struct EventsData {
 #[derive(Debug, Deserialize)]
 struct Blockchain {
     events: EventsPage,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountBocData {
-    blockchain: AccountBocBlockchain,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountBocBlockchain {
-    #[serde(default)]
-    account: Option<AccountBocNode>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountBocNode {
-    #[serde(default)]
-    info: Option<AccountBocInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountBocInfo {
-    #[serde(default)]
-    boc: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

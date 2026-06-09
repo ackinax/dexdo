@@ -2,12 +2,15 @@
 //
 // Production implementation of `ChainOrderSender` that dispatches
 // `PrivateNote.placeOrder`, `PrivateNote.cancelOrder`,
-// `PrivateNote.placeBatch`, and `PrivateNote.cancelBatch` through the
-// `dodex_chain::Dex` facade. The wrapper does nothing except translate
-// the application-layer payloads into the chain ABI's
-// `ParamsOfPlaceOrder` / `ParamsOfCancelOrder` / `ParamsOfPlaceBatch` /
-// `ParamsOfCancelBatch` and forward the call — ABI encoding, signing,
-// and gateway transport all live in `ackinacki_kit`.
+// `PrivateNote.placeBatch`, and `PrivateNote.splitFullSet` through the
+// `dodex_chain::Dex` facade. `placeBatch` is the chain's atomic batch
+// entry: it carries both a placements side and a `cancelIds` side, so
+// batch cancels dispatch the same method with an empty `orders` array.
+// The wrapper does nothing except translate the application-layer
+// payloads into the chain ABI's `ParamsOfPlaceOrder` /
+// `ParamsOfCancelOrder` / `ParamsOfPlaceBatch` / `ParamsOfSplitFullSet`
+// and forward the call — ABI encoding, signing, and gateway transport
+// all live in `ackinacki_kit`.
 //
 // See `docs/tech-specs/write-api.md §Chain submission` for the layering
 // contract this implements.
@@ -15,7 +18,6 @@
 use std::time::Duration;
 
 use ackinacki_kit::contracts::dex::order_book::OrderBookOrder;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelBatch;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrder;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfPlaceBatch;
 use ackinacki_kit::contracts::dex::private_note::ParamsOfPlaceOrder;
@@ -232,12 +234,12 @@ impl ChainOrderSender for DexChainSender {
             orders.push(encode_batch_item(item, item_index)?);
         }
 
-        let params = ParamsOfPlaceBatch {
-            event_id: event_id.clone(),
-            oracle_list_hash: payload.oracle_list_hash,
-            token_type: payload.token_type,
+        let params = build_place_batch_params(
+            event_id.clone(),
+            payload.oracle_list_hash,
+            payload.token_type,
             orders,
-        };
+        );
 
         let call = self.dex.place_batch(&pn_address, params, signer);
         let outcome = timeout(self.place_batch_timeout, call).await;
@@ -289,14 +291,18 @@ impl ChainOrderSender for DexChainSender {
         let pn_address = payload.pn_address;
         let event_id = payload.event_id;
 
-        let params = ParamsOfCancelBatch {
-            event_id: event_id.clone(),
-            oracle_list_hash: payload.oracle_list_hash,
-            token_type: payload.token_type,
+        // The chain has no standalone cancelBatch: `placeBatch` is the
+        // atomic batch dispatch and a pure cancel rides it with an empty
+        // placements side. Built via `build_cancel_batch_params` so the
+        // orders-empty / ids-on-cancel-side shape is unit-testable.
+        let params = build_cancel_batch_params(
+            event_id.clone(),
+            payload.oracle_list_hash,
+            payload.token_type,
             order_ids,
-        };
+        );
 
-        let call = self.dex.cancel_batch(&pn_address, params, signer);
+        let call = self.dex.place_batch(&pn_address, params, signer);
         let outcome = timeout(self.cancel_batch_timeout, call).await;
         let ctx = ChainCallContext {
             entry_point: "cancel_batch",
@@ -363,6 +369,34 @@ impl ChainOrderSender for DexChainSender {
         };
         classify_chain_outcome(outcome, self.split_full_set_timeout.as_millis() as u64, &ctx)
     }
+}
+
+/// Build the chain params for a batch placement. `placeBatch` carries
+/// both sides; a placement MUST leave `cancel_ids` empty — a stray id
+/// here would silently cancel orders during a POST. Mirror of
+/// `build_cancel_batch_params` so that shape is unit-testable.
+fn build_place_batch_params(
+    event_id: String,
+    oracle_list_hash: String,
+    token_type: u32,
+    orders: Vec<OrderBookOrder>,
+) -> ParamsOfPlaceBatch {
+    ParamsOfPlaceBatch { event_id, oracle_list_hash, token_type, orders, cancel_ids: vec![] }
+}
+
+/// Build the chain params for a batch cancel. The chain has no
+/// standalone cancelBatch: a pure cancel rides `placeBatch` with no
+/// placements and the ids on `cancel_ids`. Extracted so the
+/// orders-empty / ids-on-cancel-side shape is unit-testable — swapping
+/// the two sides would cancel nothing (or place phantom orders) yet
+/// pass every other test.
+fn build_cancel_batch_params(
+    event_id: String,
+    oracle_list_hash: String,
+    token_type: u32,
+    cancel_ids: Vec<u128>,
+) -> ParamsOfPlaceBatch {
+    ParamsOfPlaceBatch { event_id, oracle_list_hash, token_type, orders: vec![], cancel_ids }
 }
 
 /// Translate one application-layer `BatchOrderPayloadItem` into the
@@ -568,8 +602,8 @@ fn map_chain_error(err: &ChainError, ctx: &ChainCallContext<'_>) -> DomainError 
 }
 
 /// `PrivateNote` exit codes from `contracts/modifiers/errors.sol`,
-/// shared across the five entry points (`placeOrder`, `cancelOrder`,
-/// `placeBatch`, `cancelBatch`, `splitFullSet`) the wrapper dispatches —
+/// shared across the entry points (`placeOrder`, `cancelOrder`,
+/// `placeBatch`, `splitFullSet`) the wrapper dispatches —
 /// the originating entry point is carried in `ChainCallContext.entry_point`
 /// for the unmapped-code log site. Only codes the trading path can
 /// plausibly raise are mapped; everything else returns `None` so
@@ -583,7 +617,7 @@ fn map_tvm_exit_code(code: u16) -> Option<DomainError> {
         // precision check, but the contract guards it too).
         102 => Some(DomainError::OrderValidationFailed),
         // ERR_NOTE_BUSY: another PN-level op (any of placeOrder /
-        // cancelOrder / placeBatch / cancelBatch) is still holding the
+        // cancelOrder / placeBatch / splitFullSet) is still holding the
         // `_busy` lock for this PN. Distinct retry semantics — 429 /
         // -2014 instead of -2010.
         121 => Some(DomainError::OrderPnBusy),
@@ -625,7 +659,7 @@ fn map_tvm_exit_code(code: u16) -> Option<DomainError> {
         // defence-in-depth against the same length checks the use
         // case pre-applies (`orders.len()` ∈ [1, `max_batch_size`]).
         // Reaching them means the local guard was bypassed — i.e.
-        // the read-model's `max_batch_size` drifted from the on-chain
+        // the configured `chain.max_batch_size` drifted from the on-chain
         // ceiling — which is a server-state inconsistency, not a
         // client error. Surface as `MarketInconsistent` (503 / -1500)
         // so ops sees it instead of confusing the client with a
@@ -937,6 +971,32 @@ mod tests {
 
         let err = sender.cancel_batch_order(payload).await.expect_err("decode must fail closed");
         assert_eq!(err, DomainError::MarketInconsistent);
+    }
+
+    #[test]
+    fn place_batch_carries_no_cancel_ids() {
+        // Mirror of the cancel-side guard: a placement MUST leave
+        // `cancel_ids` empty — a stray id would silently cancel orders
+        // during a POST, the more dangerous direction of the collapse.
+        let params = build_place_batch_params("0xevent".into(), "0xhash".into(), 1, vec![]);
+        assert!(params.cancel_ids.is_empty(), "a place batch must carry no cancel ids");
+        assert_eq!(params.event_id, "0xevent");
+        assert_eq!(params.token_type, 1);
+    }
+
+    #[test]
+    fn cancel_batch_rides_place_batch_with_empty_orders() {
+        // The headline cancelBatch→placeBatch collapse: a pure cancel
+        // MUST carry no placements and put the ids on `cancel_ids`.
+        // Swapping the two sides would cancel nothing (or place phantom
+        // orders) yet pass the rest of the suite — this is the guard.
+        let params =
+            build_cancel_batch_params("0xevent".into(), "0xhash".into(), 1, vec![10, 20, 30]);
+        assert!(params.orders.is_empty(), "a batch cancel must place no orders");
+        assert_eq!(params.cancel_ids, vec![10u128, 20, 30]);
+        assert_eq!(params.event_id, "0xevent");
+        assert_eq!(params.oracle_list_hash, "0xhash");
+        assert_eq!(params.token_type, 1);
     }
 
     #[test]

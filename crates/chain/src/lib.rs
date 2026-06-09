@@ -4,8 +4,9 @@
 // handles. Two consumers:
 //
 //   * `dodex-infrastructure::chain_sender` — production trader path
-//     (`place_order` / `cancel_order` / `place_batch` / `cancel_batch`)
-//     plus the order-book read used by e2e cleanup polling.
+//     (`place_order` / `cancel_order` / `place_batch`; batch cancels go
+//     through `place_batch` with an empty `orders` side) plus the
+//     order-book read used by e2e cleanup polling.
 //
 //   * the api e2e tests — spawn ephemeral PMP + OrderBook setups via
 //     the deploy entry points (`deploy_pmp`, `submit_set_timings`,
@@ -20,6 +21,7 @@
 // `chain_sender` wraps each call in `tokio::time::timeout`).
 
 mod client;
+mod dapp;
 mod dto;
 mod error;
 
@@ -27,6 +29,7 @@ mod error;
 mod test_helpers;
 
 pub use client::Dex;
+pub use dapp::dex_contract_params;
 pub use dto::OwnedOrder;
 pub use dto::OwnedOrders;
 pub use error::ChainError;

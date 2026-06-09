@@ -294,7 +294,7 @@ Response:
           "tickSize": "0.001",
           "stepSize": "0.01",
           "minNotional": "1",
-          "maxBatchSize": 5
+          "maxBatchSize": 10
         },
         {
           "outcomeId": 1,
@@ -305,7 +305,7 @@ Response:
           "tickSize": "0.001",
           "stepSize": "0.01",
           "minNotional": "1",
-          "maxBatchSize": 5
+          "maxBatchSize": 10
         }
       ]
     }
@@ -478,7 +478,7 @@ Example for a non-terminal market (any of the six live statuses, including the t
   "tickSize": "0.001",
   "stepSize": "0.01",
   "minNotional": "1",
-  "maxBatchSize": 5
+  "maxBatchSize": 10
 }
 ```
 
