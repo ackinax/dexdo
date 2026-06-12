@@ -23,9 +23,10 @@
 // Marked `#[ignore]` because it needs:
 //   - TEST_DATABASE_URL (test Postgres up — see README.md#test-postgres)
 //   - reachable shellnet endpoint
-//   - `tests/fixtures/test_pns.json` extended to slot 4 (the fifth PN)
-//     via `mint_pn_pool` — `TestPnPool::slot(4)` panics with a clear
-//     "top up via mint_pn_pool" message until the pool is extended.
+//   - `tests/fixtures/seed_notes.json` with at least one funded PN, shared
+//     across the whole single-threaded e2e suite (see
+//     tests/fixtures/README.md). That note must hold enough NACKL to cover
+//     every test's market deploy + this split.
 //
 // Run explicitly:
 //
@@ -44,9 +45,9 @@ use common::canonical_query;
 use common::deploy_market::deploy_ephemeral_market;
 use common::deploy_market::DeployOptions;
 use common::e2e_setup::db_pool;
+use common::e2e_setup::network_endpoint;
 use common::e2e_setup::provision_account;
 use common::e2e_setup::upsert_market;
-use common::e2e_setup::SHELLNET_ENDPOINT;
 use common::now_ms;
 use common::sign;
 use common::test_pns::TestPnPool;
@@ -69,11 +70,6 @@ use salvo::Service;
 use serde::Deserialize;
 use serde_json::json;
 
-/// Slot 4 per `tests/fixtures/README.md` — buyFullSet has its own PN
-/// so a parallel `cargo nextest run` does not contend with the four
-/// other e2e tests on `_busy`.
-const BUY_FULL_SET_SLOT: usize = 4;
-
 /// 10 NACKL of collateral at decimals=9. Small enough to leave the PN
 /// solvent after the ~300 NACKL deploy already spent (see
 /// `tests/fixtures/README.md#orderbook-fixture`); large enough to be
@@ -82,7 +78,7 @@ const COLLATERAL_HUMAN: &str = "10";
 const COLLATERAL_RAW: u128 = 10_000_000_000;
 
 #[tokio::test]
-#[ignore = "requires TEST_DATABASE_URL + shellnet + tests/fixtures/test_pns.json slot 4"]
+#[ignore = "requires TEST_DATABASE_URL + shellnet + tests/fixtures/seed_notes.json"]
 async fn buy_full_set_against_shellnet() {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
@@ -94,21 +90,20 @@ async fn buy_full_set_against_shellnet() {
         return;
     };
 
+    // Shared single note — the suite is single-threaded (see
+    // tests/fixtures/README.md), so the PN `_busy` lock never contends.
     let pn_pool = TestPnPool::load();
-    let trader = pn_pool.slot(BUY_FULL_SET_SLOT).clone();
+    let trader = pn_pool.first().clone();
 
     // `deploy_ephemeral_market` ends with its own splitFullSet, so by
     // the time this returns the market is in TRADING and the trader-PN
     // already holds some outcome tokens. The buyFullSet we send below
     // is a SECOND split that accumulates onto the existing stake — see
     // `PrivateNote.onSplitAccepted` in `contracts/PrivateNote.sol`.
-    let market = deploy_ephemeral_market(
-        vec![SHELLNET_ENDPOINT.to_string()],
-        &trader,
-        DeployOptions::default(),
-    )
-    .await
-    .expect("deploy ephemeral market");
+    let market =
+        deploy_ephemeral_market(vec![network_endpoint()], &trader, DeployOptions::default())
+            .await
+            .expect("deploy ephemeral market");
 
     let outcome_for_symbol = market.outcome_name.replace(' ', "-");
     let pmp_short = &market.pmp_address[..16.min(market.pmp_address.len())];
@@ -118,7 +113,7 @@ async fn buy_full_set_against_shellnet() {
 
     let chain_sender: SharedChainSender = Arc::new(
         DexChainSender::new(
-            vec![SHELLNET_ENDPOINT.to_string()],
+            vec![network_endpoint()],
             Duration::from_secs(30),
             Duration::from_secs(30),
             Duration::from_secs(30),
@@ -136,6 +131,7 @@ async fn buy_full_set_against_shellnet() {
         default_recv_window_ms: 5_000,
         max_recv_window_ms: 60_000,
         seed_accounts: false,
+        seed_accounts_path: None,
     };
     let authenticator: SharedAuth =
         Arc::new(PostgresAuthenticator::new(pool.clone(), kek.clone(), &auth_config));
@@ -150,8 +146,7 @@ async fn buy_full_set_against_shellnet() {
     // Raw chain handle for the before/after balance probe. Shares no
     // state with the API's `DexChainSender` — that one would block
     // on its own timeout config and is not designed for read getters.
-    let raw_dex = RawDex::from_endpoints(vec![SHELLNET_ENDPOINT.to_string()])
-        .expect("RawDex::from_endpoints");
+    let raw_dex = RawDex::from_endpoints(vec![network_endpoint()]).expect("RawDex::from_endpoints");
 
     // Wait for `_busy` to clear before reading the pre-balance.
     // `deploy_ephemeral_market`'s splitFullSet sets the PN busy until

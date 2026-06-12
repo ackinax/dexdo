@@ -1,7 +1,7 @@
 // HTTP-level integration tests for the auth hoop and the permission
 // gate on `POST /api/v1/order`. Each test sends a real request through
 // the production router (constructed by `dodex_api::build_router`)
-// against the test DB seeded with `seed::seed_accounts`, then asserts
+// against the test DB seeded via `seed::seed_accounts_from_notes`, then asserts
 // on status + spec error body.
 //
 // The seeded test DB has no `markets` rows, so a fully-authorised
@@ -359,4 +359,15 @@ async fn cleanup_readonly_key(pool: &PgPool, api_key: &str) {
     {
         eprintln!("cleanup readonly api_key failed: {err}");
     }
+}
+
+// Pins the seeded-credential consts to the KEK derivation so a scheme
+// change (or a hand-edited const) cannot silently desync them from what
+// `seed_accounts_from_notes` writes. No DB required.
+#[test]
+fn seed_secret_consts_match_kek_derivation() {
+    use dodex_infrastructure::crypto::derive_api_secret;
+    let kek = common::test_kek();
+    assert_eq!(SEED_API_SECRET, hex::encode(derive_api_secret(&kek, 0)));
+    assert_eq!(common::SEED_API_SECRET_2, hex::encode(derive_api_secret(&kek, 1)));
 }

@@ -2,7 +2,8 @@
 // declares `mod common;` and uses the setup/sign primitives below.
 //
 // The whole suite shares a single test DB (the docker-compose.test.yml
-// Postgres). The seeded credentials baked into `seed::seed_accounts`
+// Postgres). The credentials seeded from `SEED_NOTES_FIXTURE` via
+// `seed::seed_accounts_from_notes`
 // are read-only as far as tests are concerned, so parallel reads are
 // safe. Tests that mutate rows (e.g. the USER_DATA-only permission
 // case) carry their own cleanup.
@@ -15,6 +16,7 @@ pub mod e2e_setup;
 pub mod test_pns;
 
 use std::collections::HashMap as StdHashMap;
+use std::collections::HashSet as StdHashSet;
 use std::env;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -38,6 +40,7 @@ use dodex_application::PnStateReader;
 use dodex_application::RefToken;
 use dodex_application::ReferenceRepository;
 use dodex_domain::DomainError;
+use dodex_infrastructure::account_registry::PostgresAccountRegistry;
 use dodex_infrastructure::auth::PostgresAuthenticator;
 use dodex_infrastructure::config::AuthSection;
 use dodex_infrastructure::crypto::Kek;
@@ -53,16 +56,25 @@ use sqlx::PgPool;
 
 pub type HmacSha256 = Hmac<Sha256>;
 
-/// First seeded api_key/secret pair from `seed.rs`. Used as the
-/// "happy path" credential across the auth_http tests.
+/// Credentials the seeder mints for the first two notes of the test
+/// fixture (`SEED_NOTES_FIXTURE`). The api_key is `dk_live_test_{n:03}`;
+/// the secret is `crypto::derive_api_secret(test_kek, index)`, pinned
+/// here so the signing tests need no DB round-trip and guarded against
+/// drift by `seed_secret_consts_match_kek_derivation` in auth_http.rs.
 pub const SEED_API_KEY: &str = "dk_live_test_001";
 pub const SEED_API_SECRET: &str =
-    "1de6fc5cf8899e7f1dacf449fe46c3c88854478b7fcd9dd26c664535ee589966";
+    "86c223a600ce630f9abf62ea2244ca638a2e02bb16d73d74128bf31f5d3e1910";
 
-/// Second seeded api_key/secret pair, used for cross-tenant isolation tests.
+/// Second seeded credential, used for cross-tenant isolation tests.
 pub const SEED_API_KEY_2: &str = "dk_live_test_002";
 pub const SEED_API_SECRET_2: &str =
-    "0353c808ebdf3f4d5074bc9d9465093acc28cf7ce4ef24d413dd98c4bc4191ef";
+    "55ed737c64cf4069c33275745ba96a06a8e9bd7d14b65bf97eadf701a38b2a55";
+
+/// Notes fixture the api test suite seeds from. Dummy custody keys — the
+/// suite mocks the chain, so `pn_seckey` is never used to sign on-chain;
+/// real notes are provided on CI out of band.
+pub const SEED_NOTES_FIXTURE: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/seed_notes_dummy.json");
 
 /// Fixed KEK for tests so seeded ciphertexts decrypt across runs.
 pub fn test_kek() -> Arc<Kek> {
@@ -88,7 +100,9 @@ pub async fn setup() -> Option<(Service, PgPool, Arc<Kek>, Arc<FakePnStateReader
     database::run_migrations(&pool).await.expect("run migrations");
 
     let kek = test_kek();
-    seed::seed_accounts(&pool, &kek).await.expect("seed credentials");
+    seed::seed_accounts_from_notes(&pool, &kek, std::path::Path::new(SEED_NOTES_FIXTURE))
+        .await
+        .expect("seed credentials");
 
     let repo: SharedRepo = Arc::new(PostgresReadModelRepository::new(pool.clone()));
     let auth_config = AuthSection {
@@ -96,6 +110,7 @@ pub async fn setup() -> Option<(Service, PgPool, Arc<Kek>, Arc<FakePnStateReader
         default_recv_window_ms: 5_000,
         max_recv_window_ms: 60_000,
         seed_accounts: false,
+        seed_accounts_path: None,
     };
     let authenticator: SharedAuth =
         Arc::new(PostgresAuthenticator::new(pool.clone(), kek.clone(), &auth_config));
@@ -107,7 +122,10 @@ pub async fn setup() -> Option<(Service, PgPool, Arc<Kek>, Arc<FakePnStateReader
     let pn_reader_inner = Arc::new(FakePnStateReader::default());
     let pn_reader: dodex_api::testkit::SharedPnReader = pn_reader_inner.clone();
     let ref_repo: dodex_api::testkit::SharedRefRepo = Arc::new(FakeReferenceRepo::with_seeded());
-    let state = AppState::new(repo, authenticator, chain_sender, pn_reader, ref_repo);
+    let registry: dodex_api::testkit::SharedRegistry =
+        Arc::new(PostgresAccountRegistry::new(pool.clone(), kek.clone()));
+    let state = AppState::new(repo, authenticator, chain_sender, pn_reader, ref_repo)
+        .with_account_registry(registry);
     let service = Service::new(build_router(state));
     Some((service, pool, kek, pn_reader_inner))
 }
@@ -129,7 +147,9 @@ pub async fn setup_with_pn_reader(
     database::run_migrations(&pool).await.expect("run migrations");
 
     let kek = test_kek();
-    seed::seed_accounts(&pool, &kek).await.expect("seed credentials");
+    seed::seed_accounts_from_notes(&pool, &kek, std::path::Path::new(SEED_NOTES_FIXTURE))
+        .await
+        .expect("seed credentials");
 
     let repo: SharedRepo = Arc::new(PostgresReadModelRepository::new(pool.clone()));
     let auth_config = AuthSection {
@@ -137,12 +157,16 @@ pub async fn setup_with_pn_reader(
         default_recv_window_ms: 5_000,
         max_recv_window_ms: 60_000,
         seed_accounts: false,
+        seed_accounts_path: None,
     };
     let authenticator: SharedAuth =
         Arc::new(PostgresAuthenticator::new(pool.clone(), kek.clone(), &auth_config));
     let chain_sender: SharedChainSender = Arc::new(NoopChainSender);
     let ref_repo: dodex_api::testkit::SharedRefRepo = Arc::new(FakeReferenceRepo::with_seeded());
-    let state = AppState::new(repo, authenticator, chain_sender, pn_reader, ref_repo);
+    let registry: dodex_api::testkit::SharedRegistry =
+        Arc::new(PostgresAccountRegistry::new(pool.clone(), kek.clone()));
+    let state = AppState::new(repo, authenticator, chain_sender, pn_reader, ref_repo)
+        .with_account_registry(registry);
     let service = Service::new(build_router(state));
     Some((service, pool, kek))
 }
@@ -206,8 +230,17 @@ pub struct FakePnStateReader {
     details: Mutex<Option<Result<PnDetails, String>>>,
     stake: Mutex<Option<Option<PnStake>>>,
     stake_err: Mutex<Option<String>>,
+    // Untyped fault for `owner_pubkey` — the single chain read registration
+    // uses as its existence probe. Maps to a retryable 503 (-1500), distinct
+    // from `not_deployed`'s typed -2013.
+    owner_err: Mutex<Option<String>>,
     // Per-address overrides.
     details_by_pn: Mutex<StdHashMap<String, Result<PnDetails, String>>>,
+    // Addresses that `get_details` answers with a typed
+    // `DomainError::AccountNotDeployed` (-2013) — distinct from
+    // `fail_details`, which maps to a generic 503. Lets registration tests
+    // drive the "PN not on-chain" path.
+    not_deployed: Mutex<StdHashSet<String>>,
     stake_by_pn: Mutex<StdHashMap<String, Option<PnStake>>>,
     // Hash-keyed overrides. When non-empty, any stake_hash absent from the
     // map returns `None` — this is how tests verify the production hasher
@@ -224,6 +257,13 @@ impl FakePnStateReader {
         *self.details.lock().unwrap() = Some(Err(msg.into()));
     }
 
+    /// Make `owner_pubkey(pn_address)` fail with an untyped (gateway/ABI)
+    /// error so callers exercise the retryable 503 path on registration's
+    /// chain read.
+    pub fn fail_owner_pubkey(&self, msg: &str) {
+        *self.owner_err.lock().unwrap() = Some(msg.into());
+    }
+
     pub fn set_stake(&self, s: Option<PnStake>) {
         *self.stake.lock().unwrap() = Some(s);
     }
@@ -234,6 +274,13 @@ impl FakePnStateReader {
 
     pub fn set_details_for(&self, pn_address: &str, d: PnDetails) {
         self.details_by_pn.lock().unwrap().insert(pn_address.to_string(), Ok(d));
+    }
+
+    /// Make `get_details(pn_address)` return a typed
+    /// `DomainError::AccountNotDeployed` so callers exercise the -2013
+    /// path (e.g. registering a note that is not deployed on-chain).
+    pub fn set_not_deployed(&self, pn_address: &str) {
+        self.not_deployed.lock().unwrap().insert(pn_address.to_string());
     }
 
     pub fn set_stake_for(&self, pn_address: &str, s: Option<PnStake>) {
@@ -248,6 +295,9 @@ impl FakePnStateReader {
 #[async_trait]
 impl PnStateReader for FakePnStateReader {
     async fn get_details(&self, pn_address: &str) -> anyhow::Result<PnDetails> {
+        if self.not_deployed.lock().unwrap().contains(pn_address) {
+            return Err(anyhow::Error::from(DomainError::AccountNotDeployed));
+        }
         if let Some(result) = self.details_by_pn.lock().unwrap().get(pn_address).cloned() {
             return match result {
                 Ok(d) => Ok(d),
@@ -279,6 +329,18 @@ impl PnStateReader for FakePnStateReader {
             return Ok(s);
         }
         Ok(self.stake.lock().unwrap().clone().unwrap_or(None))
+    }
+
+    async fn owner_pubkey(&self, pn_address: &str) -> anyhow::Result<String> {
+        if let Some(msg) = self.owner_err.lock().unwrap().clone() {
+            return Err(anyhow::anyhow!(msg));
+        }
+        if self.not_deployed.lock().unwrap().contains(pn_address) {
+            return Err(anyhow::Error::from(DomainError::AccountNotDeployed));
+        }
+        // The fixture note is owned by the canonical test seckey ("00"*32);
+        // a registration submitting a different key fails the binding.
+        Ok(dodex_application::derive_ed25519_pubkey_hex(&"00".repeat(32)).unwrap())
     }
 }
 
@@ -335,6 +397,10 @@ impl PnStateReader for RawJsonPnStateReader {
                 anyhow::anyhow!("RawJsonPnStateReader: no stakes for {pn_address}")
             })?;
         dodex_infrastructure::pn_state_reader::stake_from_value(&v, stake_hash)
+    }
+
+    async fn owner_pubkey(&self, _pn_address: &str) -> anyhow::Result<String> {
+        anyhow::bail!("RawJsonPnStateReader: register flow uses FakePnStateReader")
     }
 }
 

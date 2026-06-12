@@ -5,6 +5,7 @@ use num_bigint::BigUint;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
+use zeroize::Zeroize;
 use zeroize::ZeroizeOnDrop;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -999,6 +1000,50 @@ impl From<Vec<u8>> for SensitiveBytes {
     }
 }
 
+/// A plaintext secret held as text — the string analogue of
+/// [`SensitiveBytes`], for a secret that must stay textual at a boundary
+/// (a hex key carried over the wire, the one-time `api_secret` echo) rather
+/// than decode to bytes. Suppresses `Debug` and wipes its buffer on drop,
+/// so a struct embedding it can `#[derive(Debug)]` without leaking the
+/// secret and need not hand-write a redacting `Debug` that a later field
+/// could silently slip past.
+pub struct SensitiveString(String);
+
+impl SensitiveString {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the wrapper and surface the plaintext. The only way out: a
+    /// caller must opt in explicitly (e.g. to serialise the one-time
+    /// `api_secret`), and the wrapper — with its on-drop wipe — is gone
+    /// afterwards.
+    pub fn into_inner(mut self) -> String {
+        // `mem::take` leaves an empty String for our `Drop` to wipe (a
+        // no-op) and moves the live buffer out — a plain field move is
+        // forbidden while `Drop` is implemented.
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl From<String> for SensitiveString {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl Drop for SensitiveString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SensitiveString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SensitiveString(<redacted, {} chars>)", self.0.len())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DomainError {
     /// Binance-compatible `-1102`. Some handlers also use this for a
@@ -1040,6 +1085,23 @@ pub enum DomainError {
     /// so clients can offer "deploy your account" rather than retry.
     #[error("account not deployed")]
     AccountNotDeployed,
+    /// Account registration was attempted for a PrivateNote that already
+    /// has an account — a conflict on `accounts.pn_address` or
+    /// `accounts.pn_dih`. Registration is insert-only: an existing note is
+    /// never re-credentialed and its secret is never re-issued. Surfaces
+    /// as 409 so the caller knows the note is taken, not that the request
+    /// was malformed.
+    #[error("private note already registered")]
+    NoteAlreadyRegistered,
+    /// Registration supplied a private key that does not control the note's
+    /// on-chain owner: the note is deployed, but the submitted `pn_seckey`
+    /// derives a different public key than the PrivateNote's owner key
+    /// (`_ephemeralPubkey`), so a
+    /// credential minted from it could never sign a valid trade. Rejected
+    /// before any row is written, so a bogus key cannot squat the note's
+    /// unique constraint. Surfaces as 400.
+    #[error("submitted key does not control this private note")]
+    KeyDoesNotOwnNote,
     /// The read-model row violates a tech-spec invariant (e.g. RESOLVED with
     /// `frozenAt = null`, CANCELLED with `cancelReason = null`). Per the
     /// invariant-checking contract in `docs/tech-specs/read-api.md`
@@ -1086,6 +1148,8 @@ impl DomainError {
             Self::UnknownOrder => -2011,
             Self::AccountNotDeployed => -2013,
             Self::OrderPnBusy => -2014,
+            Self::NoteAlreadyRegistered => -2015,
+            Self::KeyDoesNotOwnNote => -2016,
         }
     }
 
@@ -1107,6 +1171,8 @@ impl DomainError {
             Self::UnknownOrder => "Unknown order.",
             Self::AccountNotDeployed => "Account not deployed.",
             Self::OrderPnBusy => "Trading note busy with a previous order; retry shortly.",
+            Self::NoteAlreadyRegistered => "Private note already registered.",
+            Self::KeyDoesNotOwnNote => "Submitted key does not control this private note.",
         }
     }
 }

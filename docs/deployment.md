@@ -175,6 +175,7 @@ auth:
   # point at must be deployed and funded on-chain first. See
   # docs/seed-private-notes.md.
   seed_accounts: true
+  seed_accounts_path: ./config/seed_notes_list.json  # required when seed_accounts is on
 
 chain:
   gateway_endpoint: shellnet.ackinacki.org   # your Acki Nacki node host
@@ -307,6 +308,21 @@ endpoints return empty results — that is expected on a cold database.
 Applied automatically on startup: the indexer always runs them; the api runs
 them only when `auth.seed_accounts: true`. `sqlx::migrate!` takes an advisory
 lock, so the two racing on a fresh database is safe.
+
+### API credentials for clients
+
+The seeder stores no `api_secret` — each one is derived from `auth.kek_hex` and
+the note's slot index (see
+[docs/seed-private-notes.md](seed-private-notes.md#api-credentials-are-derived-not-in-the-file)).
+To recover the `api_key` / `api_secret` to hand a client, re-derive them from
+this environment's KEK:
+
+```sh
+cargo run -p dodex-api --bin dump_creds -- --kek <auth.kek_hex> --count <N>
+```
+
+It prints the pairs for the first `N` slots in cleartext — run it on a trusted
+host and never log or commit the output.
 
 ### Changing config
 

@@ -7,6 +7,7 @@
 // the scheme: a future v2 row decrypts under a new KEK while v1 rows
 // keep decrypting under the original.
 
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::Aead;
 use aes_gcm::aead::AeadCore;
 use aes_gcm::aead::KeyInit;
@@ -18,6 +19,9 @@ use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use hmac::Hmac;
+use hmac::Mac;
+use sha2::Sha256;
 use zeroize::ZeroizeOnDrop;
 
 const KEK_LEN: usize = 32;
@@ -85,6 +89,36 @@ pub fn open(kek: &Kek, blob: &[u8]) -> Result<Vec<u8>> {
     let ciphertext = &blob[HEADER_LEN..];
 
     kek.cipher().decrypt(nonce, ciphertext).map_err(|e| anyhow!("aes-gcm decrypt failed: {e}"))
+}
+
+/// Domain separator for KEK-derived API secrets. Bumping the version
+/// suffix rotates every derived secret at once.
+const API_SECRET_INFO: &[u8] = b"dodex/api-secret/v1";
+
+/// Deterministic per-index API secret, bound to the KEK. The same
+/// `(kek, index)` always yields the same 32 bytes, and a different KEK
+/// yields a disjoint secret — so two environments never share a credential
+/// even at the same index, and the value stays as secret as the KEK.
+/// Lets the seeder mint reproducible credentials from a notes file without
+/// persisting the plaintext anywhere but the KEK-encrypted DB row.
+pub fn derive_api_secret(kek: &Kek, index: u32) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(&kek.0).expect("HMAC accepts any key length");
+    mac.update(API_SECRET_INFO);
+    mac.update(&index.to_be_bytes());
+    let tag = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&tag);
+    out
+}
+
+/// Fill `buf` with cryptographically secure random bytes from the OS RNG.
+/// Account registration mints API secrets and key tokens that are stored
+/// sealed (not derived from a notes-file index), so each must be
+/// independently unpredictable. Same `OsRng` source [`seal`] draws its
+/// nonces from.
+pub fn fill_random(buf: &mut [u8]) {
+    OsRng.fill_bytes(buf);
 }
 
 #[cfg(test)]
@@ -194,6 +228,23 @@ mod tests {
         let kek_b = Kek::from_hex(&"ff".repeat(KEK_LEN)).unwrap();
         let blob = seal(&kek_a, b"payload").unwrap();
         assert!(open(&kek_b, &blob).is_err());
+    }
+
+    #[test]
+    fn derive_api_secret_is_stable_and_kek_bound() {
+        // Known-answer test: pins the derivation so any change that would
+        // silently invalidate every seeded credential fails here first.
+        // The companion value lives in the api test consts
+        // (`SEED_API_SECRET` in services/api/tests/common/mod.rs).
+        let kek = Kek::from_hex(&"ab".repeat(KEK_LEN)).unwrap();
+        assert_eq!(
+            hex::encode(derive_api_secret(&kek, 0)),
+            "86c223a600ce630f9abf62ea2244ca638a2e02bb16d73d74128bf31f5d3e1910",
+        );
+        // Distinct index and distinct KEK both yield distinct secrets.
+        assert_ne!(derive_api_secret(&kek, 0), derive_api_secret(&kek, 1));
+        let other = Kek::from_hex(&"00".repeat(KEK_LEN)).unwrap();
+        assert_ne!(derive_api_secret(&kek, 0), derive_api_secret(&other, 0));
     }
 
     #[test]

@@ -187,12 +187,18 @@ Recommended common error codes:
 | `-2011` | Unknown order. | 404 |
 | `-2013` | Account not deployed. | 404 |
 | `-2014` | Trading note busy with a previous order; retry shortly. | 429 |
+| `-2015` | Private note already registered. | 409 |
+| `-2016` | Submitted key does not control this private note. | 400 |
 
 `-1007` means the request did not complete in time. The order may still have been accepted by the exchange. Retry `POST /api/v1/order` with the same `newOrderClientId` — the server will deduplicate so the same order is not placed twice.
 
 `-2013` means the caller's authenticated account has no PrivateNote contract deployed at its resolved address. The credential is valid but the on-chain contract is missing; the client should offer "deploy your account" instead of retrying.
 
 `-2014` means another order from the same account is still being processed. Retry after a short delay; the in-flight order will appear in `/api/v1/orders` shortly.
+
+`-2015` means `POST /api/v1/accounts` was called for a PrivateNote that already has an account. Registration is one-shot per note: the existing credential is left untouched and no new one is minted. Do not retry — use the credential issued at first registration.
+
+`-2016` means the submitted secret key does not control the note: the backend derived its public key and it did not match the note's on-chain owner. Send the secret key of the note you are registering — a key that cannot sign for the note would never produce valid trades.
 
 Authentication errors are split intentionally: `-1003` signals a malformed
 request envelope (missing or unparseable `X-DODEX-APIKEY`, `timestamp`,
@@ -210,6 +216,7 @@ envelope field failed or why a credential was rejected.
 | List oracles and their available events | `GET` | `/api/v1/oracles` | `NONE` |
 | Fetch order book | `GET` | `/api/v1/depth` | `NONE` |
 | Fetch recent trades | `GET` | `/api/v1/trades` | `NONE` |
+| Register a trading account from a PrivateNote | `POST` | `/api/v1/accounts` | `NONE` |
 | Fetch account collateral balance | `GET` | `/api/v1/account` | `USER_DATA` |
 | Fetch outcome balances for one market | `GET` | `/api/v1/account/balances` | `USER_DATA` |
 | Buy a full set of outcome tokens with collateral | `POST` | `/api/v1/buyFullSet` | `TRADE` |
@@ -781,6 +788,62 @@ Errors:
 | Trade data is temporarily inconsistent | `-1500` | 503 |
 
 ## Account Endpoints
+
+### Register Account
+
+```http
+POST /api/v1/accounts
+```
+
+Register a trading account from a PrivateNote you already control, and receive an API credential you can sign requests with right away.
+
+This is the self-service equivalent of seeding one account: you supply the note's address and keys, the backend stores them (the secret key sealed at rest, exactly as seeded accounts are) and mints one API key with `USER_DATA` and `TRADE` permission. The endpoint is public — you have no API key yet, and possession of the note's keys is the authorization.
+
+**The PrivateNote must already be deployed and funded on-chain.** Registration only writes backend rows; it deploys nothing. Before creating the account the backend confirms the note exists on-chain — returning `-2013` if it does not — so a registered account can trade immediately. A note that later runs out of gas still fails trading until it is refunded.
+
+Request body:
+
+| Field | Type | Mandatory | Description |
+| --- | --- | --- | --- |
+| `pnAddress` | STRING | YES | Address of the deployed PrivateNote (`0:…`). |
+| `pnPubkeyHex` | STRING | YES | Note owner public key, hex (up to 256 bits). Must be the key `pnSeckeyHex` derives. |
+| `pnSeckeyHex` | STRING | YES | Note owner secret key, 32-byte hex. Held in custody, sealed under the backend key, and used to sign your trades. |
+| `pnDihHex` | STRING | YES | Deposit-identifier hash of the note, hex (up to 256 bits). |
+
+```json
+{
+  "pnAddress": "0:a554b6d3…",
+  "pnPubkeyHex": "6a00e7c5…",
+  "pnSeckeyHex": "de0a6632…",
+  "pnDihHex": "8416176d…"
+}
+```
+
+Response:
+
+```json
+{
+  "accountId": "7c3e2f10-...",
+  "pnAddress": "0:a554b6d3…",
+  "apiKey": "dk_live_9fa3...",
+  "apiSecret": "f1c2...",
+  "permissions": ["USER_DATA", "TRADE"]
+}
+```
+
+Response fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `accountId` | STRING | Identifier of the created account. |
+| `pnAddress` | STRING | The registered note address, echoed back. |
+| `apiKey` | STRING | Send this as the `X-DODEX-APIKEY` header on signed requests. |
+| `apiSecret` | STRING | The HMAC signing secret, hex. **Returned only here** — it is stored sealed and cannot be retrieved again, so capture it now. |
+| `permissions` | ARRAY | Granted permissions: `["USER_DATA", "TRADE"]`. |
+
+Each note can be registered once. Registering a note that already has an account returns `-2015` (HTTP 409); the existing credential is left untouched and no second one is minted. Losing an `apiSecret` cannot be undone by re-registering the same note. The submitted secret key must be the note's own key — the backend checks it against the note's on-chain owner and returns `-2016` otherwise.
+
+Errors: `-1102` (a mandatory field is missing), `-1130` (a field is malformed — bad hex, over 256 bits, an unknown body key, or `pnPubkeyHex` is not the key `pnSeckeyHex` derives), `-1500` (the backend could not read the note's on-chain state; transient — retry), `-2013` (the note is not deployed on-chain), `-2015` (the note is already registered), `-2016` (the submitted key does not control the note).
 
 ### Account Balance
 

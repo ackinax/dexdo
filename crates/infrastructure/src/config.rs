@@ -93,6 +93,14 @@ pub struct AuthSection {
     pub max_recv_window_ms: u64,
     #[serde(default)]
     pub seed_accounts: bool,
+    /// Path to the JSON notes file the seeder reads when `seed_accounts`
+    /// is on. The file holds real note custody keys, so it is supplied out
+    /// of band per environment and never committed (`config/seed_notes*.json`
+    /// is gitignored). The only committed notes file is the cargo test
+    /// fixture `services/api/tests/fixtures/seed_notes_dummy.json`. Required
+    /// whenever `seed_accounts` is true.
+    #[serde(default)]
+    pub seed_accounts_path: Option<String>,
 }
 
 fn default_recv_window_ms() -> u64 {
@@ -358,6 +366,10 @@ impl AuthSection {
             "auth.default_recv_window_ms ({}) must be <= auth.max_recv_window_ms ({})",
             self.default_recv_window_ms,
             self.max_recv_window_ms,
+        );
+        anyhow::ensure!(
+            !self.seed_accounts || self.seed_accounts_path.is_some(),
+            "auth.seed_accounts=true requires auth.seed_accounts_path",
         );
         Ok(())
     }
@@ -707,6 +719,7 @@ indexer:
             default_recv_window_ms: default_ms,
             max_recv_window_ms: max_ms,
             seed_accounts: false,
+            seed_accounts_path: None,
         }
     }
 
@@ -783,6 +796,7 @@ graphql:
             default_recv_window_ms: 5_000,
             max_recv_window_ms: 60_000,
             seed_accounts: false,
+            seed_accounts_path: None,
         };
         let err = s.validate().unwrap_err();
         assert!(err.to_string().contains("kek_hex"), "got: {err}");
@@ -796,9 +810,29 @@ graphql:
             default_recv_window_ms: 5_000,
             max_recv_window_ms: 60_000,
             seed_accounts: false,
+            seed_accounts_path: None,
         };
         let err = s.validate().unwrap_err();
         assert!(err.to_string().contains("kek_hex"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_validate_rejects_seed_accounts_without_path() {
+        // A misconfig must fail at config load, not later when the seeder
+        // aborts after migrations have already run.
+        let mut s = valid_auth_section(5_000, 60_000);
+        s.seed_accounts = true;
+        s.seed_accounts_path = None;
+        let err = s.validate().unwrap_err();
+        assert!(err.to_string().contains("seed_accounts_path"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_validate_accepts_seed_accounts_with_path() {
+        let mut s = valid_auth_section(5_000, 60_000);
+        s.seed_accounts = true;
+        s.seed_accounts_path = Some("/etc/dodex/seed_notes.json".to_string());
+        s.validate().unwrap();
     }
 
     #[test]
