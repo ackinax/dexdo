@@ -7,12 +7,50 @@ Backend for DEX.DO — a decentralized exchange on the Acki Nacki chain. Two Rus
 
 On-chain DEX.DO contracts live under `contracts/`.
 
+## Onboarding (Shellnet)
+
+DEX.DO onboarding is **agent-driven**: an AI coding agent with shell access to this repo runs the whole flow from a one-line prompt.
+
+**Prerequisites**
+
+- An AI agent with shell + repo access (Claude Code, Cursor, …).
+- macOS or Linux with `git`, `curl`, `jq` — the skill installs Rust (`cargo`) and `tvm-cli` itself if they're missing.
+- Network access to Shellnet (`shellnet.ackinacki.org`) and its public giver.
+
+**Prompt** (paste into the agent):
+
+> Onboard me to DEXDO on Shellnet end-to-end: deploy and fund a multisig, then deploy three gas-funded PrivateNotes ready to trade.
+
+The agent follows the procedure in [`.claude/skills/dexdo-onboarding-shellnet/SKILL.md`](.claude/skills/dexdo-onboarding-shellnet/SKILL.md).
+
+**Output** — a multisig wallet you control and three funded PrivateNotes (SHELL / NACKL / USDC).
+
+Everything is written under the workspace directory **`$WORKSPACE`** (default `~/dexdo-workspace`; export `WORKSPACE=/your/path` before running to change it):
+
+```
+$WORKSPACE/
+├── multisig/   wallet — Multisig.keys.json, Multisig.seed (SECRET) + Multisig.abi.json, Multisig.tvc
+├── notes/      two files per PrivateNote, token ∈ {shell, nackl, usdc} (SECRET):
+│                 <token>.account.json  — ready POST /api/v1/accounts body
+│                                         (pnAddress / pnPubkeyHex / pnSeckeyHex / pnDihHex)
+│                 pn_state.<token>.json — onboarding resume state (not API-loadable)
+└── giver/      GiverV3.abi.json — Shellnet funding artifact
+```
+
+Use the notes two ways:
+
+- **directly with the SDK libraries** (`dodex-sdk` / `ackinacki-kit`) — sign on-chain operations with each note's key from its file;
+- **loaded into a running API service** — POST each `notes/<token>.account.json` to `/api/v1/accounts`.
+
+Files under `multisig/` and `notes/` carry secret keys — back them up, never commit them.
+
 ## Documentation
 
 - [docs/api-spec.md](docs/api-spec.md) — public REST API contract.
 - [docs/openapi.yaml](docs/openapi.yaml) — OpenAPI 3.1 contract, generated from the Rust handlers. See [openapi/README.md](openapi/README.md) for the regen workflow and the GitHub Pages deployment.
 - [docs/README.md](docs/README.md) — documentation map and file ownership.
 - [docs/deployment.md](docs/deployment.md) — self-hosting the `indexer` and `api` on your own server, wired to your own Acki Nacki GraphQL endpoint and your own Postgres / Supabase.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — where code and docs go (libs / services / tools), test and documentation rules, PR checklist. For humans and agents.
 - [AGENT_REQUIREMENTS.md](AGENT_REQUIREMENTS.md) — rules for any agent making repository changes.
 
 ## Repository layout
@@ -28,6 +66,7 @@ services/
 contracts/           # on-chain DEX.DO contracts (TVM)
 sdk/                 # dodex-sdk: write-side DEX facade + halo2 voucher pipeline
                      # (separate workspace, excluded from the root build)
+tools/               # end-user CLIs (separate workspace; see tools/README.md)
 docs/                # specs and plans (see docs/README.md)
 migrations/          # SQL migrations applied by sqlx::migrate! at startup
 config/              # service config files (api.<env>.yaml, indexer.<env>.yaml)

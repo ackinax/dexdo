@@ -16,8 +16,8 @@ dependencies = [
 
 [[package]]
 name = "ackinacki-kit"
-version = "2.0.1"
-source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v2.0.1#2ecd4683d287438722c39ea52724923645a610ee"
+version = "2.1.0"
+source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v2.1.0#5b8a6909dc8bd66d6aaea6541839abd7a1a0083c"
 dependencies = [
  "contracts",
  "shared",
@@ -1043,8 +1043,8 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "contracts"
-version = "2.0.1"
-source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v2.0.1#2ecd4683d287438722c39ea52724923645a610ee"
+version = "2.1.0"
+source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v2.1.0#5b8a6909dc8bd66d6aaea6541839abd7a1a0083c"
 dependencies = [
  "base64",
  "chrono",
@@ -4588,8 +4588,8 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "2.0.1"
-source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v2.0.1#2ecd4683d287438722c39ea52724923645a610ee"
+version = "2.1.0"
+source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v2.1.0#5b8a6909dc8bd66d6aaea6541839abd7a1a0083c"
 dependencies = [
  "gloo-timers",
  "tokio",
