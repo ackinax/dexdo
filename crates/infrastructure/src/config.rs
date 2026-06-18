@@ -1,6 +1,7 @@
 // 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 //
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -249,6 +250,12 @@ pub struct IndexerSection {
     /// typos all fail loudly at startup rather than silently doing nothing.
     #[serde(default)]
     pub ignored_event_types: Vec<String>,
+    /// The DEXDO `dapp_id`. When set, the indexer keeps only event edges whose
+    /// `src_dapp_id` matches it — foreign chain traffic is dropped before
+    /// decode. Edges with no `src_dapp_id` are kept (so a gateway that omits the
+    /// field never costs us our own events). When unset, no dapp scoping runs.
+    #[serde(default)]
+    pub dapp_id: Option<String>,
 }
 
 fn default_reprojection_interval_ms() -> u64 {
@@ -420,6 +427,43 @@ pub const IGNORABLE_EVENT_TYPES: [&str; 4] = [
     "OrderBook.Rejected",
     "OrderBook.CallbackBounced",
 ];
+
+/// The `makeAddrExtern` EVENT_ID each ignorable event type routes its external
+/// `dst` to (`contracts/dex/modifiers/modifiers.sol`). The ingest filter drops
+/// these events by `dst` before decode; this table maps the configured
+/// event-type name to the EVENT_ID needed to compute that `dst`. Names must
+/// equal [`IGNORABLE_EVENT_TYPES`] and IDs must match `modifiers.sol` — unit
+/// tests pin both.
+pub const IGNORABLE_EVENT_IDS: [(&str, u32); 4] = [
+    ("OrderBook.FullyFilled", 158),
+    ("OrderBook.Queued", 159),
+    ("OrderBook.Rejected", 160),
+    ("OrderBook.CallbackBounced", 161),
+];
+
+/// The external `dst` the gateway reports for an event routed to
+/// `address.makeAddrExtern(event_id, 256)`: a `:` followed by the EVENT_ID as
+/// 64 lowercase hex digits (verified against production `raw_events`, e.g.
+/// `OrderBook.OrderPlaced` / EVENT_ID 143 -> `:00…008f`).
+pub fn event_type_dst(event_id: u32) -> String {
+    format!(":{event_id:064x}")
+}
+
+/// The set of external `dst` strings to drop before decode, derived from the
+/// configured `ignored_event_types`. A name not in [`IGNORABLE_EVENT_IDS`] is
+/// skipped — it cannot occur, because `validate` restricts the config to
+/// [`IGNORABLE_EVENT_TYPES`], the same set.
+pub fn ignored_event_dsts(ignored_event_types: &[String]) -> HashSet<String> {
+    ignored_event_types
+        .iter()
+        .filter_map(|t| {
+            IGNORABLE_EVENT_IDS
+                .iter()
+                .find(|(name, _)| *name == t.as_str())
+                .map(|(_, id)| event_type_dst(*id))
+        })
+        .collect()
+}
 
 impl IndexerConfig {
     pub fn load_from_path(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -1449,5 +1493,73 @@ indexer:
                 "{t} is both ignorable and metric-critical"
             );
         }
+    }
+
+    #[test]
+    fn event_type_dst_matches_gateway_format() {
+        // Cross-check the wire format against a real production dst:
+        // OrderBook.OrderPlaced is EVENT_ID 143 (0x8f).
+        let dst = event_type_dst(143);
+        assert_eq!(dst.len(), 65, "':' + 64 hex digits");
+        assert!(dst.starts_with(':'));
+        assert_eq!(&dst[1..], &format!("{:064x}", 143u32));
+        assert_eq!(dst, dst.to_lowercase(), "hex must be lowercase");
+    }
+
+    #[test]
+    fn ignorable_event_ids_cover_exactly_ignorable_event_types() {
+        let names: std::collections::HashSet<&str> =
+            IGNORABLE_EVENT_IDS.iter().map(|(n, _)| *n).collect();
+        let types: std::collections::HashSet<&str> =
+            IGNORABLE_EVENT_TYPES.iter().copied().collect();
+        assert_eq!(names, types, "IGNORABLE_EVENT_IDS names must equal IGNORABLE_EVENT_TYPES");
+    }
+
+    #[test]
+    fn ignorable_event_ids_match_contract_constants() {
+        // Pin EVENT_IDs against the contract source: if modifiers.sol renumbers
+        // an OB_* constant, this fails instead of silently filtering a wrong dst.
+        let src = include_str!("../../../contracts/dex/modifiers/modifiers.sol");
+        let want = [
+            ("OrderBook.FullyFilled", "OB_FULLY_FILLED"),
+            ("OrderBook.Queued", "OB_QUEUED"),
+            ("OrderBook.Rejected", "OB_REJECTED"),
+            ("OrderBook.CallbackBounced", "OB_CALLBACK_BOUNCED"),
+        ];
+        for (event_type, const_name) in want {
+            let id = IGNORABLE_EVENT_IDS
+                .iter()
+                .find(|(n, _)| *n == event_type)
+                .map(|(_, id)| *id)
+                .expect("event type present in IGNORABLE_EVENT_IDS");
+            let line = src
+                .lines()
+                .find(|l| l.contains(const_name) && l.contains("constant") && l.contains('='))
+                .unwrap_or_else(|| panic!("{const_name} not found in modifiers.sol"));
+            let rhs = line.split('=').nth(1).expect("constant line has =");
+            let value: u32 = rhs
+                .split(';')
+                .next()
+                .expect("constant line has ;")
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("could not parse {const_name} from {line:?}"));
+            assert_eq!(value, id, "{const_name} in modifiers.sol != IGNORABLE_EVENT_IDS");
+        }
+    }
+
+    #[test]
+    fn ignored_event_dsts_maps_names_to_dst() {
+        let set = ignored_event_dsts(&["OrderBook.Queued".to_string()]);
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&event_type_dst(159)));
+        assert!(ignored_event_dsts(&[]).is_empty());
+    }
+
+    #[test]
+    fn indexer_dapp_id_defaults_to_none() {
+        // indexer_cfg_with_ignored builds a config YAML with no dapp_id key.
+        let cfg = indexer_cfg_with_ignored(&[]);
+        assert_eq!(cfg.indexer.dapp_id, None);
     }
 }
