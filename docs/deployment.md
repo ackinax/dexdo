@@ -217,6 +217,7 @@ indexer:
   reprojection_interval_ms: 30000
   reprojection_batch_size: 500
   oracle_event_list_reconciliation_interval_ms: 60000
+  dapp_id: "<dexdo-dapp-id>"   # scopes ingestion to this dapp; omit to disable
   ignored_addresses:
     - "0:1111111111111111111111111111111111111111111111111111111111111111"
   ignored_event_types:
@@ -253,8 +254,15 @@ api only:
 
 indexer only:
 
+- `indexer.dapp_id` (optional): when set, scopes ingestion to the DEXDO dapp
+  whose `src_dapp_id` matches — foreign chain events are dropped before decode.
+  Edges with no `src_dapp_id` are kept. Omit the key (or leave it commented
+  out) to disable scoping. Do not set it to an empty string — `""` deserializes
+  to `Some("")` and makes the scope filter treat every edge with a real
+  `src_dapp_id` as foreign.
 - `indexer.ignored_event_types` may list only known droppable no-op types
-  (`OrderBook.Queued` / `FullyFilled` / `Rejected` / `CallbackBounced`). The
+  (`OrderBook.Queued` / `FullyFilled` / `Rejected` / `CallbackBounced`). Each
+  entry is matched by its external `dst` before decode (no decode cost). The
   startup guard refuses anything else — metric-critical types
   (`OrderBook.OrderPlaced`, `OrderBook.PartialFill`, counted from `raw_events`
   for the OTLP metrics), state-changing types, and typos — so a bad list
