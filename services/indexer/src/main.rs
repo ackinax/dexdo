@@ -9,6 +9,7 @@ use std::time::Duration;
 use dodex_infrastructure::config::IndexerConfig;
 use dodex_infrastructure::database;
 use dodex_infrastructure::decoder::Decoder;
+use dodex_infrastructure::graphql::EventEdge;
 use dodex_infrastructure::graphql::EventsPage;
 use dodex_infrastructure::graphql::GraphqlClient;
 use dodex_infrastructure::indexer_repo::IndexerRepository;
@@ -140,11 +141,13 @@ async fn main() -> anyhow::Result<()> {
                 cfg.indexer.ignored_addresses.iter().map(String::as_str).collect();
             let ignored_event_types: HashSet<&str> =
                 cfg.indexer.ignored_event_types.iter().map(String::as_str).collect();
+            let dapp_id = cfg.indexer.dapp_id.as_deref();
             match drain_events(
                 client,
                 &repo,
                 &decoder,
                 cfg.graphql.page_size,
+                dapp_id,
                 &ignored,
                 &ignored_event_types,
                 &mut cursor,
@@ -155,6 +158,7 @@ async fn main() -> anyhow::Result<()> {
                     info!(
                         edges = stats.edges,
                         ignored = stats.ignored,
+                        foreign_skipped = stats.foreign_skipped,
                         inserted = stats.inserted,
                         skipped = stats.skipped,
                         decoded = stats.decoded,
@@ -182,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
 struct DrainStats {
     edges: usize,
     ignored: u64,
+    foreign_skipped: u64,
     inserted: u64,
     skipped: u64,
     decoded: u64,
@@ -193,11 +198,23 @@ struct DrainStats {
     pages: u32,
 }
 
+/// Whether an event edge belongs to the configured DEXDO dapp. Edges with no
+/// `src_dapp_id` are kept (treated as in-scope) so a gateway that omits the
+/// field never costs us our own events.
+fn edge_in_scope(edge: &EventEdge, dapp_id: &str) -> bool {
+    match edge.node.src_dapp_id.as_deref() {
+        Some(d) => d == dapp_id,
+        None => true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn drain_events(
     client: &GraphqlClient,
     repo: &IndexerRepository,
     decoder: &Decoder,
     page_size: u32,
+    dapp_id: Option<&str>,
     ignored_src: &HashSet<&str>,
     ignored_event_types: &HashSet<&str>,
     cursor: &mut Option<String>,
@@ -220,6 +237,14 @@ async fn drain_events(
             });
         }
         stats.ignored += (edges_seen - page.edges.len()) as u64;
+
+        // Scope to the DEXDO dapp: drop foreign chain traffic before decode.
+        // Inert when no dapp_id is configured.
+        if let Some(dapp_id) = dapp_id {
+            let before = page.edges.len();
+            page.edges.retain(|edge| edge_in_scope(edge, dapp_id));
+            stats.foreign_skipped += (before - page.edges.len()) as u64;
+        }
 
         let end_cursor = page.page_info.end_cursor.as_deref();
         let persisted = repo
@@ -253,4 +278,33 @@ async fn drain_events(
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dodex_infrastructure::graphql::EventEdge;
+    use dodex_infrastructure::graphql::EventNode;
+
+    fn edge_with(src_dapp_id: Option<&str>, dst: Option<&str>) -> EventEdge {
+        EventEdge {
+            cursor: "c".to_string(),
+            node: EventNode {
+                msg_id: "m".to_string(),
+                msg_chain_order: Some("m".to_string()),
+                src: None,
+                src_dapp_id: src_dapp_id.map(str::to_string),
+                dst: dst.map(str::to_string),
+                body: None,
+                created_at: None,
+            },
+        }
+    }
+
+    #[test]
+    fn edge_in_scope_keeps_own_dapp_and_null_drops_foreign() {
+        assert!(edge_in_scope(&edge_with(Some("dexdo"), None), "dexdo"));
+        assert!(!edge_in_scope(&edge_with(Some("other"), None), "dexdo"));
+        assert!(edge_in_scope(&edge_with(None, None), "dexdo"), "null dapp is kept");
+    }
 }
