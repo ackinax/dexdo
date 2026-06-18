@@ -139,8 +139,8 @@ async fn main() -> anyhow::Result<()> {
         if let Some(client) = client.as_ref() {
             let ignored: HashSet<&str> =
                 cfg.indexer.ignored_addresses.iter().map(String::as_str).collect();
-            let ignored_event_types: HashSet<&str> =
-                cfg.indexer.ignored_event_types.iter().map(String::as_str).collect();
+            let ignored_event_dsts =
+                dodex_infrastructure::config::ignored_event_dsts(&cfg.indexer.ignored_event_types);
             let dapp_id = cfg.indexer.dapp_id.as_deref();
             match drain_events(
                 client,
@@ -149,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.graphql.page_size,
                 dapp_id,
                 &ignored,
-                &ignored_event_types,
+                &ignored_event_dsts,
                 &mut cursor,
             )
             .await
@@ -208,6 +208,15 @@ fn edge_in_scope(edge: &EventEdge, dapp_id: &str) -> bool {
     }
 }
 
+/// Whether an edge is a configured no-op event to drop, matched by its external
+/// `dst`. Edges with no `dst` are kept.
+fn edge_is_ignored_noop(edge: &EventEdge, ignored_dsts: &HashSet<String>) -> bool {
+    match edge.node.dst.as_deref() {
+        Some(dst) => ignored_dsts.contains(dst),
+        None => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drain_events(
     client: &GraphqlClient,
@@ -216,7 +225,7 @@ async fn drain_events(
     page_size: u32,
     dapp_id: Option<&str>,
     ignored_src: &HashSet<&str>,
-    ignored_event_types: &HashSet<&str>,
+    ignored_event_dsts: &HashSet<String>,
     cursor: &mut Option<String>,
 ) -> anyhow::Result<DrainStats> {
     let mut stats = DrainStats::default();
@@ -246,10 +255,18 @@ async fn drain_events(
             stats.foreign_skipped += (before - page.edges.len()) as u64;
         }
 
+        // Drop configured no-op event types by dst before decode. dst is in the
+        // message header, so this costs no decode. PartialFill is excluded by
+        // the startup guard, so its dst is never here and its metric stays.
+        if !ignored_event_dsts.is_empty() {
+            let before = page.edges.len();
+            page.edges.retain(|edge| !edge_is_ignored_noop(edge, ignored_event_dsts));
+            stats.type_ignored += (before - page.edges.len()) as u64;
+        }
+
         let end_cursor = page.page_info.end_cursor.as_deref();
         let persisted = repo
-            .persist_page(STREAM_NAME, &page.edges, end_cursor, decoder, ignored_event_types)
-            .await?;
+            .persist_page(STREAM_NAME, &page.edges, end_cursor, decoder).await?;
         stats.inserted += persisted.inserted;
         stats.skipped += persisted.skipped;
         stats.decoded += persisted.decoded;
@@ -257,7 +274,6 @@ async fn drain_events(
         stats.projected += persisted.projected;
         stats.projection_deferred += persisted.projection_deferred;
         stats.projection_failed += persisted.projection_failed;
-        stats.type_ignored += persisted.type_ignored;
 
         if let Some(end) = page.page_info.end_cursor.clone() {
             *cursor = Some(end);
@@ -306,5 +322,19 @@ mod tests {
         assert!(edge_in_scope(&edge_with(Some("dexdo"), None), "dexdo"));
         assert!(!edge_in_scope(&edge_with(Some("other"), None), "dexdo"));
         assert!(edge_in_scope(&edge_with(None, None), "dexdo"), "null dapp is kept");
+    }
+
+    #[test]
+    fn edge_is_ignored_noop_matches_exact_dst_only() {
+        use std::collections::HashSet;
+        let queued = dodex_infrastructure::config::event_type_dst(159);
+        let ignored: HashSet<String> = [queued.clone()].into_iter().collect();
+
+        assert!(edge_is_ignored_noop(&edge_with(None, Some(&queued)), &ignored));
+        // a different dst (OrderPlaced, 143) is not dropped
+        let placed = dodex_infrastructure::config::event_type_dst(143);
+        assert!(!edge_is_ignored_noop(&edge_with(None, Some(&placed)), &ignored));
+        // no dst -> kept
+        assert!(!edge_is_ignored_noop(&edge_with(None, None), &ignored));
     }
 }

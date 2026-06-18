@@ -233,9 +233,10 @@ pub struct IndexerSection {
     /// (system / null-route addresses) without polluting the read-model.
     #[serde(default)]
     pub ignored_addresses: Vec<String>,
-    /// Decoded `event_type` values to drop at ingest, before the `raw_events`
-    /// insert and projection. The page cursor still advances past them. Used
-    /// to shed observability-only floods (e.g. `OrderBook.Queued`).
+    /// Decoded `event_type` names to drop at ingest — matched by their external
+    /// `dst` and dropped before decode, the `raw_events` insert, and projection.
+    /// The page cursor still advances past them. Used to shed observability-only
+    /// floods (e.g. `OrderBook.Queued`).
     ///
     /// Only genuine no-op types belong here — those `projectors::project_event`
     /// maps to `ProjectionOutcome::Applied` without touching a read-model table
@@ -418,8 +419,9 @@ pub const METRIC_CRITICAL_EVENT_TYPES: [&str; 2] =
 /// `OrderBook.PartialFill` (a no-op there, but it backs an OTLP counter — see
 /// [`METRIC_CRITICAL_EVENT_TYPES`]). `validate` rejects any configured type
 /// outside this set, so a typo or a state-changing type fails loudly at startup
-/// instead of being a silent no-op (the ingest filter only fires post-decode,
-/// so an unmatched name simply never drops anything). Keep in sync with the
+/// instead of being a silent no-op (the ingest filter matches by dst before
+/// decode, so an unmatched name maps to no dst and would silently never drop
+/// anything). Keep in sync with the
 /// no-op arm in `projectors::project_event`.
 pub const IGNORABLE_EVENT_TYPES: [&str; 4] = [
     "OrderBook.FullyFilled",
@@ -507,9 +509,9 @@ impl IndexerConfig {
         // types (dropping them silently undercounts the OTLP counters their
         // raw_events back), state-changing types (dropping them corrupts the
         // read model), and typos — which would otherwise be a silent no-op,
-        // since the ingest filter only fires post-decode and an unmatched name
-        // never drops anything. Metric-critical types are checked first so they
-        // get the more specific message.
+        // since the ingest filter matches by dst before decode and an unmatched
+        // name maps to no dst, so it would never drop anything. Metric-critical
+        // types are checked first so they get the more specific message.
         for t in &i.ignored_event_types {
             let t = t.as_str();
             anyhow::ensure!(
