@@ -56,7 +56,7 @@ Two filters run against the raw message edge — before any ABI decode — and d
 
 `indexer.dapp_id` (optional string; omit or leave unset to disable) scopes ingestion to one DEXDO application. When set, only edges whose `src_dapp_id` matches the configured value are kept; edges with no `src_dapp_id` field are also kept (so a gateway that omits the field does not silently drop everything); edges with a mismatching `src_dapp_id` are dropped before decode. When unset (the local default), the filter is inert and every edge is processed. Each per-tick log line includes a `foreign_skipped` count of edges dropped by this filter.
 
-Do not set `dapp_id` to an empty string — an empty string deserializes to `Some("")`, which would treat every edge with a real `src_dapp_id` as foreign and drop it.
+Setting `dapp_id` to an empty string is rejected at startup by `IndexerConfig::validate` (it would otherwise deserialize to `Some("")` and treat every edge with a real `src_dapp_id` as foreign); omit the key to disable scoping.
 
 #### No-op filter: `indexer.ignored_event_types`
 

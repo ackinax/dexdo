@@ -504,6 +504,14 @@ impl IndexerConfig {
             i.oracle_event_list_reconciliation_interval_ms > 0,
             "indexer.oracle_event_list_reconciliation_interval_ms must be > 0"
         );
+        // `dapp_id: ""` deserializes to Some(""), which would enable the scope
+        // filter and drop every edge with a real src_dapp_id while the cursor
+        // still advances — silent, unrecoverable data loss. An empty string is
+        // never valid; omit the key to disable dapp scoping.
+        anyhow::ensure!(
+            i.dapp_id.as_deref() != Some(""),
+            "indexer.dapp_id must not be empty; omit the key to disable dapp scoping"
+        );
         // Every configured ignored type must be a known droppable no-op
         // (`IGNORABLE_EVENT_TYPES`). This rejects, at startup: metric-critical
         // types (dropping them silently undercounts the OTLP counters their
@@ -1563,5 +1571,23 @@ indexer:
         // indexer_cfg_with_ignored builds a config YAML with no dapp_id key.
         let cfg = indexer_cfg_with_ignored(&[]);
         assert_eq!(cfg.indexer.dapp_id, None);
+    }
+
+    #[test]
+    fn indexer_validate_rejects_blank_dapp_id() {
+        // A templated deploy rendering an unset var to "" must fail loudly, not
+        // silently enable scoping and drop every real-dapp edge.
+        let mut cfg = indexer_cfg_with_ignored(&[]);
+        cfg.indexer.dapp_id = Some(String::new());
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("dapp_id must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn indexer_validate_accepts_absent_or_nonempty_dapp_id() {
+        let mut cfg = indexer_cfg_with_ignored(&[]);
+        cfg.validate().expect("absent dapp_id validates");
+        cfg.indexer.dapp_id = Some("dexdo-dapp".to_string());
+        cfg.validate().expect("non-empty dapp_id validates");
     }
 }
