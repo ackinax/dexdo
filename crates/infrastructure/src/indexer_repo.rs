@@ -45,9 +45,6 @@ pub struct PagePersistResult {
     pub skipped: u64,
     pub decoded: u64,
     pub undecoded: u64,
-    pub projected: u64,
-    pub projection_deferred: u64,
-    pub projection_failed: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -127,16 +124,28 @@ impl IndexerRepository {
         end_cursor: Option<&str>,
         decoder: &Decoder,
     ) -> anyhow::Result<PagePersistResult> {
-        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await.context("begin tx")?;
         let mut result = PagePersistResult::default();
+
+        // Build column vectors for one bulk insert. Capture decodes (so the
+        // row lands with `decoded` populated for the projection loop) but does
+        // NOT project — projection is run_reprojection_loop's job. De-dup by
+        // msg_id within the page so a repeated edge does not have to be
+        // absorbed by `on conflict` and the inserted/skipped counts stay honest.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(edges.len());
+        let mut msg_ids: Vec<String> = Vec::with_capacity(edges.len());
+        let mut chain_orders: Vec<String> = Vec::with_capacity(edges.len());
+        let mut created_ats: Vec<Option<f64>> = Vec::with_capacity(edges.len());
+        let mut src_addresses: Vec<Option<String>> = Vec::with_capacity(edges.len());
+        let mut dst_addresses: Vec<Option<String>> = Vec::with_capacity(edges.len());
+        let mut event_types: Vec<Option<String>> = Vec::with_capacity(edges.len());
+        let mut body_texts: Vec<String> = Vec::with_capacity(edges.len());
+        let mut decoded_texts: Vec<Option<String>> = Vec::with_capacity(edges.len());
 
         for edge in edges {
             // `chain_order` is the projection-ordering key. The GraphQL gateway
-            // promises it on every message edge; an event
-            // without it is unusable here — the reproject SQL orders by
-            // `chain_order` and would either misplace this row or fail on the
-            // NOT NULL constraint. Drop the edge with a warning rather than
-            // synthesise a fake key.
+            // promises it on every message edge; an event without it is unusable
+            // (the projection SQL orders by `chain_order` and the column is NOT
+            // NULL). Drop the edge with a warning rather than synthesise a key.
             let Some(chain_order) = edge.node.msg_chain_order.as_deref() else {
                 result.undecoded += 1;
                 warn!(
@@ -145,8 +154,10 @@ impl IndexerRepository {
                 );
                 continue;
             };
+            if !seen.insert(edge.node.msg_id.as_str()) {
+                continue;
+            }
 
-            let body_value = edge.node.body.clone().unwrap_or(Value::Null);
             let decoded = try_decode(decoder, &edge.node.msg_id, edge.node.body.as_ref());
             if decoded.is_some() {
                 result.decoded += 1;
@@ -154,8 +165,6 @@ impl IndexerRepository {
                 result.undecoded += 1;
             }
 
-            let event_type = decoded.as_ref().map(|d| d.event_type.clone());
-            let decoded_value = decoded.as_ref().map(|d| d.value.clone());
             let created_at_chain = parse_unix_seconds(edge.node.created_at.as_ref());
             if should_warn_unparseable_created_at(edge.node.created_at.as_ref(), created_at_chain) {
                 warn!(
@@ -166,93 +175,53 @@ impl IndexerRepository {
                 );
             }
 
-            let affected = sqlx::query(
+            msg_ids.push(edge.node.msg_id.clone());
+            chain_orders.push(chain_order.to_string());
+            created_ats.push(created_at_chain);
+            src_addresses.push(edge.node.src.clone());
+            dst_addresses.push(edge.node.dst.clone());
+            event_types.push(decoded.as_ref().map(|d| d.event_type.clone()));
+            // body_json is NOT NULL; an absent body stores jsonb 'null'
+            // ("null"::jsonb), exactly as the prior per-row path did.
+            body_texts.push(edge.node.body.as_ref().map_or_else(|| "null".to_string(), Value::to_string));
+            decoded_texts.push(decoded.as_ref().map(|d| d.value.to_string()));
+        }
+
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await.context("begin tx")?;
+
+        if !msg_ids.is_empty() {
+            // One prepared statement regardless of page size. The jsonb columns
+            // are passed as text[] and cast with `::jsonb` so we never depend on
+            // sqlx encoding an array of jsonb values directly.
+            let inserted = sqlx::query(
                 r#"insert into raw_events
                        (msg_id, chain_order, created_at_chain, src_address,
                         dst_address, event_type, body_json, decoded)
-                   values ($1, $2, to_timestamp($3), $4, $5, $6, $7, $8)
+                   select msg_id, chain_order, to_timestamp(created_f8),
+                          src_address, dst_address, event_type,
+                          body_text::jsonb, decoded_text::jsonb
+                     from unnest($1::text[], $2::text[], $3::double precision[],
+                                 $4::text[], $5::text[], $6::text[],
+                                 $7::text[], $8::text[])
+                          as t(msg_id, chain_order, created_f8, src_address,
+                               dst_address, event_type, body_text, decoded_text)
                    on conflict (msg_id) do nothing"#,
             )
-            .bind(&edge.node.msg_id)
-            .bind(chain_order)
-            .bind(created_at_chain)
-            .bind(edge.node.src.as_deref())
-            .bind(edge.node.dst.as_deref())
-            .bind(event_type)
-            .bind(body_value)
-            .bind(decoded_value)
+            .bind(msg_ids.as_slice())
+            .bind(chain_orders.as_slice())
+            .bind(created_ats.as_slice())
+            .bind(src_addresses.as_slice())
+            .bind(dst_addresses.as_slice())
+            .bind(event_types.as_slice())
+            .bind(body_texts.as_slice())
+            .bind(decoded_texts.as_slice())
             .execute(&mut *tx)
             .await
-            .with_context(|| format!("insert raw_events msg_id={}", edge.node.msg_id))?
+            .context("bulk insert raw_events")?
             .rows_affected();
 
-            if affected == 0 {
-                result.skipped += 1;
-            } else {
-                result.inserted += affected;
-            }
-
-            // Skip projection on conflict: either the row was already projected
-            // (processed_at is set) or it is queued for retry — reproject_pending
-            // will pick it up. Re-running the projector here is unsafe because
-            // OrderBook arms are not idempotent (re-subtracted fills, OPEN reset
-            // by a duplicate OrderPlaced).
-            if affected == 0 {
-                continue;
-            }
-
-            if let Some(decoded_event) = decoded.as_ref() {
-                let mut sp = tx.begin().await.context("projector savepoint begin")?;
-                let outcome = projectors::project_event(&mut sp, decoded_event, &edge.node).await;
-                match outcome {
-                    Ok(ProjectionOutcome::Applied) => {
-                        sp.commit().await.context("projector savepoint release")?;
-                        result.projected += 1;
-                        mark_processed_by_msg_id(&mut tx, &edge.node.msg_id).await?;
-                    }
-                    Ok(ProjectionOutcome::Deferred) => {
-                        // Leave processed_at null; the reprojection loop picks
-                        // it up once the missing parent record materialises.
-                        sp.commit().await.context("projector savepoint release")?;
-                        result.projection_deferred += 1;
-                    }
-                    Ok(ProjectionOutcome::Unknown) => {
-                        // The row is still marked processed so the cursor
-                        // advances — blocking it would stall ingestion on
-                        // every newly deployed contract emitting an event we
-                        // don't yet teach. The first sighting of each unhandled
-                        // type goes to the normal target (stdout + main log) so
-                        // operators actually see the gap; later repeats are
-                        // diverted to the noise log to avoid flooding it.
-                        if self.first_unknown_sighting(&decoded_event.event_type) {
-                            warn!(
-                                msg_id = %edge.node.msg_id,
-                                event_type = %decoded_event.event_type,
-                                "projector has no handler for event type; marking processed and advancing cursor (first sighting — later repeats go to the noise log)"
-                            );
-                        } else {
-                            warn!(
-                                target: dodex_logging::EVENT_NOISE_TARGET,
-                                msg_id = %edge.node.msg_id,
-                                event_type = %decoded_event.event_type,
-                                "projector has no handler for event type; marking processed and advancing cursor"
-                            );
-                        }
-                        sp.commit().await.context("projector savepoint release")?;
-                        mark_processed_by_msg_id(&mut tx, &edge.node.msg_id).await?;
-                    }
-                    Err(err) => {
-                        drop(sp);
-                        result.projection_failed += 1;
-                        warn!(
-                            msg_id = %edge.node.msg_id,
-                            event_type = %decoded_event.event_type,
-                            ?err,
-                            "projector failed; raw event still persisted, savepoint rolled back"
-                        );
-                    }
-                }
-            }
+            result.inserted = inserted;
+            result.skipped = msg_ids.len() as u64 - inserted;
         }
 
         if let Some(cursor) = end_cursor {
@@ -410,23 +379,6 @@ fn pending_row_to_inputs(row: &PendingRow) -> Option<(DecodedEvent, EventNode)> 
         created_at: row.ts.and_then(serde_json::Number::from_f64).map(Value::Number),
     };
     Some((event, node))
-}
-
-async fn mark_processed_by_msg_id(
-    tx: &mut Transaction<'_, Postgres>,
-    msg_id: &str,
-) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"update raw_events
-              set processed_at = now()
-            where msg_id = $1
-              and processed_at is null"#,
-    )
-    .bind(msg_id)
-    .execute(&mut **tx)
-    .await
-    .with_context(|| format!("mark raw_events.processed_at for msg_id={msg_id}"))?;
-    Ok(())
 }
 
 async fn mark_processed_by_id(tx: &mut Transaction<'_, Postgres>, id: i64) -> anyhow::Result<()> {
