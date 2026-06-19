@@ -23,7 +23,7 @@ Config sections:
 - `app`: environment name and log level.
 - `database`: Postgres URL and pool settings.
 - `graphql`: gateway endpoint, page size, request timeout.
-- `indexer`: polling/reconciliation/reprojection intervals, `ignored_addresses`, `dapp_id` (scopes ingestion to the DEXDO dapp; foreign events dropped before decode; see [docs/tech-specs/indexer.md](../../docs/tech-specs/indexer.md#scope-filter-indexerdapp_id)), and `ignored_event_types` (event types dropped before decode, matched by `dst`; see [docs/tech-specs/indexer.md](../../docs/tech-specs/indexer.md#no-op-filter-indexer_ignored_event_types)).
+- `indexer`: polling/reconciliation/reprojection intervals, `ignored_addresses`, `dapp_id` (scopes ingestion to the DEXDO dapp; foreign events dropped before decode; see [docs/tech-specs/indexer.md](../../docs/tech-specs/indexer.md#scope-filter-indexerdapp_id)), and `ignored_event_types` (event types dropped before decode, matched by `dst`; see [docs/tech-specs/indexer.md](../../docs/tech-specs/indexer.md#no-op-filter-indexerignored_event_types)).
 
 Logging is configured by environment variables, not YAML: `RUST_LOG` sets the
 filter (default `info`), and `LOG_DIR` (optional) makes the service additionally
