@@ -3329,3 +3329,157 @@ async fn divergent_qty_replay_never_heals_null_chain_time() {
 
     purge(&pool, cleanup).await;
 }
+
+#[tokio::test]
+async fn count_pending_projection_counts_only_unprojected_typed_decoded_rows() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "count_pending";
+    let pending = format!("{test}-pending");
+    let processed = format!("{test}-processed");
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", pending.as_str()),
+            ("delete from raw_events where msg_id = $1", processed.as_str()),
+        ],
+    )
+    .await;
+
+    let before = repo.count_pending_projection().await.expect("count before");
+
+    // One pending decodable+typed row.
+    insert_raw(&pool, &pending, "0:count_pending_src", "RootOracle.OracleDeployed", &json!({})).await;
+    // One already-processed row — must NOT be counted.
+    sqlx::query(
+        r#"insert into raw_events
+               (msg_id, chain_order, created_at_chain, src_address, dst_address,
+                event_type, body_json, decoded, processed_at)
+           values ($1, $2, to_timestamp(1700000000), $3, $3,
+                   'RootOracle.OracleDeployed', '{}'::jsonb, '{}'::jsonb, now())"#,
+    )
+    .bind(&processed)
+    .bind(format!("5f80{processed:0>28}"))
+    .bind("0:count_pending_src")
+    .execute(&pool)
+    .await
+    .expect("insert processed row");
+
+    let after = repo.count_pending_projection().await.expect("count after");
+    assert_eq!(after - before, 1, "only the unprojected typed+decoded row adds to the backlog");
+
+    // Purge before returning: `pending` is typed + decoded + processed_at NULL,
+    // so it satisfies reproject_pending's filter. Left behind in the shared test
+    // DB, a later reproject_pending(1000) would select it, fail on the empty
+    // payload, and add a phantom stats.failed — breaking the exact failure-count
+    // assertions elsewhere in this suite.
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", pending.as_str()),
+            ("delete from raw_events where msg_id = $1", processed.as_str()),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reproject_pending_marks_a_whole_batch_processed() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_batch_mark";
+    let addr_a = format!("0:{test}_a");
+    let addr_b = format!("0:{test}_b");
+    let msg_a = format!("{test}-a");
+    let msg_b = format!("{test}-b");
+    purge(
+        &pool,
+        &[
+            ("delete from oracles where address = $1", addr_a.as_str()),
+            ("delete from oracles where address = $1", addr_b.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_a.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_b.as_str()),
+        ],
+    )
+    .await;
+
+    insert_raw(&pool, &msg_a, &addr_a, "RootOracle.OracleDeployed",
+        &json!({ "oracle": addr_a, "pubkey": "0x00", "name": format!("{test}-a") })).await;
+    insert_raw(&pool, &msg_b, &addr_b, "RootOracle.OracleDeployed",
+        &json!({ "oracle": addr_b, "pubkey": "0x00", "name": format!("{test}-b") })).await;
+
+    let stats = repo.reproject_pending(1000).await.expect("reproject");
+    assert!(stats.applied >= 2, "both rows apply in one batch");
+
+    assert!(processed_at_is_set(&pool, &msg_a).await, "row A marked processed");
+    assert!(processed_at_is_set(&pool, &msg_b).await, "row B marked processed");
+
+    // Purge the rows and the oracles they projected so the test leaves the
+    // shared DB as it found it.
+    purge(
+        &pool,
+        &[
+            ("delete from oracles where address = $1", addr_a.as_str()),
+            ("delete from oracles where address = $1", addr_b.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_a.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_b.as_str()),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reproject_pending_from_honors_after_and_until_bounds() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_range";
+    let a1 = format!("0:{test}_a1");
+    let a2 = format!("0:{test}_a2");
+    let a3 = format!("0:{test}_a3");
+    let m1 = format!("{test}-1");
+    let m2 = format!("{test}-2");
+    let m3 = format!("{test}-3");
+    let cleanup = [
+        ("delete from oracles where address = $1", a1.as_str()),
+        ("delete from oracles where address = $1", a2.as_str()),
+        ("delete from oracles where address = $1", a3.as_str()),
+        ("delete from raw_events where msg_id = $1", m1.as_str()),
+        ("delete from raw_events where msg_id = $1", m2.as_str()),
+        ("delete from raw_events where msg_id = $1", m3.as_str()),
+    ];
+    purge(&pool, &cleanup).await;
+
+    insert_raw(&pool, &m1, &a1, "RootOracle.OracleDeployed",
+        &json!({ "oracle": a1, "pubkey": "0x00", "name": m1 })).await;
+    insert_raw(&pool, &m2, &a2, "RootOracle.OracleDeployed",
+        &json!({ "oracle": a2, "pubkey": "0x00", "name": m2 })).await;
+    insert_raw(&pool, &m3, &a3, "RootOracle.OracleDeployed",
+        &json!({ "oracle": a3, "pubkey": "0x00", "name": m3 })).await;
+
+    // insert_raw derives chain_order as `5f80{msg_id:0>28}`. after = row 1's value,
+    // until = row 2's value, so only row 2 (after < chain_order <= until) is eligible:
+    // row 1 is excluded by `>`, row 3 by `<=`.
+    let after = format!("5f80{m1:0>28}");
+    let until = format!("5f80{m2:0>28}");
+    let stats = repo
+        .reproject_pending_from(1000, Some(&after), Some(&until))
+        .await
+        .expect("reproject_from");
+
+    assert!(!processed_at_is_set(&pool, &m1).await, "row at/before `after` must be skipped");
+    assert!(processed_at_is_set(&pool, &m2).await, "row inside (after, until] must be projected");
+    assert!(!processed_at_is_set(&pool, &m3).await, "row above `until` must be skipped");
+    assert_eq!(
+        stats.max_chain_order.as_deref(),
+        Some(until.as_str()),
+        "max_chain_order must be the highest chain_order read in the batch"
+    );
+
+    purge(&pool, &cleanup).await;
+}

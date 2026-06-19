@@ -47,13 +47,16 @@ pub struct PagePersistResult {
     pub undecoded: u64,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct ReprojectionStats {
     pub scanned: u64,
     pub applied: u64,
     pub deferred: u64,
     pub unknown: u64,
     pub failed: u64,
+    /// Highest `chain_order` read in the batch (rows are ordered asc, so the
+    /// last row's). `None` for an empty batch. Drives the drain loop's cursor.
+    pub max_chain_order: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -242,17 +245,21 @@ impl IndexerRepository {
         Ok(result)
     }
 
-    /// Replays decoded-but-unprojected `raw_events` through the projector.
-    /// Picks rows where `processed_at is null` in chain-arrival order so a
-    /// previously-deferred parent gets its first chance before children retry.
-    /// Stored `decoded` jsonb is reused — bodies are not re-decoded.
-    ///
-    /// Uses `for update skip locked` and runs the whole batch inside a single
-    /// transaction so concurrent reproject workers (or a parallel test
-    /// harness) cannot pick up the same row and apply a non-idempotent
-    /// projector twice — without the lock, an `OrderFilled` could subtract
-    /// `filledAmount` from `live_orders` more than once.
-    pub async fn reproject_pending(&self, batch_size: u32) -> anyhow::Result<ReprojectionStats> {
+    /// Replays decoded-but-unprojected `raw_events` through the projector in
+    /// `chain_order` order, considering only rows in the range
+    /// `after_chain_order < chain_order <= until_chain_order` (either bound
+    /// `None` = unbounded on that side). The drain loop passes the previous
+    /// batch's high-water mark as `after` and the cycle ceiling as `until`, so
+    /// each pending row is attempted at most once per cycle and the cycle is
+    /// bounded to rows that existed at its start. `for update skip locked` + a
+    /// single transaction keep concurrent workers from applying a non-idempotent
+    /// projector twice.
+    pub async fn reproject_pending_from(
+        &self,
+        batch_size: u32,
+        after_chain_order: Option<&str>,
+        until_chain_order: Option<&str>,
+    ) -> anyhow::Result<ReprojectionStats> {
         let mut tx: Transaction<'_, Postgres> =
             self.pool.begin().await.context("reproject tx begin")?;
 
@@ -269,16 +276,26 @@ impl IndexerRepository {
                 where processed_at is null
                   and event_type is not null
                   and decoded is not null
+                  and ($2::text is null or chain_order > $2::text)
+                  and ($3::text is null or chain_order <= $3::text)
                 order by chain_order asc
                 limit $1
                 for update skip locked"#,
         )
         .bind(i64::from(batch_size))
+        .bind(after_chain_order)
+        .bind(until_chain_order)
         .fetch_all(&mut *tx)
         .await
         .context("select pending raw_events")?;
 
-        let mut stats = ReprojectionStats::default();
+        // Rows are ordered asc, so the last one carries the high-water chain_order.
+        let mut stats = ReprojectionStats {
+            max_chain_order: rows.last().map(|r| r.chain_order.clone()),
+            ..Default::default()
+        };
+        let mut to_mark: Vec<i64> = Vec::new();
+
         for row in rows {
             stats.scanned += 1;
             let Some((event, node)) = pending_row_to_inputs(&row) else {
@@ -290,7 +307,7 @@ impl IndexerRepository {
             match outcome {
                 Ok(ProjectionOutcome::Applied) => {
                     sp.commit().await.context("reproject savepoint release")?;
-                    mark_processed_by_id(&mut tx, row.id).await?;
+                    to_mark.push(row.id);
                     stats.applied += 1;
                 }
                 Ok(ProjectionOutcome::Deferred) => {
@@ -298,9 +315,6 @@ impl IndexerRepository {
                     stats.deferred += 1;
                 }
                 Ok(ProjectionOutcome::Unknown) => {
-                    // First sighting -> normal target so operators see the gap;
-                    // repeats -> noise log. Shares the dedup set with the fetch
-                    // loop, so a type already surfaced there stays quiet here.
                     if self.first_unknown_sighting(&event.event_type) {
                         warn!(
                             msg_id = %row.msg_id,
@@ -316,7 +330,7 @@ impl IndexerRepository {
                         );
                     }
                     sp.commit().await.context("reproject savepoint release")?;
-                    mark_processed_by_id(&mut tx, row.id).await?;
+                    to_mark.push(row.id);
                     stats.unknown += 1;
                 }
                 Err(err) => {
@@ -332,28 +346,192 @@ impl IndexerRepository {
             }
         }
 
+        if !to_mark.is_empty() {
+            sqlx::query(
+                r#"update raw_events
+                      set processed_at = now()
+                    where id = any($1)
+                      and processed_at is null"#,
+            )
+            .bind(&to_mark)
+            .execute(&mut *tx)
+            .await
+            .context("batch mark raw_events.processed_at")?;
+        }
+
         tx.commit().await.context("reproject tx commit")?;
         Ok(stats)
     }
 
-    /// Hot loop, runs forever until cancelled.
-    pub async fn run_reprojection_loop(self, interval: Duration, batch_size: u32) {
+    /// Projects the whole pending queue from the front, unbounded. Thin wrapper
+    /// over `reproject_pending_from`; kept for tests and any single-shot caller.
+    pub async fn reproject_pending(&self, batch_size: u32) -> anyhow::Result<ReprojectionStats> {
+        self.reproject_pending_from(batch_size, None, None).await
+    }
+
+    /// Number of `raw_events` rows waiting for the projection loop — the
+    /// backlog gauge. Predicate matches `reproject_pending_from`'s SELECT so the
+    /// count reflects exactly what the loop will pick up. Cheap thanks to
+    /// `raw_events_pending_chain_order_idx`.
+    pub async fn count_pending_projection(&self) -> anyhow::Result<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"select count(*) from raw_events
+                where processed_at is null
+                  and event_type is not null
+                  and decoded is not null"#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("count pending projection")?;
+        Ok(count)
+    }
+
+    /// Highest pending `chain_order` right now, or `None` when the queue is
+    /// empty. The drain loop snapshots this as each cycle's ceiling so the cycle
+    /// is bounded to rows that existed at its start and terminates even under
+    /// sustained ingest. Cheap — a backward scan endpoint of
+    /// `raw_events_pending_chain_order_idx`.
+    pub async fn max_pending_chain_order(&self) -> anyhow::Result<Option<String>> {
+        let max: Option<String> = sqlx::query_scalar(
+            r#"select max(chain_order) from raw_events
+                where processed_at is null
+                  and event_type is not null
+                  and decoded is not null"#,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("max pending chain_order")?;
+        Ok(max)
+    }
+
+    /// Whether any pending row exists with `chain_order` above the argument. The
+    /// drain loop calls this after a cycle to decide whether to idle: rows at or
+    /// below the just-drained ceiling are stuck (Deferred/failed, already
+    /// attempted this cycle), so the loop sleeps only when NO new rows have
+    /// arrived above it — it never idles while applicable work is queued. The
+    /// `>` comparison is done in SQL so it matches the column's Postgres
+    /// collation (the same ordering `reproject_pending_from` filters on).
+    pub async fn has_pending_above(&self, chain_order: &str) -> anyhow::Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            r#"select exists(
+                   select 1 from raw_events
+                    where processed_at is null
+                      and event_type is not null
+                      and decoded is not null
+                      and chain_order > $1)"#,
+        )
+        .bind(chain_order)
+        .fetch_one(&self.pool)
+        .await
+        .context("has pending above chain_order")?;
+        Ok(exists)
+    }
+
+    /// Hot loop, runs forever until cancelled. The sole projector. It keeps a
+    /// forward `floor` (high-water chain_order already attempted) and a retry
+    /// timer; each pass snapshots a `ceiling` (highest pending chain_order now)
+    /// and drains the bounded range `(after, ceiling]` batch by batch.
+    ///  - Forward pass (default): `after` = floor, so it drains only newly
+    ///    captured rows above the floor and never re-touches the stuck
+    ///    Deferred/failed rows below it; the floor then advances to the ceiling.
+    ///  - Retry pass: `after` = None (front), re-attempting the stuck rows too,
+    ///    rate-limited to once per `idle_interval` — so a permanently stuck row
+    ///    is re-tried/re-logged on the polling cadence, not the drain cadence.
+    ///
+    /// The ceiling bounds every pass so it terminates under sustained ingest; the
+    /// retry timer fires every idle_interval regardless of ingest (Deferred rows
+    /// retried within ~one interval); the post-pass sleep is conditional on
+    /// `has_pending_above`, so the projector never idles with work queued.
+    /// `idle_interval` is wired to polling_interval_ms.
+    pub async fn run_reprojection_loop(self, idle_interval: Duration, batch_size: u32) {
+        let mut floor: Option<String> = None;
+        let mut last_retry = tokio::time::Instant::now();
+        let mut force_retry = true; // first pass rewinds to the front
+
         loop {
-            match self.reproject_pending(batch_size).await {
-                Ok(stats) if stats.scanned > 0 => {
-                    info!(
-                        scanned = stats.scanned,
-                        applied = stats.applied,
-                        deferred = stats.deferred,
-                        unknown = stats.unknown,
-                        failed = stats.failed,
-                        "reprojection sweep"
-                    );
+            let retry = force_retry || last_retry.elapsed() >= idle_interval;
+            force_retry = false;
+            // Forward passes resume above the floor; a rate-limited retry pass
+            // rewinds to the front to re-attempt the stuck set below the floor.
+            let mut after: Option<String> = if retry {
+                last_retry = tokio::time::Instant::now();
+                None
+            } else {
+                floor.clone()
+            };
+
+            // Ceiling = highest pending chain_order now; bounds this pass so it
+            // terminates even while capture keeps appending above it.
+            let ceiling = match self.max_pending_chain_order().await {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    tokio::time::sleep(idle_interval).await;
+                    continue;
                 }
-                Ok(_) => debug!("reprojection sweep (idle)"),
-                Err(err) => error!(?err, "reprojection sweep failed"),
+                Err(err) => {
+                    error!(?err, "projection ceiling query failed");
+                    tokio::time::sleep(idle_interval).await;
+                    continue;
+                }
+            };
+
+            loop {
+                match self.reproject_pending_from(batch_size, after.as_deref(), Some(&ceiling)).await
+                {
+                    Ok(stats) => {
+                        if stats.scanned > 0 {
+                            info!(
+                                scanned = stats.scanned,
+                                applied = stats.applied,
+                                deferred = stats.deferred,
+                                unknown = stats.unknown,
+                                failed = stats.failed,
+                                "projection sweep"
+                            );
+                        }
+                        // Not a full batch -> the bounded range (after, ceiling]
+                        // is drained; stop.
+                        if stats.scanned < u64::from(batch_size) {
+                            break;
+                        }
+                        // Full batch -> advance past the highest chain_order read.
+                        // A full batch always has a max; if absent, stop.
+                        match stats.max_chain_order {
+                            Some(co) => after = Some(co),
+                            None => break,
+                        }
+                    }
+                    Err(err) => {
+                        error!(?err, "projection sweep failed");
+                        break;
+                    }
+                }
             }
-            tokio::time::sleep(interval).await;
+            // Everything <= ceiling has been attempted this pass; forward passes
+            // resume above it. (Harmless if ceiling < the previous floor: ceiling
+            // is the max pending row, so (ceiling, old_floor] holds nothing.)
+            floor = Some(ceiling.clone());
+
+            // Backlog gauge: rows still pending after the pass (Deferred waiting
+            // on a parent, or rows that arrived above the ceiling). Info only when
+            // non-zero to avoid an idle flood.
+            match self.count_pending_projection().await {
+                Ok(backlog) if backlog > 0 => info!(backlog, "projection backlog"),
+                Ok(backlog) => debug!(backlog, "projection backlog (drained)"),
+                Err(err) => warn!(?err, "projection backlog gauge failed"),
+            }
+
+            // Idle only if no new rows arrived above the ceiling. If they did, run
+            // the next pass immediately so the projector never idles with
+            // applicable work queued. The retry timer still fires on schedule.
+            match self.has_pending_above(&ceiling).await {
+                Ok(true) => {}
+                Ok(false) => tokio::time::sleep(idle_interval).await,
+                Err(err) => {
+                    warn!(?err, "projection has-pending-above check failed; idling");
+                    tokio::time::sleep(idle_interval).await;
+                }
+            }
         }
     }
 }
@@ -381,19 +559,6 @@ fn pending_row_to_inputs(row: &PendingRow) -> Option<(DecodedEvent, EventNode)> 
     Some((event, node))
 }
 
-async fn mark_processed_by_id(tx: &mut Transaction<'_, Postgres>, id: i64) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"update raw_events
-              set processed_at = now()
-            where id = $1
-              and processed_at is null"#,
-    )
-    .bind(id)
-    .execute(&mut **tx)
-    .await
-    .with_context(|| format!("mark raw_events.processed_at for id={id}"))?;
-    Ok(())
-}
 
 fn try_decode(decoder: &Decoder, msg_id: &str, body: Option<&Value>) -> Option<DecodedEvent> {
     let body_str = body?.as_str()?;
