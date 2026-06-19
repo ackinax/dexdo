@@ -228,3 +228,83 @@ async fn persist_page_advances_cursor() {
     let cursor = repo.load_cursor(stream).await.expect("load_cursor");
     assert_eq!(cursor.as_deref(), Some("cursor-xyz"), "end_cursor must be persisted");
 }
+
+#[tokio::test]
+async fn persist_page_handles_mixed_decodable_and_undecodable_edges() {
+    // One page with a decodable edge (ORDER_PLACED_BODY) and an undecodable
+    // edge (body None). Asserts the counts and per-row DB state are correct —
+    // catching UNNEST column misalignment and the 'null'::jsonb vs SQL-NULL
+    // asymmetry.
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+    let decoder = Decoder::new().expect("decoder");
+
+    let test = "capture_mixed";
+    let orderbook = format!("0:{test}_book");
+    let msg_decodable = format!("{test}-decodable");
+    let msg_undecodable = format!("{test}-undecodable");
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_decodable.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_undecodable.as_str()),
+        ],
+    )
+    .await;
+
+    let edges = vec![
+        edge(
+            &msg_decodable,
+            Some("5f80capture_mixed_00000000000001"),
+            &orderbook,
+            Some(ORDER_PLACED_BODY),
+        ),
+        edge(&msg_undecodable, Some("5f80capture_mixed_00000000000002"), &orderbook, None),
+    ];
+    let result =
+        repo.persist_page("blockchain_events", &edges, None, &decoder).await.expect("persist_page");
+
+    assert_eq!(result.inserted, 2, "both edges must be inserted");
+    assert_eq!(result.decoded, 1, "only the OrderPlaced body decodes");
+    assert_eq!(result.undecoded, 1, "the body-None edge is undecoded");
+
+    // Decodable row: event_type set, decoded non-null, processed_at null.
+    let (event_type, decoded_is_set, processed_is_null): (Option<String>, bool, bool) =
+        sqlx::query_as(
+            "select event_type, decoded is not null, processed_at is null
+               from raw_events where msg_id = $1",
+        )
+        .bind(&msg_decodable)
+        .fetch_one(&pool)
+        .await
+        .expect("read decodable row");
+    assert_eq!(
+        event_type.as_deref(),
+        Some("OrderBook.OrderPlaced"),
+        "decodable row must have event_type set"
+    );
+    assert!(decoded_is_set, "decodable row must have decoded jsonb stored");
+    assert!(processed_is_null, "capture must not project — processed_at stays NULL");
+
+    // Undecodable row: event_type null, decoded null.
+    let (event_type_u, decoded_is_set_u): (Option<String>, bool) =
+        sqlx::query_as("select event_type, decoded is not null from raw_events where msg_id = $1")
+            .bind(&msg_undecodable)
+            .fetch_one(&pool)
+            .await
+            .expect("read undecodable row");
+    assert!(event_type_u.is_none(), "undecodable row must have event_type NULL");
+    assert!(!decoded_is_set_u, "undecodable row must have decoded NULL");
+
+    purge(
+        &pool,
+        &[
+            ("delete from live_orders where orderbook_address = $1", orderbook.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_decodable.as_str()),
+            ("delete from raw_events where msg_id = $1", msg_undecodable.as_str()),
+        ],
+    )
+    .await;
+}
