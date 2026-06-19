@@ -25,6 +25,7 @@ mod metrics_refresh;
 
 const STREAM_NAME: &str = "blockchain_events";
 const MAX_PAGES_PER_TICK: u32 = 100;
+const DROPPED_EDGE_WARN_FRACTION: f64 = 0.5;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -171,6 +172,22 @@ async fn main() -> anyhow::Result<()> {
                         cursor = cursor.as_deref().unwrap_or(""),
                         "indexer tick"
                     );
+                    if let Some(drop_rate) = drop_rate_warning(stats.edges, stats.foreign_skipped) {
+                        warn!(
+                            edges = stats.edges,
+                            foreign_skipped = stats.foreign_skipped,
+                            drop_rate,
+                            "indexer dropped high share of foreign-dapp edges"
+                        );
+                    }
+                    if let Some(drop_rate) = drop_rate_warning(stats.edges, stats.type_ignored) {
+                        warn!(
+                            edges = stats.edges,
+                            type_ignored = stats.type_ignored,
+                            drop_rate,
+                            "indexer dropped high share of ignored event-type edges"
+                        );
+                    }
                 }
                 Err(err) => {
                     error!(?err, "graphql fetch / persist failed");
@@ -215,6 +232,14 @@ fn edge_is_ignored_noop(edge: &EventEdge, ignored_dsts: &HashSet<String>) -> boo
         Some(dst) => ignored_dsts.contains(dst),
         None => false,
     }
+}
+
+fn drop_rate_warning(edges: usize, dropped: u64) -> Option<f64> {
+    if edges == 0 || dropped == 0 {
+        return None;
+    }
+    let rate = dropped as f64 / edges as f64;
+    (rate >= DROPPED_EDGE_WARN_FRACTION).then_some(rate)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -336,5 +361,18 @@ mod tests {
         assert!(!edge_is_ignored_noop(&edge_with(None, Some(&placed)), &ignored));
         // no dst -> kept
         assert!(!edge_is_ignored_noop(&edge_with(None, None), &ignored));
+    }
+
+    #[test]
+    fn drop_rate_warning_trips_when_half_or_more_edges_are_dropped() {
+        assert!(drop_rate_warning(10, 5).is_some());
+        assert!(drop_rate_warning(10, 10).is_some());
+    }
+
+    #[test]
+    fn drop_rate_warning_stays_quiet_for_low_or_empty_ticks() {
+        assert!(drop_rate_warning(10, 4).is_none());
+        assert!(drop_rate_warning(0, 1).is_none());
+        assert!(drop_rate_warning(10, 0).is_none());
     }
 }

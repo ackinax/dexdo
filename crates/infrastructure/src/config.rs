@@ -446,7 +446,8 @@ pub const IGNORABLE_EVENT_IDS: [(&str, u32); 4] = [
 /// The external `dst` the gateway reports for an event routed to
 /// `address.makeAddrExtern(event_id, 256)`: a `:` followed by the EVENT_ID as
 /// 64 lowercase hex digits (verified against production `raw_events`, e.g.
-/// `OrderBook.OrderPlaced` / EVENT_ID 143 -> `:00…008f`).
+/// `OrderBook.OrderPlaced` / EVENT_ID 143 -> a recorded production dst of
+/// `:000000000000000000000000000000000000000000000000000000000000008f`).
 pub fn event_type_dst(event_id: u32) -> String {
     format!(":{event_id:064x}")
 }
@@ -1509,11 +1510,10 @@ indexer:
     fn event_type_dst_matches_gateway_format() {
         // Cross-check the wire format against a real production dst:
         // OrderBook.OrderPlaced is EVENT_ID 143 (0x8f).
-        let dst = event_type_dst(143);
-        assert_eq!(dst.len(), 65, "':' + 64 hex digits");
-        assert!(dst.starts_with(':'));
-        assert_eq!(&dst[1..], &format!("{:064x}", 143u32));
-        assert_eq!(dst, dst.to_lowercase(), "hex must be lowercase");
+        const ORDER_PLACED_GATEWAY_DST: &str =
+            ":000000000000000000000000000000000000000000000000000000000000008f";
+
+        assert_eq!(event_type_dst(143), ORDER_PLACED_GATEWAY_DST);
     }
 
     #[test]
