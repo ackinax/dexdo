@@ -186,7 +186,8 @@ impl IndexerRepository {
             event_types.push(decoded.as_ref().map(|d| d.event_type.clone()));
             // body_json is NOT NULL; an absent body stores jsonb 'null'
             // ("null"::jsonb), exactly as the prior per-row path did.
-            body_texts.push(edge.node.body.as_ref().map_or_else(|| "null".to_string(), Value::to_string));
+            body_texts
+                .push(edge.node.body.as_ref().map_or_else(|| "null".to_string(), Value::to_string));
             decoded_texts.push(decoded.as_ref().map(|d| d.value.to_string()));
         }
 
@@ -476,7 +477,9 @@ impl IndexerRepository {
             };
 
             loop {
-                match self.reproject_pending_from(batch_size, after.as_deref(), Some(&ceiling)).await
+                match self
+                    .reproject_pending_from(batch_size, after.as_deref(), Some(&ceiling))
+                    .await
                 {
                     Ok(stats) => {
                         if stats.scanned > 0 {
@@ -558,7 +561,6 @@ fn pending_row_to_inputs(row: &PendingRow) -> Option<(DecodedEvent, EventNode)> 
     };
     Some((event, node))
 }
-
 
 fn try_decode(decoder: &Decoder, msg_id: &str, body: Option<&Value>) -> Option<DecodedEvent> {
     let body_str = body?.as_str()?;

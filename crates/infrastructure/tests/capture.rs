@@ -82,7 +82,12 @@ async fn captures_decodable_event_without_projecting() {
     )
     .await;
 
-    let edges = vec![edge(&msg_id, Some("5f80capture0000000000000001"), &orderbook, Some(ORDER_PLACED_BODY))];
+    let edges = vec![edge(
+        &msg_id,
+        Some("5f80capture0000000000000001"),
+        &orderbook,
+        Some(ORDER_PLACED_BODY),
+    )];
     let result = repo
         .persist_page("blockchain_events", &edges, Some("cursor-1"), &decoder)
         .await
@@ -110,7 +115,10 @@ async fn captures_decodable_event_without_projecting() {
             .fetch_one(&pool)
             .await
             .expect("count live_orders");
-    assert_eq!(live_count, 0, "capture must NOT write the read-model; projection is the loop's job");
+    assert_eq!(
+        live_count, 0,
+        "capture must NOT write the read-model; projection is the loop's job"
+    );
 
     // Purge before returning: this row is a valid, typed, decoded OrderPlaced
     // left with processed_at NULL, so a reprojection-suite reproject_pending
@@ -158,22 +166,19 @@ async fn bulk_insert_counts_new_and_conflicting_and_dedups_within_page() {
         edge(&dup, Some("5f80capture_counts_000000003"), &src, None),
         edge(&dup, Some("5f80capture_counts_000000003"), &src, None),
     ];
-    let result = repo
-        .persist_page("blockchain_events", &edges, None, &decoder)
-        .await
-        .expect("persist_page");
+    let result =
+        repo.persist_page("blockchain_events", &edges, None, &decoder).await.expect("persist_page");
 
     // After in-page de-dup: 3 unique candidates (existing, fresh, dup); 1
     // conflicts (existing) → inserted 2 (fresh, dup), skipped 1.
     assert_eq!(result.inserted, 2, "fresh + dup insert once each");
     assert_eq!(result.skipped, 1, "the pre-existing msg_id conflicts");
 
-    let dup_count: i64 =
-        sqlx::query_scalar("select count(*) from raw_events where msg_id = $1")
-            .bind(&dup)
-            .fetch_one(&pool)
-            .await
-            .expect("count dup");
+    let dup_count: i64 = sqlx::query_scalar("select count(*) from raw_events where msg_id = $1")
+        .bind(&dup)
+        .fetch_one(&pool)
+        .await
+        .expect("count dup");
     assert_eq!(dup_count, 1, "a within-page duplicate msg_id must land exactly once");
 }
 
@@ -189,10 +194,8 @@ async fn edge_missing_chain_order_is_dropped() {
     purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
 
     let edges = vec![edge(&msg_id, None, &src, None)];
-    let result = repo
-        .persist_page("blockchain_events", &edges, None, &decoder)
-        .await
-        .expect("persist_page");
+    let result =
+        repo.persist_page("blockchain_events", &edges, None, &decoder).await.expect("persist_page");
 
     assert_eq!(result.inserted, 0, "an edge without msg_chain_order is not inserted");
     assert_eq!(result.undecoded, 1, "the dropped edge is counted as undecoded");

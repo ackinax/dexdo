@@ -3351,7 +3351,8 @@ async fn count_pending_projection_counts_only_unprojected_typed_decoded_rows() {
     let before = repo.count_pending_projection().await.expect("count before");
 
     // One pending decodable+typed row.
-    insert_raw(&pool, &pending, "0:count_pending_src", "RootOracle.OracleDeployed", &json!({})).await;
+    insert_raw(&pool, &pending, "0:count_pending_src", "RootOracle.OracleDeployed", &json!({}))
+        .await;
     // One already-processed row — must NOT be counted.
     sqlx::query(
         r#"insert into raw_events
@@ -3407,10 +3408,22 @@ async fn reproject_pending_marks_a_whole_batch_processed() {
     )
     .await;
 
-    insert_raw(&pool, &msg_a, &addr_a, "RootOracle.OracleDeployed",
-        &json!({ "oracle": addr_a, "pubkey": "0x00", "name": format!("{test}-a") })).await;
-    insert_raw(&pool, &msg_b, &addr_b, "RootOracle.OracleDeployed",
-        &json!({ "oracle": addr_b, "pubkey": "0x00", "name": format!("{test}-b") })).await;
+    insert_raw(
+        &pool,
+        &msg_a,
+        &addr_a,
+        "RootOracle.OracleDeployed",
+        &json!({ "oracle": addr_a, "pubkey": "0x00", "name": format!("{test}-a") }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &msg_b,
+        &addr_b,
+        "RootOracle.OracleDeployed",
+        &json!({ "oracle": addr_b, "pubkey": "0x00", "name": format!("{test}-b") }),
+    )
+    .await;
 
     let stats = repo.reproject_pending(1000).await.expect("reproject");
     assert!(stats.applied >= 2, "both rows apply in one batch");
@@ -3455,12 +3468,30 @@ async fn reproject_pending_from_honors_after_and_until_bounds() {
     ];
     purge(&pool, &cleanup).await;
 
-    insert_raw(&pool, &m1, &a1, "RootOracle.OracleDeployed",
-        &json!({ "oracle": a1, "pubkey": "0x00", "name": m1 })).await;
-    insert_raw(&pool, &m2, &a2, "RootOracle.OracleDeployed",
-        &json!({ "oracle": a2, "pubkey": "0x00", "name": m2 })).await;
-    insert_raw(&pool, &m3, &a3, "RootOracle.OracleDeployed",
-        &json!({ "oracle": a3, "pubkey": "0x00", "name": m3 })).await;
+    insert_raw(
+        &pool,
+        &m1,
+        &a1,
+        "RootOracle.OracleDeployed",
+        &json!({ "oracle": a1, "pubkey": "0x00", "name": m1 }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &m2,
+        &a2,
+        "RootOracle.OracleDeployed",
+        &json!({ "oracle": a2, "pubkey": "0x00", "name": m2 }),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        &m3,
+        &a3,
+        "RootOracle.OracleDeployed",
+        &json!({ "oracle": a3, "pubkey": "0x00", "name": m3 }),
+    )
+    .await;
 
     // insert_raw derives chain_order as `5f80{msg_id:0>28}`. after = row 1's value,
     // until = row 2's value, so only row 2 (after < chain_order <= until) is eligible:
