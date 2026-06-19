@@ -265,8 +265,7 @@ async fn drain_events(
         }
 
         let end_cursor = page.page_info.end_cursor.as_deref();
-        let persisted = repo
-            .persist_page(STREAM_NAME, &page.edges, end_cursor, decoder).await?;
+        let persisted = repo.persist_page(STREAM_NAME, &page.edges, end_cursor, decoder).await?;
         stats.inserted += persisted.inserted;
         stats.skipped += persisted.skipped;
         stats.decoded += persisted.decoded;
@@ -298,9 +297,10 @@ async fn drain_events(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use dodex_infrastructure::graphql::EventEdge;
     use dodex_infrastructure::graphql::EventNode;
+
+    use super::*;
 
     fn edge_with(src_dapp_id: Option<&str>, dst: Option<&str>) -> EventEdge {
         EventEdge {
