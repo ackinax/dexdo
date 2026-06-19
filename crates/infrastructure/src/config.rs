@@ -212,11 +212,6 @@ pub struct IndexerSection {
     pub polling_interval_ms: u64,
     pub depth_refresh_interval_ms: u64,
     pub reconciliation_interval_ms: u64,
-    /// Cadence of the deferred-projection retry pass. Background loop scans
-    /// `raw_events` rows whose `processed_at` is still null and re-runs the
-    /// projector against stored `decoded` jsonb, in chain-arrival order.
-    #[serde(default = "default_reprojection_interval_ms")]
-    pub reprojection_interval_ms: u64,
     /// Maximum rows replayed per reprojection sweep. Bounded so a long idle
     /// backlog does not block the rest of the indexer for too long.
     #[serde(default = "default_reprojection_batch_size")]
@@ -257,10 +252,6 @@ pub struct IndexerSection {
     /// field never costs us our own events). When unset, no dapp scoping runs.
     #[serde(default)]
     pub dapp_id: Option<String>,
-}
-
-fn default_reprojection_interval_ms() -> u64 {
-    30_000
 }
 
 fn default_reprojection_batch_size() -> u32 {
@@ -492,10 +483,6 @@ impl IndexerConfig {
         anyhow::ensure!(
             i.reconciliation_interval_ms > 0,
             "indexer.reconciliation_interval_ms must be > 0"
-        );
-        anyhow::ensure!(
-            i.reprojection_interval_ms > 0,
-            "indexer.reprojection_interval_ms must be > 0"
         );
         anyhow::ensure!(
             i.reprojection_batch_size > 0,

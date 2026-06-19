@@ -20,8 +20,6 @@ indexer:
   polling_interval_ms: 3000
   depth_refresh_interval_ms: 5000
   reconciliation_interval_ms: 60000
-  # Cadence and batch size for the deferred-projection retry pass.
-  reprojection_interval_ms: 30000
   reprojection_batch_size: 500
   # Cadence for the OracleEventList reconciler that fills oracle_events.describe
   # (and trust_addr) by calling OEL._events getter — `EventAdded` does not

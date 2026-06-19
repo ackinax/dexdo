@@ -214,7 +214,6 @@ indexer:
   polling_interval_ms: 3000
   depth_refresh_interval_ms: 5000
   reconciliation_interval_ms: 60000
-  reprojection_interval_ms: 30000
   reprojection_batch_size: 500
   oracle_event_list_reconciliation_interval_ms: 60000
   dapp_id: "<dexdo-dapp-id>"   # scopes ingestion to this dapp; omit to disable
