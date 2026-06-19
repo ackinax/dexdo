@@ -14,7 +14,7 @@ Implementation-facing requirements for the indexer side of the market-data path.
 
 **Reconciliation** — the process where reconcilers periodically fetch contract state and copy missing fields into the read-model. It complements event projection because some fields are available only through getters, not through chain events.
 
-**Reprojection** — retry pass for `raw_events` rows that were decoded but could not be applied yet, usually because a child event arrived before its parent row existed.
+**Projection loop** — the single consumer that drains decoded `raw_events` rows (`processed_at IS NULL`) in `chain_order` and applies each to the read-model. It is the sole projector: the capture path no longer projects inline. A row that cannot apply yet (a child arriving before its parent) is left `processed_at NULL` and retried on the next pass — the loop is both first-projection and retry.
 
 **BOC** — serialized contract state fetched from GraphQL and passed to the local TVM runner so getters can be executed off-chain.
 
@@ -24,13 +24,11 @@ Implementation-facing requirements for the indexer side of the market-data path.
 flowchart LR
     chain[Acki Nacki GraphQL event stream] --> ingest[Indexer fetch loop]
     ingest --> raw[raw_events]
-    raw --> decoder[ABI decoder]
-    decoder --> projectors[Projectors]
+    raw --> project[Projection loop]
+    project --> projectors[Projectors]
     projectors --> discovery[oracles / oracle_event_lists / oracle_events]
     projectors --> markets[markets]
     projectors --> orders[live_orders]
-    raw --> retry[Reprojection loop]
-    retry --> projectors
 
     chain_state[GraphQL account BOC lookup] --> market_reconciler[Market reconciler]
     chain_state --> oel_reconciler[OracleEventList reconciler]
@@ -76,12 +74,11 @@ Intended use: shed confirmed observability-only floods (e.g. `OrderBook.Queued`,
 
 ### Ingestion sequence per edge
 
-1. If `indexer.dapp_id` is set and the edge's `src_dapp_id` does not match (and is not absent), drop the edge. The page cursor still advances (step 5). `foreign_skipped` is incremented.
-2. If the edge's `dst` matches a configured `indexer.ignored_event_types` entry, drop the edge. The page cursor still advances (step 5). `type_ignored` is incremented.
+1. If `indexer.dapp_id` is set and the edge's `src_dapp_id` does not match (and is not absent), drop the edge. The page cursor still advances (step 4). `foreign_skipped` is incremented.
+2. If the edge's `dst` matches a configured `indexer.ignored_event_types` entry, drop the edge. The page cursor still advances (step 4). `type_ignored` is incremented.
 3. Try to decode the message body against the ABI bundle (`crates/infrastructure/src/decoder.rs`). On success, store the decoded JSON payload alongside `event_type`.
 4. Persist the row in `raw_events` with `processed_at = NULL`. The unique `msg_id` constraint deduplicates overlapping page fetches.
-5. If decoding produced a known event, dispatch the projector inside the same transaction. The projector outcome decides whether `processed_at` is stamped now (`Applied`, `Unknown`) or left null for retry (`Deferred`).
-6. After the page commits, persist the resume cursor in [`indexer_cursors`](data-schema.md#indexer_cursors). A restart resumes from this cursor — already-projected rows are not replayed.
+5. After the page commits, persist the resume cursor in [`indexer_cursors`](data-schema.md#indexer_cursors). The cursor tracks capture progress, not projection; a restart resumes capture from it while the projection loop independently drains whatever rows remain `processed_at NULL`.
 
 ### Noise log
 
@@ -89,7 +86,7 @@ When `LOG_DIR` is set, the projector's "no handler for event type" warnings are 
 
 ## Projection — lifecycle events
 
-Lifecycle events drive transitions on [`markets`](data-schema.md#markets) and the [`oracles`](data-schema.md#oracles) / [`oracle_event_lists`](data-schema.md#oracle_event_lists) / [`oracle_events`](data-schema.md#oracle_events) hierarchy. Each projector identifies its row by `pmp_address` (or the relevant parent address); if that row does not exist yet, the projector returns `Deferred` so the reprojection loop will retry once the parent event has landed.
+Lifecycle events drive transitions on [`markets`](data-schema.md#markets) and the [`oracles`](data-schema.md#oracles) / [`oracle_event_lists`](data-schema.md#oracle_event_lists) / [`oracle_events`](data-schema.md#oracle_events) hierarchy. Each projector identifies its row by `pmp_address` (or the relevant parent address); if that row does not exist yet, the projector returns `Deferred` so the projection loop will retry once the parent event has landed.
 
 | Event | Read-model effect |
 | --- | --- |
@@ -124,7 +121,7 @@ events are observability-only.
 
 `PartialFill` / `FullyFilled` are derived aggregates that the contract emits for MM-friendly UX; the underlying state is already captured by `OrderFilled`. `Queued` / `Rejected` occur at the queue level, before any order ID is assigned. `CallbackBounced` is a diagnostic event — the OrderBook state is not automatically rolled back, and the bounced credit requires operator-driven recovery.
 
-Event ordering is anchored on `raw_events.chain_order` (set from the GraphQL gateway’s `msg_chain_order`). The GraphQL events connection already returns edges in strict `msg_chain_order` order, and pagination preserves that order across pages; the live persist path therefore projects newly fetched edges in the received order. The reproject loop sorts deferred rows by `chain_order ASC` because it reads from Postgres rather than directly from the ordered GraphQL page. Together, these rules ensure that `OrderPlaced → OrderFilled → OrderCancelled` preserves the correct natural sequence: fills reduce `amount_remaining`, and cancellation then closes the order without erasing the unfilled remainder. `greatest(existing, new)` on `last_chain_order` is a belt-and-suspenders monotonicity guard for the row’s column, not the primary correctness mechanism.
+Event ordering is anchored on `raw_events.chain_order` (set from the GraphQL gateway’s `msg_chain_order`). All projection now runs through the projection loop, which reads pending rows from Postgres ordered by `chain_order ASC`; a single consumer applies them so `OrderPlaced → OrderFilled → OrderCancelled` preserves the natural sequence. Fills reduce `amount_remaining`, and cancellation then closes the order without erasing the unfilled remainder. `greatest(existing, new)` on `last_chain_order` is a belt-and-suspenders monotonicity guard for the row’s column, not the primary correctness mechanism.
 
 ## Projection — public trades
 
@@ -226,10 +223,10 @@ Two anti-starvation outcomes share the failure-backoff path with the market reco
 
 Two outcomes leave a `raw_events` row pending:
 
-- **`Deferred`** — the projector knows it cannot apply this event yet (typically a child arriving before its parent). `processed_at` stays NULL and the reprojection loop retries the row on every tick.
+- **`Deferred`** — the projector knows it cannot apply this event yet (typically a child arriving before its parent). `processed_at` stays NULL and the projection loop retries it on the next pass. The loop drains all eligible pending rows each pass; when no new rows remain above the last-seen ceiling, it idles for `polling_interval_ms` before rewinding to retry stuck rows from the front — so a permanently deferred row is retried at most once per idle interval, not on every ingest batch.
 - **`Err`** — the projector hit an unexpected error. Same effect on `processed_at`, plus a warn log and an increment in the failure counter. Useful for spotting ABI drift.
 
-The reprojection loop (`indexer_repo.rs::reproject_pending`) picks pending rows in chain-arrival order, uses `for update skip locked` to coexist with the main fetch loop, and reuses the already-decoded payload from `raw_events.decoded` — bodies are not re-decoded.
+The projection loop (`indexer_repo.rs::reproject_pending`) picks pending rows in `chain_order` sequence, uses `for update skip locked` to coexist with the main fetch loop, and reuses the already-decoded payload from `raw_events.decoded` — bodies are not re-decoded. It is the sole projector: the capture path writes `raw_events` rows with `processed_at NULL` and never projects inline.
 
 Reconciler-side failures use a separate mechanism — `last_reconcile_failed_at` and `reconcile_attempts` on the [`markets`](data-schema.md#markets) and [`oracle_event_lists`](data-schema.md#oracle_event_lists) rows. The 5-minute backoff window prevents a permanently broken `getDetails()` from blocking the batch every tick.
 
