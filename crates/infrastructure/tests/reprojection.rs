@@ -3661,7 +3661,6 @@ async fn run_reprojection_loop_drains_pending_and_retries_deferred() {
     let test = "reproj_loop_orch";
     let oracle_addr = format!("0:{test}_oracle");
     let oracle_name = format!("{test}-oracle");
-    let oracle_deploy_msg = format!("{test}-oracle-deploy");
     let evlist_addr = format!("0:{test}_evlist");
     let msg_oracle = format!("{test}-oracle-msg");
     let msg_child = format!("{test}-child-msg");
@@ -3742,20 +3741,23 @@ async fn run_reprojection_loop_drains_pending_and_retries_deferred() {
     );
 
     h.abort();
-    let _ = oracle_deploy_msg; // used only as doc for the test scenario
+    let _ = h.await; // drive the aborted task to completion before purging its rows
     purge(&pool, &cleanup).await;
 }
 
 #[tokio::test]
 async fn identical_chain_order_both_rows_eventually_drain() {
     // Verifies that two pending rows sharing the same chain_order are both
-    // eventually drained. The keyset cursor (`chain_order > after`) EXCLUDES
-    // the duplicate when `after == that shared value`, so a single keyset pass
-    // strands the second row. The loop's front-rewinding retry pass (after =
-    // None) recovers it by re-scanning from the beginning of the queue. This
-    // is expected behaviour: chain_order is globally unique by gateway design,
-    // so real duplicates are not anticipated on the write path; this test
-    // asserts the recovery mechanism as defense-in-depth.
+    // eventually drained. With batch_size=1, the first forward pass takes row A
+    // and advances `after` to the shared chain_order; the next forward SELECT
+    // (`chain_order > after`) then excludes row B, stranding it. The loop's
+    // front-rewinding retry pass (after = None, `processed_at is null` filter)
+    // then recovers B. This exercises the actual boundary path: forward-pass
+    // stranding followed by retry-pass recovery.
+    //
+    // chain_order is globally unique by gateway design, so real duplicates are
+    // not anticipated on the write path; this test asserts the recovery
+    // mechanism as defense-in-depth.
     let _guard = REPROJECTION_LOCK.lock().await;
     let Some(pool) = setup().await else { return };
     let repo = IndexerRepository::new(pool.clone());
@@ -3806,9 +3808,12 @@ async fn identical_chain_order_both_rows_eventually_drain() {
     .await
     .expect("insert row B");
 
-    // Drive through the loop with a short idle interval. The retry pass
-    // (after = None) re-covers the stranded duplicate.
-    let h = tokio::spawn(repo.clone().run_reprojection_loop(Duration::from_millis(50), 1000));
+    // Drive through the loop with batch_size=1 and a short idle interval.
+    // batch_size=1 forces the keyset boundary: the first forward pass takes
+    // row A (advances `after` to the shared chain_order), the next forward
+    // SELECT excludes row B, and the timer-gated retry pass (rewind to front)
+    // recovers B.
+    let h = tokio::spawn(repo.clone().run_reprojection_loop(Duration::from_millis(50), 1));
 
     // Poll up to 5 seconds for BOTH rows to drain.
     let both_applied = {
@@ -3827,6 +3832,7 @@ async fn identical_chain_order_both_rows_eventually_drain() {
     };
 
     h.abort();
+    let _ = h.await; // drive the aborted task to completion before purging its rows
 
     assert!(
         both_applied,
