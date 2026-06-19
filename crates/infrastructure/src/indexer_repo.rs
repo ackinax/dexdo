@@ -31,11 +31,11 @@ pub struct IndexerRepository {
     /// first sighting of a type is logged at the normal target (stdout + main
     /// log) as the operator's signal that a deployed contract emits something
     /// the indexer does not yet handle; every later repeat is diverted to the
-    /// noise log. Shared via `Arc` across the clones that record sightings —
-    /// the fetch loop and the reprojection sweep — so "first" is process-global
-    /// across both. (The metrics-refresh clone shares the `Arc` too but never
-    /// records sightings.) Bounded by the decoder's ABI event vocabulary, so it
-    /// cannot grow without limit.
+    /// noise log. Shared via `Arc` across all clones. The projection loop
+    /// (`run_reprojection_loop`) is the sole emitter of unknown-type sightings;
+    /// "first" is process-global across the loop's passes. (The metrics-refresh
+    /// clone shares the `Arc` too but never records sightings.) Bounded by the
+    /// decoder's ABI event vocabulary, so it cannot grow without limit.
     seen_unknown_event_types: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -56,6 +56,8 @@ pub struct ReprojectionStats {
     pub failed: u64,
     /// Highest `chain_order` read in the batch (rows are ordered asc, so the
     /// last row's). `None` for an empty batch. Drives the drain loop's cursor.
+    /// It is a keyset cursor folded into the stats struct (returned alongside
+    /// the counts to avoid a second return value), not an outcome counter.
     pub max_chain_order: Option<String>,
 }
 
@@ -221,7 +223,13 @@ impl IndexerRepository {
             .bind(decoded_texts.as_slice())
             .execute(&mut *tx)
             .await
-            .context("bulk insert raw_events")?
+            .with_context(|| {
+                format!(
+                    "bulk insert raw_events chain_orders {:?}..{:?}",
+                    chain_orders.first(),
+                    chain_orders.last()
+                )
+            })?
             .rows_affected();
 
             result.inserted = inserted;
@@ -348,7 +356,7 @@ impl IndexerRepository {
         }
 
         if !to_mark.is_empty() {
-            sqlx::query(
+            let marked = sqlx::query(
                 r#"update raw_events
                       set processed_at = now()
                     where id = any($1)
@@ -357,7 +365,16 @@ impl IndexerRepository {
             .bind(&to_mark)
             .execute(&mut *tx)
             .await
-            .context("batch mark raw_events.processed_at")?;
+            .context("batch mark raw_events.processed_at")?
+            .rows_affected();
+            if marked != to_mark.len() as u64 {
+                warn!(
+                    expected = to_mark.len(),
+                    actual = marked,
+                    "batch-mark stamped fewer rows than projected: another writer may have set \
+                     processed_at concurrently — single-consumer assumption may be violated"
+                );
+            }
         }
 
         tx.commit().await.context("reproject tx commit")?;
@@ -476,6 +493,7 @@ impl IndexerRepository {
                 }
             };
 
+            let mut drained_clean = true;
             loop {
                 match self
                     .reproject_pending_from(batch_size, after.as_deref(), Some(&ceiling))
@@ -506,14 +524,16 @@ impl IndexerRepository {
                     }
                     Err(err) => {
                         error!(?err, "projection sweep failed");
+                        drained_clean = false;
                         break;
                     }
                 }
             }
-            // Everything <= ceiling has been attempted this pass; forward passes
-            // resume above it. (Harmless if ceiling < the previous floor: ceiling
-            // is the max pending row, so (ceiling, old_floor] holds nothing.)
-            floor = Some(ceiling.clone());
+            // Advances floor only after a clean drain; on a sweep error the floor
+            // is left so the next forward pass re-covers the range.
+            if drained_clean {
+                floor = Some(ceiling.clone());
+            }
 
             // Backlog gauge: rows still pending after the pass (Deferred waiting
             // on a parent, or rows that arrived above the ceiling). Info only when
