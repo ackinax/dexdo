@@ -54,7 +54,7 @@ Two filters run against the raw message edge — before any ABI decode — and d
 
 #### Scope filter: `indexer.dapp_id`
 
-`indexer.dapp_id` (optional string; omit or leave unset to disable) scopes ingestion to one DEXDO application. When set, only edges whose `src_dapp_id` matches the configured value are kept; edges with no `src_dapp_id` field are also kept (so a gateway that omits the field does not silently drop everything); edges with a mismatching `src_dapp_id` are dropped before decode. When unset (the local default), the filter is inert and every edge is processed. Each per-tick log line includes a `foreign_skipped` count of edges dropped by this filter.
+`indexer.dapp_id` (optional string; omit or leave unset to disable) scopes ingestion to one DEXDO application. When set, only edges whose `src_dapp_id` matches the configured value are kept; edges with no `src_dapp_id` field are also kept (so a gateway that omits the field does not silently drop everything); edges with a mismatching `src_dapp_id` are dropped before decode. When unset (the local default), the filter is inert and every edge is processed. Each per-tick log line includes a `foreign_skipped` count of edges dropped by this filter, and any nonzero `foreign_skipped` emits a `warn!` with the tick drop rate because a correctly scoped single-dapp deployment should see effectively no foreign traffic.
 
 Setting `dapp_id` to an empty string is rejected at startup by `IndexerConfig::validate` (it would otherwise deserialize to `Some("")` and treat every edge with a real `src_dapp_id` as foreign); omit the key to disable scoping.
 
@@ -64,7 +64,7 @@ Setting `dapp_id` to an empty string is rejected at startup by `IndexerConfig::v
 
 Matching is by `dst` alone — it is not namespaced by contract or dapp — so a foreign contract that emits an event with the same `EVENT_ID` produces the same `dst` and is dropped too (no `raw_events` row). This is intentional: only DEXDO events are of interest, and our own non-no-op events use distinct EVENT_IDs outside the no-op set, so a wanted event is never dropped by this filter. To confine dropping to your own contracts, pair it with the `indexer.dapp_id` scope filter, which runs first.
 
-Each per-tick log line includes a `type_ignored` count of edges dropped by this filter.
+Each per-tick log line includes a `type_ignored` count of edges dropped by this filter. A high `type_ignored` rate is not warned by itself because this filter is deliberately used to shed observability-only floods such as `OrderBook.Queued`.
 
 The startup guard accepts **only** the known droppable no-op types — `OrderBook.Queued` / `FullyFilled` / `Rejected` / `CallbackBounced` (the `IGNORABLE_EVENT_TYPES` allow-list) — and refuses any other entry. It fires at startup, not at ingest time, so a bad entry prevents the service from starting rather than failing silently. The allow-list closes three otherwise-silent failures:
 

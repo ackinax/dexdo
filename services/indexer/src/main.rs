@@ -25,7 +25,6 @@ mod metrics_refresh;
 
 const STREAM_NAME: &str = "blockchain_events";
 const MAX_PAGES_PER_TICK: u32 = 100;
-const DROPPED_EDGE_WARN_FRACTION: f64 = 0.5;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -172,15 +171,19 @@ async fn main() -> anyhow::Result<()> {
                         cursor = cursor.as_deref().unwrap_or(""),
                         "indexer tick"
                     );
-                    if let Some(drop_rate) = drop_rate_warning(stats.edges, stats.foreign_skipped) {
+                    if let Some(drop_rate) =
+                        foreign_drop_warning(stats.edges, stats.foreign_skipped)
+                    {
                         warn!(
                             edges = stats.edges,
                             foreign_skipped = stats.foreign_skipped,
                             drop_rate,
-                            "indexer dropped high share of foreign-dapp edges"
+                            "indexer dropped foreign-dapp edges"
                         );
                     }
-                    if let Some(drop_rate) = drop_rate_warning(stats.edges, stats.type_ignored) {
+                    if let Some(drop_rate) =
+                        ignored_type_drop_warning(stats.edges, stats.type_ignored)
+                    {
                         warn!(
                             edges = stats.edges,
                             type_ignored = stats.type_ignored,
@@ -215,6 +218,13 @@ struct DrainStats {
     pages: u32,
 }
 
+#[derive(Debug, Default)]
+struct FilterStats {
+    ignored: u64,
+    foreign_skipped: u64,
+    type_ignored: u64,
+}
+
 /// Whether an event edge belongs to the configured DEXDO dapp. Edges with no
 /// `src_dapp_id` are kept (treated as in-scope) so a gateway that omits the
 /// field never costs us our own events.
@@ -234,12 +244,61 @@ fn edge_is_ignored_noop(edge: &EventEdge, ignored_dsts: &HashSet<String>) -> boo
     }
 }
 
-fn drop_rate_warning(edges: usize, dropped: u64) -> Option<f64> {
+fn drop_rate(edges: usize, dropped: u64) -> Option<f64> {
     if edges == 0 || dropped == 0 {
         return None;
     }
-    let rate = dropped as f64 / edges as f64;
-    (rate >= DROPPED_EDGE_WARN_FRACTION).then_some(rate)
+    Some(dropped as f64 / edges as f64)
+}
+
+fn foreign_drop_warning(edges: usize, dropped: u64) -> Option<f64> {
+    drop_rate(edges, dropped)
+}
+
+fn ignored_type_drop_warning(_edges: usize, _dropped: u64) -> Option<f64> {
+    // Configured no-op event types are expected to be dropped during normal
+    // OrderBook floods; the per-tick info log still carries the count.
+    None
+}
+
+fn apply_ingest_filters(
+    mut edges: Vec<EventEdge>,
+    dapp_id: Option<&str>,
+    ignored_src: &HashSet<&str>,
+    ignored_event_dsts: &HashSet<String>,
+) -> (Vec<EventEdge>, FilterStats) {
+    let mut stats = FilterStats::default();
+
+    // Filter on src only: events are outbound externals from a contract.
+    // Cursor still advances on the original page, so we will not re-fetch
+    // the noise on the next tick.
+    if !ignored_src.is_empty() {
+        let before = edges.len();
+        edges.retain(|edge| match edge.node.src.as_deref() {
+            Some(src) => !ignored_src.contains(src),
+            None => true,
+        });
+        stats.ignored += (before - edges.len()) as u64;
+    }
+
+    // Scope to the DEXDO dapp: drop foreign chain traffic before decode.
+    // Inert when no dapp_id is configured.
+    if let Some(dapp_id) = dapp_id {
+        let before = edges.len();
+        edges.retain(|edge| edge_in_scope(edge, dapp_id));
+        stats.foreign_skipped += (before - edges.len()) as u64;
+    }
+
+    // Drop configured no-op event types by dst before decode. dst is in the
+    // message header, so this costs no decode. PartialFill is excluded by
+    // the startup guard, so its dst is never here and its metric stays.
+    if !ignored_event_dsts.is_empty() {
+        let before = edges.len();
+        edges.retain(|edge| !edge_is_ignored_noop(edge, ignored_event_dsts));
+        stats.type_ignored += (before - edges.len()) as u64;
+    }
+
+    (edges, stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -261,33 +320,12 @@ async fn drain_events(
         let edges_seen = page.edges.len();
         stats.edges += edges_seen;
 
-        // Filter on src only: events are outbound externals from a contract.
-        // Cursor still advances on the original page, so we will not re-fetch
-        // the noise on the next tick.
-        if !ignored_src.is_empty() {
-            page.edges.retain(|edge| match edge.node.src.as_deref() {
-                Some(src) => !ignored_src.contains(src),
-                None => true,
-            });
-        }
-        stats.ignored += (edges_seen - page.edges.len()) as u64;
-
-        // Scope to the DEXDO dapp: drop foreign chain traffic before decode.
-        // Inert when no dapp_id is configured.
-        if let Some(dapp_id) = dapp_id {
-            let before = page.edges.len();
-            page.edges.retain(|edge| edge_in_scope(edge, dapp_id));
-            stats.foreign_skipped += (before - page.edges.len()) as u64;
-        }
-
-        // Drop configured no-op event types by dst before decode. dst is in the
-        // message header, so this costs no decode. PartialFill is excluded by
-        // the startup guard, so its dst is never here and its metric stays.
-        if !ignored_event_dsts.is_empty() {
-            let before = page.edges.len();
-            page.edges.retain(|edge| !edge_is_ignored_noop(edge, ignored_event_dsts));
-            stats.type_ignored += (before - page.edges.len()) as u64;
-        }
+        let (retained, filter_stats) =
+            apply_ingest_filters(page.edges, dapp_id, ignored_src, ignored_event_dsts);
+        page.edges = retained;
+        stats.ignored += filter_stats.ignored;
+        stats.foreign_skipped += filter_stats.foreign_skipped;
+        stats.type_ignored += filter_stats.type_ignored;
 
         let end_cursor = page.page_info.end_cursor.as_deref();
         let persisted = repo.persist_page(STREAM_NAME, &page.edges, end_cursor, decoder).await?;
@@ -328,12 +366,16 @@ mod tests {
     use super::*;
 
     fn edge_with(src_dapp_id: Option<&str>, dst: Option<&str>) -> EventEdge {
+        edge_with_all(None, src_dapp_id, dst)
+    }
+
+    fn edge_with_all(src: Option<&str>, src_dapp_id: Option<&str>, dst: Option<&str>) -> EventEdge {
         EventEdge {
             cursor: "c".to_string(),
             node: EventNode {
                 msg_id: "m".to_string(),
                 msg_chain_order: Some("m".to_string()),
-                src: None,
+                src: src.map(str::to_string),
                 src_dapp_id: src_dapp_id.map(str::to_string),
                 dst: dst.map(str::to_string),
                 body: None,
@@ -364,15 +406,45 @@ mod tests {
     }
 
     #[test]
-    fn drop_rate_warning_trips_when_half_or_more_edges_are_dropped() {
-        assert!(drop_rate_warning(10, 5).is_some());
-        assert!(drop_rate_warning(10, 10).is_some());
+    fn foreign_drop_warning_trips_on_any_nonzero_drop() {
+        assert!(foreign_drop_warning(10, 1).is_some());
+        assert!(foreign_drop_warning(10, 4).is_some());
     }
 
     #[test]
-    fn drop_rate_warning_stays_quiet_for_low_or_empty_ticks() {
-        assert!(drop_rate_warning(10, 4).is_none());
-        assert!(drop_rate_warning(0, 1).is_none());
-        assert!(drop_rate_warning(10, 0).is_none());
+    fn foreign_drop_warning_stays_quiet_for_empty_or_zero_drop_ticks() {
+        assert!(foreign_drop_warning(0, 1).is_none());
+        assert!(foreign_drop_warning(10, 0).is_none());
+    }
+
+    #[test]
+    fn ignored_type_drop_warning_is_disabled_for_expected_noop_floods() {
+        assert!(ignored_type_drop_warning(10, 10).is_none());
+    }
+
+    #[test]
+    fn apply_ingest_filters_attributes_each_drop_to_the_filter_that_removed_it() {
+        use std::collections::HashSet;
+
+        let queued = dodex_infrastructure::config::event_type_dst(159);
+        let placed = dodex_infrastructure::config::event_type_dst(143);
+        let ignored_src: HashSet<&str> = ["noise"].into_iter().collect();
+        let ignored_event_dsts: HashSet<String> = [queued.clone()].into_iter().collect();
+
+        let edges = vec![
+            edge_with_all(Some("noise"), Some("dexdo"), Some(&queued)),
+            edge_with_all(Some("own"), Some("other"), Some(&queued)),
+            edge_with_all(Some("own"), Some("dexdo"), Some(&queued)),
+            edge_with_all(Some("own"), Some("dexdo"), Some(&placed)),
+            edge_with_all(Some("own"), None, Some(&placed)),
+        ];
+
+        let (retained, stats) =
+            apply_ingest_filters(edges, Some("dexdo"), &ignored_src, &ignored_event_dsts);
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(stats.ignored, 1);
+        assert_eq!(stats.foreign_skipped, 1);
+        assert_eq!(stats.type_ignored, 1);
     }
 }
