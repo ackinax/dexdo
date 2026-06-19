@@ -57,17 +57,20 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(reconciler.run_loop(reconciler_interval));
     info!(interval_ms = config.indexer.reconciliation_interval_ms, "market reconciler started");
 
-    // Spawn the deferred-projection retry pass. Replays raw_events rows whose
-    // projector returned `Deferred` (or failed) once their parent records show
-    // up. Idempotent — projectors are upserts.
-    let reprojector = repo.clone();
-    let reprojection_interval = Duration::from_millis(config.indexer.reprojection_interval_ms);
-    let reprojection_batch_size = config.indexer.reprojection_batch_size;
-    tokio::spawn(reprojector.run_reprojection_loop(reprojection_interval, reprojection_batch_size));
+    // Spawn the projection loop. It is the SOLE projector: it drains the
+    // raw_events rows the capture loop writes (processed_at IS NULL) in
+    // chain_order and projects each into the read-model, retrying Deferred
+    // rows once their parent lands. Continuous-drain with an idle pause of
+    // polling_interval_ms — no point polling for pending rows faster than
+    // capture produces them.
+    let projector = repo.clone();
+    let projection_idle_interval = Duration::from_millis(config.indexer.polling_interval_ms);
+    let projection_batch_size = config.indexer.reprojection_batch_size;
+    tokio::spawn(projector.run_reprojection_loop(projection_idle_interval, projection_batch_size));
     info!(
-        interval_ms = config.indexer.reprojection_interval_ms,
-        batch_size = reprojection_batch_size,
-        "reprojection loop started"
+        idle_interval_ms = config.indexer.polling_interval_ms,
+        batch_size = projection_batch_size,
+        "projection loop started"
     );
 
     // Spawn the OracleEventList reconciler. Fills `oracle_events.describe`
@@ -166,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
                         type_ignored = stats.type_ignored,
                         pages = stats.pages,
                         cursor = cursor.as_deref().unwrap_or(""),
-                        "indexer tick"
+                        "capture tick"
                     );
                     if let Some(drop_rate) =
                         foreign_drop_warning(stats.edges, stats.foreign_skipped)
