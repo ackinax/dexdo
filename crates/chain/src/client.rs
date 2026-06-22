@@ -8,18 +8,19 @@
 
 use std::sync::Arc;
 
-use ackinacki_kit::contracts::dex::order_book::OrderBook;
-use ackinacki_kit::contracts::dex::order_book::ParamsOfGetOrdersByOwner;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrder;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfCancelOrderByClient;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfPlaceBatch;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfPlaceOrder;
-use ackinacki_kit::contracts::dex::private_note::ParamsOfSplitFullSet;
-use ackinacki_kit::contracts::dex::private_note::PrivateNote;
 use ackinacki_kit::tvm_client::abi::Signer;
 use ackinacki_kit::tvm_client::processing::ResultOfSendMessage;
 use ackinacki_kit::tvm_client::ClientConfig;
 use ackinacki_kit::tvm_client::ClientContext;
+use dodex_contracts::dex::order_book::OrderBook;
+use dodex_contracts::dex::order_book::ParamsOfGetOrdersByOwner;
+use dodex_contracts::dex::private_note::ParamsOfCancelOrder;
+use dodex_contracts::dex::private_note::ParamsOfCancelOrderByClient;
+use dodex_contracts::dex::private_note::ParamsOfMergeFullSet;
+use dodex_contracts::dex::private_note::ParamsOfPlaceBatch;
+use dodex_contracts::dex::private_note::ParamsOfPlaceOrder;
+use dodex_contracts::dex::private_note::ParamsOfSplitFullSet;
+use dodex_contracts::dex::private_note::PrivateNote;
 
 use super::dapp::dex_contract_params;
 use super::dto::OwnedOrders;
@@ -102,6 +103,22 @@ impl Dex {
     ) -> ChainResult<ResultOfSendMessage> {
         PrivateNote::new(self.ctx.clone(), dex_contract_params(pn_address))
             .split_full_set(params, signer)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Inverse of `split_full_set`: burn a full set of outcome tokens to
+    /// recover their collateral back into the note's `_balance`. Tests use
+    /// it on teardown so the shared deployer note's NACKL is reclaimed from
+    /// the throwaway market instead of being stranded in it.
+    pub async fn merge_full_set(
+        &self,
+        pn_address: &str,
+        params: ParamsOfMergeFullSet,
+        signer: Signer,
+    ) -> ChainResult<ResultOfSendMessage> {
+        PrivateNote::new(self.ctx.clone(), dex_contract_params(pn_address))
+            .merge_full_set(params, signer)
             .await
             .map_err(Into::into)
     }
