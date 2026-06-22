@@ -3842,3 +3842,164 @@ async fn identical_chain_order_both_rows_eventually_drain() {
 
     purge(&pool, &cleanup).await;
 }
+
+#[tokio::test]
+async fn projection_lag_seconds_empty_queue_is_zero() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    // projection_lag_seconds and count_pending_projection are global over ALL
+    // eligible pending rows, not scoped to this test, and run as separate reads
+    // on a shared DB (REPROJECTION_LOCK is in-process only, so it does not cross
+    // nextest's process-per-test). Read the count on both sides of the lag read
+    // and assert the empty-queue==0 contract only when the queue is observably
+    // empty across both — then it was empty during the lag read too. Otherwise a
+    // concurrent row makes the snapshots disagree and we skip rather than flake.
+    let pending_before = repo.count_pending_projection().await.expect("count_pending_projection");
+    let lag = repo.projection_lag_seconds().await.expect("projection_lag_seconds");
+    let pending_after = repo.count_pending_projection().await.expect("count_pending_projection");
+    if pending_before == 0 && pending_after == 0 {
+        assert_eq!(lag, 0, "empty eligible queue must return 0");
+    }
+}
+
+#[tokio::test]
+async fn projection_lag_seconds_pending_row_has_positive_lag() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "metrics_lag_pending";
+    let src = format!("0:{test}_src");
+    let msg_id = format!("{test}-msg");
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
+
+    // insert_raw uses created_at_chain = to_timestamp(1_700_000_000)
+    // which is far in the past, so lag will be large and positive.
+    insert_raw(&pool, &msg_id, &src, "Nullifier.VoucherGenerated", &serde_json::json!({})).await;
+
+    let lag = repo.projection_lag_seconds().await.expect("projection_lag_seconds");
+    // On the shared DB another nextest process may consume this eligible row via
+    // reproject_* before the lag read. processed_at is monotonic (NULL -> set),
+    // so if the row is still pending afterward it was pending during the read and
+    // the global min therefore included its old timestamp -> lag > 0. If it was
+    // consumed, skip rather than flake on a spurious 0.
+    if !processed_at_is_set(&pool, &msg_id).await {
+        assert!(
+            lag > 0,
+            "pending row with old created_at_chain must produce positive lag, got {lag}"
+        );
+    }
+
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
+}
+
+#[tokio::test]
+async fn projection_lag_seconds_null_chain_time_falls_back_to_ingest_time() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let msg_id = "metrics_lag_null_chain-msg";
+    let src = "0:metrics_lag_null_chain_src";
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
+
+    // Eligible pending row whose gateway created_at was unparseable, so chain
+    // time is NULL, but whose ingest time (created_at) is far in the past. A
+    // bare min(created_at_chain) would be NULL and report 0 lag, hiding the
+    // stale row; the coalesce fallback to created_at must surface it.
+    sqlx::query(
+        r#"insert into raw_events
+               (msg_id, chain_order, created_at_chain, created_at, src_address,
+                dst_address, event_type, body_json, decoded)
+           values ($1, $2, NULL, to_timestamp($3), $4, $4,
+                   'Nullifier.VoucherGenerated', '{}'::jsonb, '{}'::jsonb)"#,
+    )
+    .bind(msg_id)
+    .bind(format!("5f80{msg_id:0>28}"))
+    .bind(1_700_000_000_f64)
+    .bind(src)
+    .execute(&pool)
+    .await
+    .expect("insert null-chain raw_events");
+
+    let lag = repo.projection_lag_seconds().await.expect("projection_lag_seconds");
+    // Same shared-DB isolation as the positive-lag test (processed_at monotonic):
+    // assert only while the row is still pending, so its created_at fallback was
+    // in the global min -> lag > 0.
+    if !processed_at_is_set(&pool, msg_id).await {
+        assert!(lag > 0, "NULL chain time must fall back to ingest age, got {lag}");
+    }
+
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
+}
+
+#[tokio::test]
+async fn cursor_age_seconds_nonexistent_stream_is_none() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let stream = "metrics_cursor_age_nonexistent_stream";
+    sqlx::query("delete from indexer_cursors where stream_name = $1")
+        .bind(stream)
+        .execute(&pool)
+        .await
+        .expect("purge cursor");
+
+    let age = repo.cursor_age_seconds(stream).await.expect("cursor_age_seconds");
+    assert!(age.is_none(), "non-existent stream must return None");
+}
+
+#[tokio::test]
+async fn cursor_age_seconds_known_stream_is_small() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let stream = "metrics_cursor_age_known_stream";
+
+    // Upsert a cursor row with updated_at = now().
+    sqlx::query(
+        r#"insert into indexer_cursors (stream_name, cursor, updated_at)
+           values ($1, 'test-cursor', now())
+           on conflict (stream_name)
+           do update set cursor = excluded.cursor, updated_at = now()"#,
+    )
+    .bind(stream)
+    .execute(&pool)
+    .await
+    .expect("upsert cursor");
+
+    let age = repo.cursor_age_seconds(stream).await.expect("cursor_age_seconds");
+    assert!(age.is_some(), "known stream must return Some");
+    let age = age.unwrap();
+    assert!((0..10).contains(&age), "cursor just updated must have age < 10s, got {age}");
+
+    sqlx::query("delete from indexer_cursors where stream_name = $1")
+        .bind(stream)
+        .execute(&pool)
+        .await
+        .expect("cleanup cursor");
+}
+
+#[tokio::test]
+async fn pool_connection_stats_is_callable_and_sane() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    // Issue a query to ensure at least one connection exists.
+    let _: i32 = sqlx::query_scalar("select 1").fetch_one(&pool).await.expect("warmup query");
+
+    let (in_use, idle) = repo.pool_connection_stats();
+    // Pool state is live and read non-atomically (size()/num_idle() are separate
+    // reads, and other test binaries share the pool), so exact counts are not
+    // assertable without flaking. After the warmup query at least one connection
+    // exists, so the total is positive — the strongest non-flaky check.
+    assert!(
+        in_use + idle >= 1,
+        "expected >=1 connection after warmup, got in_use={in_use} idle={idle}"
+    );
+}
