@@ -2841,6 +2841,355 @@ async fn malformed_is_taker_fails_projection_loudly() {
     purge(&pool, &cleanup_refs).await;
 }
 
+/// Inserts a pending `raw_events` row with an explicit `chain_order`, so a test
+/// can place rows at controlled positions and bound a reproject to exactly its
+/// own rows — isolating it from whatever else the shared CI database holds.
+async fn insert_raw_at(
+    pool: &PgPool,
+    msg_id: &str,
+    chain_order: &str,
+    src: &str,
+    event_type: &str,
+    decoded: &serde_json::Value,
+) {
+    sqlx::query(
+        r#"insert into raw_events
+               (msg_id, chain_order, created_at_chain, src_address, dst_address,
+                event_type, body_json, decoded)
+           values ($1, $2, to_timestamp(1700000000), $3, $3, $4, '{}'::jsonb, $5)"#,
+    )
+    .bind(msg_id)
+    .bind(chain_order)
+    .bind(src)
+    .bind(event_type)
+    .bind(decoded)
+    .execute(pool)
+    .await
+    .expect("insert raw_events at chain_order");
+}
+
+/// Inserts an OPEN parent order so a subsequent OrderFilled reaches the body
+/// parse (and can fail there) instead of deferring on a missing parent.
+async fn insert_open_parent(pool: &PgPool, book: &str, order_id: &str) {
+    sqlx::query(
+        r#"insert into live_orders
+               (orderbook_address, order_id, outcome_id, is_buy, price,
+                amount_initial, amount_remaining, status,
+                last_chain_order, placed_chain_order)
+           values ($1, $2::numeric, 1, true, 6150::numeric,
+                   100::numeric, 100::numeric, 'OPEN',
+                   '5f800000000000000000', '5f800000000000000000')"#,
+    )
+    .bind(book)
+    .bind(order_id)
+    .execute(pool)
+    .await
+    .expect("insert parent live_orders");
+}
+
+/// A clean row then a poison row in one batch: the optimistic pass applies the
+/// clean row, errors on the poison, rolls the whole transaction back, and the
+/// savepointed replay re-applies the clean row and leaves the poison pending.
+/// Asserts the branch actually taken (the fallback log marker), the recomputed
+/// high-water mark, exact outcome counts, and that the rolled-back fast pass did
+/// not double-warn the clean Unknown row.
+///
+/// `current_thread` keeps the reproject future on this thread so the
+/// thread-local capture subscriber sees its events. The rows carry explicit
+/// chain_orders that sort above the `insert_raw` "5f80…" space, and the reproject
+/// is bounded to that range, so exactly these two rows are drained regardless of
+/// what else the shared database holds (deterministic stats and high-water mark).
+#[tokio::test(flavor = "current_thread")]
+async fn fast_path_falls_back_and_isolates_poison_row() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let book = "0:reproj_fastfb_book";
+    let order_id = "91";
+    let probe_type = "Test.FastfbCleanProbe";
+    let clean_msg = "reproj_fastfb_clean-msg";
+    let poison_msg = "reproj_fastfb_poison-msg";
+    let after = "zzzz_reproj_fastfb_0";
+    let clean_chain = "zzzz_reproj_fastfb_1_clean";
+    let poison_chain = "zzzz_reproj_fastfb_2_poison";
+
+    let cleanup: Vec<(&str, &str)> = vec![
+        ("delete from live_orders where orderbook_address = $1", book),
+        ("delete from raw_events where msg_id = $1", clean_msg),
+        ("delete from raw_events where msg_id = $1", poison_msg),
+    ];
+    purge(&pool, &cleanup).await;
+
+    insert_open_parent(&pool, book, order_id).await;
+    insert_raw_at(&pool, clean_msg, clean_chain, "0:reproj_fastfb_src", probe_type, &json!({}))
+        .await;
+    insert_raw_at(
+        &pool,
+        poison_msg,
+        poison_chain,
+        book,
+        "OrderBook.OrderFilled",
+        &json!({"orderId": order_id, "filledAmount": "30", "clearingPrice": "6150"}),
+    )
+    .await;
+
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let stats = {
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer { events: events.clone() });
+        let _sub = tracing::subscriber::set_default(subscriber);
+        repo.reproject_pending_from(1000, Some(after), Some(poison_chain)).await.expect("reproject")
+    };
+
+    // Exactly the two in-range rows are drained, so the counts are deterministic.
+    assert_eq!(stats.scanned, 2, "only the two in-range rows are drained");
+    assert_eq!(stats.applied, 0);
+    assert_eq!(stats.unknown, 1, "the clean Unknown row");
+    assert_eq!(stats.deferred, 0);
+    assert_eq!(stats.failed, 1, "the poison row");
+    // The savepointed branch recomputes the high-water mark; the drain loop's
+    // forward floor depends on it. Poison sorts last in the bounded range.
+    assert_eq!(stats.max_chain_order.as_deref(), Some(poison_chain));
+    assert!(processed_at_is_set(&pool, clean_msg).await, "clean row marked despite the fallback");
+    assert!(!processed_at_is_set(&pool, poison_msg).await, "poison row stays pending");
+    assert_eq!(repo.projection_fallback_count(), 1, "the batch fell back exactly once");
+
+    let captured: Vec<CapturedEvent> = events.lock().unwrap().clone();
+    // The branch actually taken: the optimistic pass logged its fallback.
+    assert!(
+        captured.iter().any(|e| e.message.contains("per-row savepoints")),
+        "the optimistic pass must log its fallback (proves the fast path ran and aborted)"
+    );
+    // A rolled-back fast pass must not pre-warn the clean Unknown row: exactly one
+    // warning, on the normal target (the savepointed replay owns it).
+    let unknown_warnings: Vec<&CapturedEvent> = captured
+        .iter()
+        .filter(|e| e.event_type == probe_type && e.message.contains("no handler for event type"))
+        .collect();
+    assert_eq!(unknown_warnings.len(), 1, "exactly one unknown warning, got {unknown_warnings:?}");
+    assert_ne!(unknown_warnings[0].target, dodex_logging::EVENT_NOISE_TARGET);
+    assert!(unknown_warnings[0].message.contains("first sighting"));
+
+    purge(&pool, &cleanup).await;
+}
+
+/// A fully clean batch commits on the optimistic fast path with no fallback:
+/// the fallback log marker is absent and the freshly-computed stats are exact.
+#[tokio::test(flavor = "current_thread")]
+async fn fast_path_clean_batch_commits_without_fallback() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let probe_type = "Test.FastfbCleanOnlyProbe";
+    let a_msg = "reproj_fastfb_clean_a-msg";
+    let b_msg = "reproj_fastfb_clean_b-msg";
+    let after = "zzzy_reproj_fastfb_0";
+    let a_chain = "zzzy_reproj_fastfb_1";
+    let b_chain = "zzzy_reproj_fastfb_2";
+
+    let cleanup: Vec<(&str, &str)> = vec![
+        ("delete from raw_events where msg_id = $1", a_msg),
+        ("delete from raw_events where msg_id = $1", b_msg),
+    ];
+    purge(&pool, &cleanup).await;
+
+    insert_raw_at(&pool, a_msg, a_chain, "0:reproj_fastfb_co_src", probe_type, &json!({})).await;
+    insert_raw_at(&pool, b_msg, b_chain, "0:reproj_fastfb_co_src", probe_type, &json!({})).await;
+
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let stats = {
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer { events: events.clone() });
+        let _sub = tracing::subscriber::set_default(subscriber);
+        repo.reproject_pending_from(1000, Some(after), Some(b_chain)).await.expect("reproject")
+    };
+
+    assert_eq!(stats.scanned, 2);
+    assert_eq!(stats.unknown, 2, "both rows are unhandled Unknown");
+    assert_eq!(stats.applied, 0);
+    assert_eq!(stats.deferred, 0);
+    assert_eq!(stats.failed, 0);
+    assert_eq!(stats.max_chain_order.as_deref(), Some(b_chain));
+    assert!(processed_at_is_set(&pool, a_msg).await);
+    assert!(processed_at_is_set(&pool, b_msg).await);
+    assert_eq!(repo.projection_fallback_count(), 0, "a clean batch must not fall back");
+
+    let captured: Vec<CapturedEvent> = events.lock().unwrap().clone();
+    assert!(
+        !captured.iter().any(|e| e.message.contains("per-row savepoints")),
+        "a clean batch must commit on the fast path with no savepoint fallback, got {captured:?}"
+    );
+
+    purge(&pool, &cleanup).await;
+}
+
+/// The poison row sorts FIRST: the optimistic pass aborts immediately with
+/// nothing applied (empty mark set), rolls back, and the savepointed replay
+/// applies the trailing clean row and leaves the poison pending. Covers the
+/// rollback-from-scratch branch, distinct from a poison after applied rows.
+#[tokio::test(flavor = "current_thread")]
+async fn fast_path_first_row_poison_falls_back() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let book = "0:reproj_fastfb_first_book";
+    let order_id = "73";
+    let probe_type = "Test.FastfbFirstProbe";
+    let poison_msg = "reproj_fastfb_first_poison-msg";
+    let clean_msg = "reproj_fastfb_first_clean-msg";
+    let after = "zzzx_reproj_fastfb_0";
+    let poison_chain = "zzzx_reproj_fastfb_1_poison";
+    let clean_chain = "zzzx_reproj_fastfb_2_clean";
+
+    let cleanup: Vec<(&str, &str)> = vec![
+        ("delete from live_orders where orderbook_address = $1", book),
+        ("delete from raw_events where msg_id = $1", poison_msg),
+        ("delete from raw_events where msg_id = $1", clean_msg),
+    ];
+    purge(&pool, &cleanup).await;
+
+    insert_open_parent(&pool, book, order_id).await;
+    insert_raw_at(
+        &pool,
+        poison_msg,
+        poison_chain,
+        book,
+        "OrderBook.OrderFilled",
+        &json!({"orderId": order_id, "filledAmount": "30", "clearingPrice": "6150"}),
+    )
+    .await;
+    insert_raw_at(
+        &pool,
+        clean_msg,
+        clean_chain,
+        "0:reproj_fastfb_first_src",
+        probe_type,
+        &json!({}),
+    )
+    .await;
+
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let stats = {
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer { events: events.clone() });
+        let _sub = tracing::subscriber::set_default(subscriber);
+        repo.reproject_pending_from(1000, Some(after), Some(clean_chain)).await.expect("reproject")
+    };
+
+    assert_eq!(stats.scanned, 2);
+    assert_eq!(stats.unknown, 1, "the trailing clean row");
+    assert_eq!(stats.failed, 1, "the leading poison row");
+    assert!(!processed_at_is_set(&pool, poison_msg).await, "poison stays pending");
+    assert!(
+        processed_at_is_set(&pool, clean_msg).await,
+        "the trailing clean row is applied by the fallback"
+    );
+    assert_eq!(repo.projection_fallback_count(), 1, "the batch fell back exactly once");
+
+    let captured: Vec<CapturedEvent> = events.lock().unwrap().clone();
+    assert!(
+        captured.iter().any(|e| e.message.contains("per-row savepoints")),
+        "the optimistic pass must fall back even when the first row poisons"
+    );
+
+    purge(&pool, &cleanup).await;
+}
+
+/// The poison row mutates `live_orders` and *then* fails — a taker OrderFilled
+/// missing `clearingPrice`: the `amount_remaining` UPDATE applies, then the trade
+/// insert fails. This proves the optimistic rollback actually reverts a
+/// partially-applied transaction, which the missing-`isTaker` poison (it fails
+/// before any write) cannot. The clean row still commits, the poison stays
+/// pending with its mutation reverted, and the fallback counter accumulates
+/// across retries (and the revert holds on each).
+#[tokio::test]
+async fn fast_path_rolls_back_partial_mutation() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let book = "0:reproj_pmut_book";
+    let order_id = "91";
+    let probe_type = "Test.PmutCleanProbe";
+    let clean_msg = "reproj_pmut_clean-msg";
+    let poison_msg = "reproj_pmut_poison-msg";
+    let after = "zzzw_reproj_pmut_0";
+    let clean_chain = "zzzw_reproj_pmut_1_clean";
+    let poison_chain = "zzzw_reproj_pmut_2_poison";
+
+    let cleanup: Vec<(&str, &str)> = vec![
+        ("delete from trades where orderbook_address = $1", book),
+        ("delete from live_orders where orderbook_address = $1", book),
+        ("delete from raw_events where msg_id = $1", clean_msg),
+        ("delete from raw_events where msg_id = $1", poison_msg),
+    ];
+    purge(&pool, &cleanup).await;
+
+    insert_open_parent(&pool, book, order_id).await;
+    insert_raw_at(&pool, clean_msg, clean_chain, "0:reproj_pmut_src", probe_type, &json!({})).await;
+    // Taker fill with no clearingPrice: the amount_remaining UPDATE applies, then
+    // the trade insert fails, so the projector's whole apply must revert.
+    insert_raw_at(
+        &pool,
+        poison_msg,
+        poison_chain,
+        book,
+        "OrderBook.OrderFilled",
+        &json!({"orderId": order_id, "filledAmount": "30", "isTaker": true}),
+    )
+    .await;
+
+    let stats = repo
+        .reproject_pending_from(1000, Some(after), Some(poison_chain))
+        .await
+        .expect("reproject");
+    assert_eq!(stats.scanned, 2);
+    assert_eq!(stats.unknown, 1, "the clean row");
+    assert_eq!(stats.failed, 1, "the mutating poison");
+    assert!(processed_at_is_set(&pool, clean_msg).await, "clean row committed");
+    assert!(!processed_at_is_set(&pool, poison_msg).await, "poison stays pending");
+    assert_eq!(repo.projection_fallback_count(), 1, "one fallback so far");
+
+    // The poison's amount_remaining UPDATE must not survive the optimistic
+    // rollback — a regression that committed the fast transaction's partial
+    // writes on the error path would leave 70 here.
+    let remaining: String = sqlx::query_scalar(
+        "select amount_remaining::text from live_orders \
+              where orderbook_address = $1 and order_id = $2::numeric",
+    )
+    .bind(book)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read live_orders");
+    assert_eq!(remaining, "100", "the rolled-back optimistic batch must not persist the mutation");
+
+    // A second pass falls back again (the poison is still pending): the counter
+    // accumulates past 1 — the property the metric depends on — and the mutation
+    // still must not leak.
+    repo.reproject_pending_from(1000, Some(after), Some(poison_chain)).await.expect("reproject 2");
+    assert_eq!(
+        repo.projection_fallback_count(),
+        2,
+        "the fallback counter accumulates across passes"
+    );
+    let remaining_again: String = sqlx::query_scalar(
+        "select amount_remaining::text from live_orders \
+              where orderbook_address = $1 and order_id = $2::numeric",
+    )
+    .bind(book)
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read live_orders again");
+    assert_eq!(remaining_again, "100", "the mutation stays reverted across retries");
+
+    purge(&pool, &cleanup).await;
+}
+
 /// A taker OrderFilled with no `clearingPrice` fails the projection
 /// atomically: the live_orders mutation issued earlier in the same
 /// transaction rolls back with the trade insert, no trade row appears, and

@@ -2,6 +2,8 @@
 //
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -37,6 +39,14 @@ pub struct IndexerRepository {
     /// clone shares the `Arc` too but never records sightings.) Bounded by the
     /// decoder's ABI event vocabulary, so it cannot grow without limit.
     seen_unknown_event_types: Arc<Mutex<HashSet<String>>>,
+    /// Running count of projection batches that aborted the optimistic
+    /// (savepoint-free) pass and replayed with per-row savepoints. Shared via
+    /// `Arc` across all clones, so the projection loop's increments are visible
+    /// to the metrics-refresh clone, which polls it for `indexer_projection_fallbacks`.
+    /// A steadily climbing rate means projector errors are routinely dropping
+    /// the fast path — a throughput regression the backlog/lag gauges only show
+    /// as a symptom.
+    projection_fallbacks: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -75,7 +85,11 @@ struct PendingRow {
 
 impl IndexerRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, seen_unknown_event_types: Arc::new(Mutex::new(HashSet::new())) }
+        Self {
+            pool,
+            seen_unknown_event_types: Arc::new(Mutex::new(HashSet::new())),
+            projection_fallbacks: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Returns `true` the first time `event_type` is seen as projector-unknown
@@ -263,7 +277,128 @@ impl IndexerRepository {
     /// bounded to rows that existed at its start. `for update skip locked` + a
     /// single transaction keep concurrent workers from applying a non-idempotent
     /// projector twice.
+    ///
+    /// The batch is drained optimistically with no per-row savepoint (each
+    /// applied row then costs only its projector statements, not an extra
+    /// SAVEPOINT/RELEASE round-trip pair). If a projector errors, the optimistic
+    /// transaction is rolled back untouched and the same range is replayed with
+    /// per-row savepoints, which applies the clean rows and leaves the failing
+    /// row pending — the same outcome as savepointing every row, paid for only
+    /// when a failure actually occurs. The fallback is paid only on passes that
+    /// hit a projector error — in practice the retry pass re-attempting a stuck
+    /// row, though a newly captured row that errors on first sight also drops its
+    /// forward pass to the fallback; a clean forward drain stays on the fast path.
     pub async fn reproject_pending_from(
+        &self,
+        batch_size: u32,
+        after_chain_order: Option<&str>,
+        until_chain_order: Option<&str>,
+    ) -> anyhow::Result<ReprojectionStats> {
+        match self.reproject_batch_fast(batch_size, after_chain_order, until_chain_order).await? {
+            Some(stats) => Ok(stats),
+            None => {
+                self.reproject_batch_savepointed(batch_size, after_chain_order, until_chain_order)
+                    .await
+            }
+        }
+    }
+
+    /// Optimistic drain: applies the whole batch in one transaction with no
+    /// per-row savepoint. Returns `Ok(Some(stats))` on a clean pass (`failed` is
+    /// always 0); returns `Ok(None)` if any projector errors, after rolling the
+    /// transaction back so nothing is committed — the caller then replays the
+    /// range via `reproject_batch_savepointed`.
+    async fn reproject_batch_fast(
+        &self,
+        batch_size: u32,
+        after_chain_order: Option<&str>,
+        until_chain_order: Option<&str>,
+    ) -> anyhow::Result<Option<ReprojectionStats>> {
+        let mut tx: Transaction<'_, Postgres> =
+            self.pool.begin().await.context("reproject(fast) tx begin")?;
+        let rows =
+            Self::fetch_pending_batch(&mut tx, batch_size, after_chain_order, until_chain_order)
+                .await?;
+
+        // Rows are ordered asc, so the last one carries the high-water chain_order.
+        let mut stats = ReprojectionStats {
+            max_chain_order: rows.last().map(|r| r.chain_order.clone()),
+            ..Default::default()
+        };
+        let mut to_mark: Vec<i64> = Vec::new();
+        // Unknown-type warnings are collected and emitted only after the batch
+        // commits — `warn_unknown`'s log line and its first-sighting set mutation
+        // both survive a rollback, so firing them mid-pass would double-warn the
+        // same row once a later Err forces the savepointed replay.
+        let mut unknown_warnings: Vec<(String, String)> = Vec::new();
+
+        for row in rows {
+            stats.scanned += 1;
+            let Some((event, node)) = pending_row_to_inputs(&row) else {
+                continue;
+            };
+            match projectors::project_event(&mut tx, &event, &node).await {
+                Ok(ProjectionOutcome::Applied) => {
+                    to_mark.push(row.id);
+                    stats.applied += 1;
+                }
+                Ok(ProjectionOutcome::Deferred) => {
+                    stats.deferred += 1;
+                }
+                Ok(ProjectionOutcome::Unknown) => {
+                    unknown_warnings.push((row.msg_id.clone(), event.event_type.clone()));
+                    to_mark.push(row.id);
+                    stats.unknown += 1;
+                }
+                Err(err) => {
+                    // The optimistic transaction is now aborted; discard it and
+                    // let the caller replay this range with per-row savepoints,
+                    // which applies the clean rows and isolates this one.
+                    self.projection_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    let rollback_error = tx.rollback().await.err();
+                    // A deterministic projector error (e.g. a missing field) is not
+                    // a sqlx error: the savepointed replay re-attempts the row and
+                    // emits the single authoritative `warn`, so log at debug to
+                    // avoid double-warning. A DB-layer error (sqlx) or a failed
+                    // rollback is instead a transient/health signal the replay may
+                    // silently recover from on a fresh connection — surface it.
+                    if err.downcast_ref::<sqlx::Error>().is_some() || rollback_error.is_some() {
+                        warn!(
+                            msg_id = %row.msg_id,
+                            event_type = ?event.event_type,
+                            ?err,
+                            ?rollback_error,
+                            "optimistic projection batch hit a DB-layer error; falling back to per-row savepoints"
+                        );
+                    } else {
+                        debug!(
+                            msg_id = %row.msg_id,
+                            event_type = ?event.event_type,
+                            ?err,
+                            "optimistic projection batch errored; falling back to per-row savepoints"
+                        );
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+
+        Self::mark_processed(&mut tx, &to_mark).await?;
+        tx.commit().await.context("reproject(fast) tx commit")?;
+        // Durably committed — now (and only now) emit the unknown-type warnings
+        // and record first-sightings, in chain_order. A crash between the commit
+        // and this loop loses only log lines (and the first-sighting dedup),
+        // never projection state: the rows are already marked processed.
+        for (msg_id, event_type) in &unknown_warnings {
+            self.warn_unknown(msg_id, event_type);
+        }
+        Ok(Some(stats))
+    }
+
+    /// Pessimistic drain: wraps each row in a savepoint so one failing projector
+    /// rolls back only its own row and the rest of the batch still commits. Used
+    /// as the fallback when `reproject_batch_fast` hits an error.
+    async fn reproject_batch_savepointed(
         &self,
         batch_size: u32,
         after_chain_order: Option<&str>,
@@ -271,32 +406,9 @@ impl IndexerRepository {
     ) -> anyhow::Result<ReprojectionStats> {
         let mut tx: Transaction<'_, Postgres> =
             self.pool.begin().await.context("reproject tx begin")?;
-
-        let rows: Vec<PendingRow> = sqlx::query_as(
-            r#"select id,
-                      msg_id,
-                      chain_order,
-                      src_address,
-                      dst_address,
-                      event_type,
-                      decoded,
-                      extract(epoch from created_at_chain)::double precision as ts
-                 from raw_events
-                where processed_at is null
-                  and event_type is not null
-                  and decoded is not null
-                  and ($2::text is null or chain_order > $2::text)
-                  and ($3::text is null or chain_order <= $3::text)
-                order by chain_order asc
-                limit $1
-                for update skip locked"#,
-        )
-        .bind(i64::from(batch_size))
-        .bind(after_chain_order)
-        .bind(until_chain_order)
-        .fetch_all(&mut *tx)
-        .await
-        .context("select pending raw_events")?;
+        let rows =
+            Self::fetch_pending_batch(&mut tx, batch_size, after_chain_order, until_chain_order)
+                .await?;
 
         // Rows are ordered asc, so the last one carries the high-water chain_order.
         let mut stats = ReprojectionStats {
@@ -324,20 +436,7 @@ impl IndexerRepository {
                     stats.deferred += 1;
                 }
                 Ok(ProjectionOutcome::Unknown) => {
-                    if self.first_unknown_sighting(&event.event_type) {
-                        warn!(
-                            msg_id = %row.msg_id,
-                            event_type = %event.event_type,
-                            "reprojection has no handler for event type; marking processed and advancing (first sighting — later repeats go to the noise log)"
-                        );
-                    } else {
-                        warn!(
-                            target: dodex_logging::EVENT_NOISE_TARGET,
-                            msg_id = %row.msg_id,
-                            event_type = %event.event_type,
-                            "reprojection has no handler for event type; marking processed and advancing"
-                        );
-                    }
+                    self.warn_unknown(&row.msg_id, &event.event_type);
                     sp.commit().await.context("reproject savepoint release")?;
                     to_mark.push(row.id);
                     stats.unknown += 1;
@@ -355,30 +454,91 @@ impl IndexerRepository {
             }
         }
 
-        if !to_mark.is_empty() {
-            let marked = sqlx::query(
-                r#"update raw_events
-                      set processed_at = now()
-                    where id = any($1)
-                      and processed_at is null"#,
-            )
-            .bind(&to_mark)
-            .execute(&mut *tx)
-            .await
-            .context("batch mark raw_events.processed_at")?
-            .rows_affected();
-            if marked != to_mark.len() as u64 {
-                warn!(
-                    expected = to_mark.len(),
-                    actual = marked,
-                    "batch-mark stamped fewer rows than projected: another writer may have set \
-                     processed_at concurrently — single-consumer assumption may be violated"
-                );
-            }
-        }
-
+        Self::mark_processed(&mut tx, &to_mark).await?;
         tx.commit().await.context("reproject tx commit")?;
         Ok(stats)
+    }
+
+    /// The unknown-event warning: normal target on the first sighting of an
+    /// event type, noise target thereafter.
+    fn warn_unknown(&self, msg_id: &str, event_type: &str) {
+        if self.first_unknown_sighting(event_type) {
+            warn!(
+                msg_id = %msg_id,
+                event_type = %event_type,
+                "reprojection has no handler for event type; marking processed and advancing (first sighting — later repeats go to the noise log)"
+            );
+        } else {
+            warn!(
+                target: dodex_logging::EVENT_NOISE_TARGET,
+                msg_id = %msg_id,
+                event_type = %event_type,
+                "reprojection has no handler for event type; marking processed and advancing"
+            );
+        }
+    }
+
+    /// Keyset SELECT shared by both drain strategies: pending, typed, decoded
+    /// rows in `(after, until]`, oldest first, row-locked with `skip locked` so
+    /// a concurrent worker never double-applies.
+    async fn fetch_pending_batch(
+        tx: &mut Transaction<'_, Postgres>,
+        batch_size: u32,
+        after_chain_order: Option<&str>,
+        until_chain_order: Option<&str>,
+    ) -> anyhow::Result<Vec<PendingRow>> {
+        sqlx::query_as(
+            r#"select id,
+                      msg_id,
+                      chain_order,
+                      src_address,
+                      dst_address,
+                      event_type,
+                      decoded,
+                      extract(epoch from created_at_chain)::double precision as ts
+                 from raw_events
+                where processed_at is null
+                  and event_type is not null
+                  and decoded is not null
+                  and ($2::text is null or chain_order > $2::text)
+                  and ($3::text is null or chain_order <= $3::text)
+                order by chain_order asc
+                limit $1
+                for update skip locked"#,
+        )
+        .bind(i64::from(batch_size))
+        .bind(after_chain_order)
+        .bind(until_chain_order)
+        .fetch_all(&mut **tx)
+        .await
+        .context("select pending raw_events")
+    }
+
+    /// Batch-stamp `processed_at` for the rows the projector consumed this pass.
+    async fn mark_processed(tx: &mut Transaction<'_, Postgres>, ids: &[i64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let marked = sqlx::query(
+            r#"update raw_events
+                  set processed_at = now()
+                where id = any($1)
+                  and processed_at is null"#,
+        )
+        .bind(ids)
+        .execute(&mut **tx)
+        .await
+        .context("batch mark raw_events.processed_at")?
+        .rows_affected();
+        if marked != ids.len() as u64 {
+            warn!(
+                expected = ids.len(),
+                actual = marked,
+                "batch-mark stamped fewer rows than projected: another writer may have set \
+                 processed_at concurrently — single-consumer assumption may be violated"
+            );
+        }
+        Ok(())
     }
 
     /// Projects the whole pending queue from the front, unbounded. Thin wrapper
@@ -449,6 +609,13 @@ impl IndexerRepository {
         let size = u64::from(self.pool.size());
         let idle = self.pool.num_idle() as u64;
         (size.saturating_sub(idle), idle)
+    }
+
+    /// Running total of projection batches that fell back from the optimistic
+    /// pass to per-row savepoints (process-wide, since startup). Polled by the
+    /// metrics-refresh loop for `indexer_projection_fallbacks`.
+    pub fn projection_fallback_count(&self) -> u64 {
+        self.projection_fallbacks.load(Ordering::Relaxed)
     }
 
     /// Highest pending `chain_order` right now, or `None` when the queue is
