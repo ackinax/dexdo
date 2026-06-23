@@ -9,7 +9,7 @@ On-chain contracts live under `contracts/`: the DEX.DO core in `contracts/dex/`,
 
 ## Onboarding (Shellnet)
 
-DEX.DO onboarding is **agent-driven**: an AI coding agent with shell access to this repo runs the flow from one-line prompts, split across two chained skills (deploy the multisig, then deposit / create PrivateNotes).
+DEX.DO is **agent-driven**: an AI coding agent with shell access to this repo runs the whole flow — onboarding, registration, market data, trading, and withdrawal — from one-line prompts, one per skill (see the [Quickstart](#quickstart--prompts-by-skill) below).
 
 **Prerequisites**
 
@@ -17,34 +17,50 @@ DEX.DO onboarding is **agent-driven**: an AI coding agent with shell access to t
 - macOS or Linux with `git`, `curl`, `jq` — the skill installs Rust (`cargo`) and `tvm-cli` itself if they're missing.
 - Network access to Shellnet (`shellnet.ackinacki.org`) and its public giver.
 
-Onboarding is split into two chained skills:
+## Quickstart — prompts by skill
 
-1. **Deploy the multisig** — [`.claude/skills/dexdo-deploy-multisig-shellnet/SKILL.md`](.claude/skills/dexdo-deploy-multisig-shellnet/SKILL.md): generate a 12-word seed + keypair, fund the precomputed address from the public giver, and deploy the wallet until it is Active.
-2. **Deposit / create PrivateNotes** — [`.claude/skills/dexdo-deposit-shellnet/SKILL.md`](.claude/skills/dexdo-deposit-shellnet/SKILL.md): takes the multisig as **input** (seed phrase *or* key pair), funds it with the deposit currencies, and deploys three gas-funded PrivateNotes (SHELL / NACKL / USDC).
+The whole lifecycle is driven by pasting one-line prompts to the agent. Each step maps
+to one skill under [`.claude/skills/`](.claude/skills/); run them top to bottom (skip
+any you've already done). Copy a prompt, fill in the `<…>` bits, paste.
 
-If you already have a multisig, run step 2 alone — supply its seed phrase or keypair.
+| # | Skill | Paste this prompt |
+|---|---|---|
+| 1 | [`dexdo-deploy-multisig-shellnet`](.claude/skills/dexdo-deploy-multisig-shellnet/SKILL.md) — deploy + fund a multisig | > Deploy and fund a multisig wallet for me on DEXDO Shellnet. |
+| 2 | [`dexdo-deposit-shellnet`](.claude/skills/dexdo-deposit-shellnet/SKILL.md) — fund the wallet + create PrivateNotes | > Deposit onto DEXDO Shellnet using my multisig (here is the seed phrase / keypair) — create three gas-funded PrivateNotes ready to trade. |
+| 3 | [`dexdo-register-account`](.claude/skills/dexdo-register-account/SKILL.md) — get API credentials (delegates the note key — opt-in) | > Register my PrivateNotes with the DEXDO API and save the credentials. |
+| 4 | [`dexdo-market-data`](.claude/skills/dexdo-market-data/SKILL.md) — read markets / book / price / my orders / my stakes | > Show me the active DEXDO markets I can stake or trade. <br> > Show the order book and price for `<symbol>`. <br> > Show my open orders / order history / stakes. |
+| 5 | [`dexdo-trading`](.claude/skills/dexdo-trading/SKILL.md) — stake / place orders / full split | > Stake `<amount>` NACKL on `<outcome>` in `<market>`. <br> > Place a limit `<BUY/SELL>` of `<qty>` `<symbol>` at `<price>`. <br> > Buy a full set in `<market>` for `<amount>` NACKL. |
+| 6 | [`dexdo-total-withdraw`](.claude/skills/dexdo-total-withdraw/SKILL.md) — close everything + sweep to multisig | > Close all my DEXDO positions and withdraw everything back to my multisig. |
 
-**Prompts** (paste into the agent):
+Notes:
 
-> Deploy and fund a multisig wallet for me on DEXDO Shellnet.
+- **Already have a multisig?** Skip step 1 — step 2 takes it as input (seed phrase or keypair).
+- **Steps 1–2 are on-chain only**; the note isn't usable via the API until **step 3** (registration is a deliberate security step — it delegates the note's key to the backend; see the warning below).
+- **Staking & the order book live in different market phases** — the trading skill (step 5) routes STAKING-phase stakes through the on-chain SDK and TRADING-phase orders through the REST API automatically.
+- **Before a network restart**, run step 6 to get funds back to the multisig (rewards not withdrawn in time can be lost).
 
-then, once it is Active:
-
-> Deposit onto DEXDO Shellnet using my multisig (here is the seed phrase / keypair) — create three gas-funded PrivateNotes ready to trade.
-
-**Output** — a multisig wallet you control and three funded PrivateNotes (SHELL / NACKL / USDC).
+**Output of steps 1–2** — a multisig wallet you control and three funded PrivateNotes (SHELL / NACKL / USDC).
 
 Everything is written under the workspace directory **`$WORKSPACE`** (default `~/dexdo-workspace`; export `WORKSPACE=/your/path` before running to change it):
 
 ```
 $WORKSPACE/
 ├── multisig/   wallet — Multisig.keys.json, Multisig.seed (SECRET) + Multisig.abi.json, Multisig.tvc
-├── notes/      two files per PrivateNote, token ∈ {shell, nackl, usdc} (SECRET):
+├── notes/      per-PrivateNote files, token ∈ {shell, nackl, usdc} (SECRET, mode 0600):
 │                 <token>.account.json  — ready POST /api/v1/accounts body
 │                                         (pnAddress / pnPubkeyHex / pnSeckeyHex / pnDihHex)
-│                 pn_state.<token>.json — onboarding resume state (not API-loadable)
+│                 pn_state.<token>.json — onboarding resume state, holds the note key (not API-loadable)
+│                 <token>.creds.json    — registration credential from POST /api/v1/accounts
+│                                         (apiKey + apiSecret); written only after you register the note
 └── giver/      GiverV3.abi.json — Shellnet funding artifact
 ```
+
+The `notes/` files hold two kinds of secret used by the trading / CLI skills:
+
+- **the note's on-chain key** (`pnSeckeyHex`, in `account.json` / `pn_state.json`) — signs on-chain ops (stake, place-order, withdraw) directly;
+- **the backend API credential** (`apiKey` + `apiSecret`, in `creds.json`) — obtained when you register the note (`POST /api/v1/accounts`); REST calls are then signed `HMAC-SHA256(request, apiSecret)` under the `X-DODEX-APIKEY` header, and the `apiSecret` is returned **only once** at registration.
+
+All of these are written **mode 0600** and stored in plaintext under `$WORKSPACE` — back them up, **never commit them**, and prefer an OS keychain over the workspace on an untrusted/multi-user host.
 
 Use the PNs two ways:
 
