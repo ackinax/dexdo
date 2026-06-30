@@ -14,6 +14,8 @@ pub use crate::SharedAuth;
 #[doc(hidden)]
 pub use crate::SharedChainSender;
 #[doc(hidden)]
+pub use crate::SharedInferenceRepo;
+#[doc(hidden)]
 pub use crate::SharedPnReader;
 #[doc(hidden)]
 pub use crate::SharedRefRepo;

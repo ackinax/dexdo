@@ -30,7 +30,7 @@ pub enum InferenceOrderBookEvent {
     SubscriptionPlaced = 1005,
     CycleForfeited = 1006,
     ForfeitClaimed = 1007,
-    OrderBookDeployed = 1008,
+    InferenceOrderBookDeployed = 1008,
 }
 
 impl TryFrom<String> for InferenceOrderBookEvent {
@@ -55,7 +55,7 @@ impl TryFrom<String> for InferenceOrderBookEvent {
             1005 => Ok(InferenceOrderBookEvent::SubscriptionPlaced),
             1006 => Ok(InferenceOrderBookEvent::CycleForfeited),
             1007 => Ok(InferenceOrderBookEvent::ForfeitClaimed),
-            1008 => Ok(InferenceOrderBookEvent::OrderBookDeployed),
+            1008 => Ok(InferenceOrderBookEvent::InferenceOrderBookDeployed),
             _ => Err(KitError::new(
                 KitModule::Event,
                 KitErrorCode::UnknownEvent,
@@ -79,15 +79,51 @@ impl InferenceOrderBookEvent {
 
 /// Typed decoded `InferenceOrderBook` external event.
 pub enum DecodedInferenceOrderBookEvent {
-    OrderPlaced { event: Event, kind: InferenceOrderBookEvent, data: OrderPlacedData },
-    OrderCancelled { event: Event, kind: InferenceOrderBookEvent, data: OrderCancelledData },
-    Refunded { event: Event, kind: InferenceOrderBookEvent, data: RefundedData },
-    Filled { event: Event, kind: InferenceOrderBookEvent, data: FilledData },
-    Executed { event: Event, kind: InferenceOrderBookEvent, data: ExecutedData },
-    SubscriptionPlaced { event: Event, kind: InferenceOrderBookEvent, data: SubscriptionPlacedData },
-    CycleForfeited { event: Event, kind: InferenceOrderBookEvent, data: CycleForfeitedData },
-    ForfeitClaimed { event: Event, kind: InferenceOrderBookEvent, data: ForfeitClaimedData },
-    OrderBookDeployed { event: Event, kind: InferenceOrderBookEvent, data: OrderBookDeployedData },
+    OrderPlaced {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: OrderPlacedData,
+    },
+    OrderCancelled {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: OrderCancelledData,
+    },
+    Refunded {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: RefundedData,
+    },
+    Filled {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: FilledData,
+    },
+    Executed {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: ExecutedData,
+    },
+    SubscriptionPlaced {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: SubscriptionPlacedData,
+    },
+    CycleForfeited {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: CycleForfeitedData,
+    },
+    ForfeitClaimed {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: ForfeitClaimedData,
+    },
+    InferenceOrderBookDeployed {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: OrderBookDeployedData,
+    },
 }
 
 impl FromEvent for DecodedInferenceOrderBookEvent {
@@ -142,9 +178,9 @@ impl FromEvent for DecodedInferenceOrderBookEvent {
                     data,
                 })
             }
-            InferenceOrderBookEvent::OrderBookDeployed => {
+            InferenceOrderBookEvent::InferenceOrderBookDeployed => {
                 let data = decode_or_err::<OrderBookDeployedData>(event, contract)?;
-                Ok(DecodedInferenceOrderBookEvent::OrderBookDeployed {
+                Ok(DecodedInferenceOrderBookEvent::InferenceOrderBookDeployed {
                     event: event.clone(),
                     kind,
                     data,
@@ -166,6 +202,18 @@ where
             format!("Unexpected empty data for inference order book event `{}`", event.dst),
         )
     })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Payload of `InferenceOrderBookEvent::InferenceOrderBookDeployed`.
+pub struct OrderBookDeployedData {
+    /// Deployer note address; not stored as model identity.
+    pub note: String,
+    /// `uint256` model hash as returned by the ABI.
+    pub model_hash: String,
+    /// Canonical-ish model name (may be empty).
+    pub model_name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -278,14 +326,4 @@ pub struct ForfeitClaimedData {
     pub seller_note: String,
     #[serde(deserialize_with = "deserialize_u128")]
     pub amount: u128,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-/// Payload of `InferenceOrderBookEvent::OrderBookDeployed`.
-pub struct OrderBookDeployedData {
-    pub note: String,
-    /// `uint256` represented as returned by ABI.
-    pub model_hash: String,
-    pub model_name: String,
 }
