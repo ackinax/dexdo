@@ -70,7 +70,7 @@ Matching is by `dst` alone — it is not namespaced by contract or dapp — so a
 
 Each per-tick log line includes a `type_ignored` count of edges dropped by this filter. A high `type_ignored` rate is not warned by itself because this filter is deliberately used to shed observability-only floods such as `OrderBook.Queued`.
 
-The startup guard accepts **only** the known droppable no-op types — `OrderBook.Queued` / `FullyFilled` / `Rejected` / `CallbackBounced` (the `IGNORABLE_EVENT_TYPES` allow-list) — and refuses any other entry. It fires at startup, not at ingest time, so a bad entry prevents the service from starting rather than failing silently. The allow-list closes three otherwise-silent failures:
+The startup guard accepts **only** the known droppable no-op types — `OrderBook.Queued` / `FullyFilled` / `Rejected` / `CallbackBounced` and `PMP.StakeAccepted` / `PMP.MergeProcessed` (the `IGNORABLE_EVENT_TYPES` allow-list) — and refuses any other entry. It fires at startup, not at ingest time, so a bad entry prevents the service from starting rather than failing silently. The allow-list closes three otherwise-silent failures:
 
 - A **metric-critical** type (`OrderBook.OrderPlaced`, `OrderBook.PartialFill`) is rejected because those must always land in `raw_events` for the OTLP counters to stay accurate.
 - A **state-changing** type (anything the projector routes to a real handler, e.g. `OrderBook.OrderFilled`) is rejected before it could corrupt `live_orders`.
@@ -106,6 +106,7 @@ Lifecycle events drive transitions on [`markets`](data-schema.md#prediction-mark
 | `PMP.Resolved` | Sets `resolved_at` and `resolved_outcome_id`. |
 | `PMP.PMPRejected` | Sets `is_cancelled = true`, `cancelled_at`, `cancel_reason = 'PMP_REJECTED_BY_ORACLE'`. |
 | `PMP.EventCancelled` | Same shape but `cancel_reason = 'EVENT_CANCELLED'`. The two reasons distinguish cancellation source and have different UI meaning. |
+| `PMP.StakeAccepted` / `PMP.MergeProcessed` | Observability-only — no read-model table is touched (`ProjectionOutcome::Applied` no-op). Both are in the `IGNORABLE_EVENT_TYPES` allow-list and listed in the deployed `indexer.ignored_event_types`, so the edge is dropped before decode and no `raw_events` row is written. |
 
 ## Projection — order events
 
@@ -295,17 +296,33 @@ The inference reconciler is the third reconciler — a sixth long-running indexe
 
 **Discovery pass (Queue A)**
 
-For each `inference_markets` row with `last_reconciled_at IS NULL`, the reconciler:
+For each `inference_markets` row with `last_reconciled_at IS NULL` and `superseded_at IS NULL`, the reconciler:
 
 1. Fetches the `InferenceOrderBook` account BOC from chain.
-2. Runs `getParams()` off-chain → writes `model_hash`, `platform_fee_bps`. Also sets the **constant** precision/quote columns that do not come from the getter but are protocol-fixed: `quote_token_type = SHELL (2)`, `price_precision = 9`, `quantity_precision = 0`, `tick_size = "0.000000001"`, `step_size = "1"`, `min_notional = "0.000000001"`. Note: `getParams()` no longer returns `tickSize`/`stepSize`/`minNotional` — these are reconciler-set constants, not getter-sourced.
+2. Runs `getParams()` off-chain → resolves `model_hash`, `platform_fee_bps`. Runs `getVersion()` off-chain (on the same already-fetched BOC) → resolves the contract's `version` string (e.g. `4.0.14`). Then runs the **model-slot claim** (see below). Also sets the **constant** precision/quote columns that do not come from the getter but are protocol-fixed: `quote_token_type = SHELL (2)`, `price_precision = 9`, `quantity_precision = 0`, `tick_size = "0.000000001"`, `step_size = "1"`, `min_notional = "0.000000001"`. Note: `getParams()` no longer returns `tickSize`/`stepSize`/`minNotional` — these are reconciler-set constants, not getter-sourced.
 3. Runs `getWeeklyMedianPrice()` → writes `reference_price` (+ `reference_price_at`). The getter **reverts with TVM exit code `ERR_NO_LIQUIDITY`** on a dry book; the reconciler recognises this typed revert, writes `reference_price = NULL` (the API surfaces `referencePrice: null`), and continues — it is not a failure.
 4. Runs a **bounded round-robin phantom-cancel sweep** over `OPEN` [`inference_orders`](data-schema.md#inference_orders) for the book (see [Non-resting orders](#non-resting-orders)). Each tick advances `sweep_cursor`; the cycle completes when a batch returns fewer than `sweep_batch_n` OPEN rows in `(sweep_cursor, sweep_cycle_max]` (the range is exhausted), which resets `sweep_cursor` to NULL so the next cycle restarts from the lowest `order_id`. Completion is *not* keyed on the cursor reaching `sweep_cycle_max`: `sweep_cycle_max` is `nextOrderId` and normally has no OPEN row at the boundary, so an equality test would never reset and would starve long-lived rows. Newly-minted orders above `sweep_cycle_max` (the snapshot of the highest `order_id` at cycle start) are deferred to the next cycle.
 5. The sweep runs only when **all three** catch-up gates pass:
    - **(i) idle gate**: `getQueueSize() == 0` — the book has no in-flight queue continuation. A book with a pending queue item must not be swept yet.
    - **(ii) `at_head` gate**: `indexer_cursors.at_head = true` — the capture loop is caught up to the chain tip. If false, the indexer is still replaying old pages; a sweep firing now would cancel orders that have already been filled by events not yet projected.
    - **(iii) pending-events gate**: no `raw_events` row for this book remains `processed_at IS NULL` (checked via `raw_events_pending_src_idx`). An unprocessed event could be a `InferenceFilled` that closes the phantom order the sweep would otherwise cancel.
-6. **All-or-nothing visibility stamp**: stamps `last_reconciled_at` only after a complete sweep cycle (not mid-cycle). The stamp is guarded by a CAS on `sweep_override_seq` — if a `InferenceFilled` event overrode a provisionally cancelled order mid-cycle (bumping `sweep_override_seq`), the stamp is deferred until a fresh cycle completes cleanly. This prevents a book from becoming API-visible with phantom `CANCELLED` rows that events will later re-open.
+6. **All-or-nothing visibility stamp**: stamps `last_reconciled_at` only after a complete sweep cycle (not mid-cycle). The stamp is guarded by a CAS on `sweep_override_seq` — if a `InferenceFilled` event overrode a provisionally cancelled order mid-cycle (bumping `sweep_override_seq`), the stamp is deferred until a fresh cycle completes cleanly. This prevents a book from becoming API-visible with phantom `CANCELLED` rows that events will later re-open. The stamp is additionally blocked by `AND superseded_at IS NULL` in the UPDATE WHERE, so a row retired mid-batch can never be stamped visible.
+
+**Model-slot claim and version-based supersede**
+
+One book per `model_hash` is an on-chain invariant: every `InferenceOrderBook` contract has a single static `_modelHash`. Duplicates only appear after cross-version redeploys, where a new code-hash contract is deployed for the same model before the old one is retired. Without a resolution strategy the new book would fail discovery forever on the `model_hash` partial unique index.
+
+The reconciler resolves collisions transactionally (`claim_model_slot`) using the `getVersion()` getter (run on the already-fetched BOC — no extra round-trip):
+
+- If no other `inference_markets` row currently holds the `model_hash` slot (no collision), the book claims it unconditionally and proceeds normally.
+- On a collision with a different address, the incoming book's version is compared against the incumbent's:
+  - **Incoming version is unknown / unparseable** (getter returned no `value0`): the reconciler returns `Err` without modifying either row. Discovery fails and the book retries on the next tick. This prevents a malformed-getter result from silently retiring a good incumbent.
+  - **Incoming version is higher**: the incumbent is retired — its `model_hash` and `last_reconciled_at` are cleared and `superseded_at` is set. The incoming book then claims the slot and continues discovery normally.
+  - **Incoming version is lower or equal**: the incoming book is retired — its `model_hash` and `last_reconciled_at` are cleared and `superseded_at` is set (recording the fetched `version` for audit). Discovery returns `Superseded` and the book no longer enters the visible or metric sets.
+
+Both retire branches clear `model_hash` and `last_reconciled_at` symmetrically, so a superseded row can never hold a slot or appear API-visible. The `superseded_at IS NULL` guard on the Queue A SELECT and on the stamp UPDATE keeps this invariant stable across ticks — a retired row drops out of discovery immediately and can never be stamped back in.
+
+Superseded books are excluded from all three `indexer_inference_markets{state=discovering|visible|failing}` buckets. Each `count(*) filter` in `inference_market_state_counts` carries an explicit `AND superseded_at IS NULL` guard so a superseded row contributes to none of the buckets — even one that also has `last_reconcile_failed_at` set from a prior discovery attempt before it was retired.
 
 **Provisional sweep-cancel**
 
@@ -313,7 +330,7 @@ When `getOrder(orderId)` confirms an order is no longer in the book (zero amount
 
 **Refresh pass (Queue B)**
 
-For each already-reconciled book (`last_reconciled_at IS NOT NULL`) that is due for refresh:
+For each already-reconciled, non-superseded book (`last_reconciled_at IS NOT NULL AND superseded_at IS NULL`) that is due for refresh:
 
 1. If the price cadence is due (reference_price_at stale), re-fetches `getWeeklyMedianPrice()` → updates `reference_price` / `reference_price_at`. The `ERR_NO_LIQUIDITY` revert maps to NULL as on the discovery pass.
 2. Runs the phantom-cancel sweep under the same `at_head` + pending-events gates, over OPEN rows only (the sweep is a no-op if there are no open orders).
@@ -389,7 +406,7 @@ Both are in-process counts polled by the refresh loop, like `indexer_projection_
 | `indexer_inference_sweep_lag_seconds` | gauge | Age of the most stale `last_swept_at` across visible markets; order-book-depth staleness | `extract(epoch from now() - min(last_swept_at))` over visible rows |
 | `indexer_inference_orders{status=open\|filled\|cancelled}` | gauge | Resting inference orders by status; `open` is live order-book depth | `count(*) filter (…)` over `inference_orders` |
 
-These ride the same OTLP path and `REFRESH_INTERVAL` (15s) as the other gauges. `discovering` is a seeded skeleton not yet stamped visible; `visible` has `last_reconciled_at` set and is served by the API; `failing` is still invisible but the reconciler has recorded a failure (`last_reconcile_failed_at` set) — the bucket where an ABI-drift book or a never-deployed / wrong-dApp address surfaces instead of accruing `reconcile_attempts` silently. The two lag gauges read `now() - min(ts)` over visible markets (oldest timestamp = largest age) and report 0 when nothing is visible yet; a visible book always has both timestamps stamped because discovery refreshes the price and completes a sweep cycle before stamping visibility.
+These ride the same OTLP path and `REFRESH_INTERVAL` (15s) as the other gauges. `discovering` is a seeded skeleton not yet stamped visible; `visible` has `last_reconciled_at` set and is served by the API; `failing` is still invisible but the reconciler has recorded a failure (`last_reconcile_failed_at` set) — the bucket where an ABI-drift book or a never-deployed / wrong-dApp address surfaces instead of accruing `reconcile_attempts` silently. All three buckets exclude superseded rows (`superseded_at IS NOT NULL`): a retired book — even one that has a `last_reconcile_failed_at` stamp from a prior attempt — contributes to none of the counts. The two lag gauges read `now() - min(ts)` over visible markets (oldest timestamp = largest age) and report 0 when nothing is visible yet; a visible book always has both timestamps stamped because discovery refreshes the price and completes a sweep cycle before stamping visibility.
 
 ### Inference reconcile counter
 
@@ -410,6 +427,7 @@ In-process count like `indexer_projection_fallbacks`: the inference reconciler b
 | `live_orders.placed_chain_order` set once and never moves | `coalesce(live, excluded)` on every `OrderPlaced` upsert; column is `text not null` so a missing `chain_order` fails the insert outright. |
 | Cancellation reason matches its source | Projector picks `PMP_REJECTED_BY_ORACLE` or `EVENT_CANCELLED` based on event type, never NULL. |
 | `inference_markets.last_reconciled_at IS NOT NULL ⇒ model_hash IS NOT NULL` | Inference reconciler writes `model_hash` from `getParams()` on the discovery pass before stamping `last_reconciled_at`. |
+| `inference_markets.superseded_at IS NOT NULL ⇒ model_hash IS NULL AND last_reconciled_at IS NULL` | `claim_model_slot` clears both columns on both retire branches (symmetric); the `AND superseded_at IS NULL` stamp guard prevents them being re-set after retirement. |
 | `inference_orders.last_chain_order` lex-monotonic per row | `greatest(existing, new)` on every book-event UPDATE. |
 | A SELL offer never rests after a match | `InferenceFilled` flips an `is_buy = false` row to `FILLED` on first match (one-deal slot), independent of `amount_remaining`. |
 

@@ -71,8 +71,8 @@ Indices:
 | `raw_events_event_type_decoded_idx` (partial, `event_type IS NOT NULL`) | Same scope but optimised for decoded rows. |
 | `raw_events_created_at_chain_idx` (desc) | Time-window queries (analytics only). |
 | `raw_events_chain_order_idx` | Backs the projection loop's `ORDER BY chain_order ASC`. |
-| `raw_events_pending_chain_order_idx` (partial: `processed_at IS NULL AND event_type IS NOT NULL AND decoded IS NOT NULL`) | Backs the projection loop's keyset scan (`crates/infrastructure/src/indexer_repo.rs::reproject_pending_from`). Added by migration `0004`; replaces the former `raw_events_pending_projection_idx` which was keyed on `(created_at_chain, id)`. |
-| `raw_events_pending_src_idx` (partial: `processed_at IS NULL AND event_type IS NOT NULL AND decoded IS NOT NULL`) | Indexed on `src_address`. Allows the inference reconciler's sweep catch-up gate to probe "are there any pending events for this book?" as an index probe on `src_address = orderbook_address`, rather than a full-table scan. Added by migration `0005`. |
+| `raw_events_pending_chain_order_idx` (partial: `processed_at IS NULL AND event_type IS NOT NULL AND decoded IS NOT NULL`) | Backs the projection loop's keyset scan (`crates/infrastructure/src/indexer_repo.rs::reproject_pending_from`). Keyed on `chain_order` to match the loop's `ORDER BY`. |
+| `raw_events_pending_src_idx` (partial: `processed_at IS NULL AND event_type IS NOT NULL AND decoded IS NOT NULL`) | Indexed on `src_address`. Allows the inference reconciler's sweep catch-up gate to probe "are there any pending events for this book?" as an index probe on `src_address = orderbook_address`, rather than a full-table scan. |
 
 ### `indexer_cursors`
 
@@ -83,7 +83,7 @@ Resume-points per ingestion stream. The indexer's main fetch loop persists the c
 | `stream_name` | `text` PK | Logical stream identifier (e.g. one per filter-set the indexer subscribes to). |
 | `cursor` | `text` | Opaque cursor returned by GraphQL server. |
 | `updated_at` | `timestamptz` | Last successful page commit. |
-| `at_head` | `boolean` NOT NULL default `false` | Set to `true` by the capture loop after a drain that returned `has_next_page=false` (the cursor is caught up to the chain tip); reset to `false` whenever more pages follow. Read by the inference reconciler as the `at_head` sweep catch-up gate: phantom-cancel sweeps must not fire while the gateway still has older pages ahead of the cursor. Added by migration `0006`. |
+| `at_head` | `boolean` NOT NULL default `false` | Set to `true` by the capture loop after a drain that returned `has_next_page=false` (the cursor is caught up to the chain tip); reset to `false` whenever more pages follow. Read by the inference reconciler as the `at_head` sweep catch-up gate: phantom-cancel sweeps must not fire while the gateway still has older pages ahead of the cursor. |
 
 ## Read-model — discovery
 
@@ -314,8 +314,6 @@ Reserved table for cached depth snapshots. Not used by the current depth handler
 
 The inference side tracks the per-model order books of the private-inference market (`contracts/airegistry/InferenceOrderBook.sol` — one book per model) and the resting orders inside them. These tables back `/api/v1/inference/markets` (list, plus single-market via `?inferenceOrderBookAddress=`) and `/api/v1/inference/depth` (order book). Inference-settled **prediction** markets add no table of their own — `/api/v1/prediction/markets?resolvesFrom=` reuses [`markets`](#prediction-markets) joined to the range-event columns on [`oracle_events`](#oracle_events) (`range_ob_address`). As on the prediction-market side, a row is hidden from the public API until the inference reconciler stamps `last_reconciled_at`.
 
-Both tables are created by migration `0005_inference_orderbook.sql`.
-
 ### `inference_markets`
 
 One row per `InferenceOrderBook` contract observed on chain — equivalently, one tradable model. The book's address is derived from the model identity alone (`DexLib.computeInferenceOrderBookAddress(code, modelHash)` — one book per `_modelHash`, the tick-size component was dropped), so the address and `model_hash` are 1:1. Discovered from the first order event on an unknown book address (see [indexer.md](indexer.md#projection--inference-order-events)), completed by the inference reconciler reading `InferenceOrderBook.getParams()` and `getWeeklyMedianPrice()`.
@@ -343,6 +341,7 @@ One row per `InferenceOrderBook` contract observed on chain — equivalently, on
 | `last_reconciled_at` | `timestamptz` | Stamped by the inference reconciler after a successful discovery pass. The public API filters on `last_reconciled_at IS NOT NULL` — books without this are invisible to clients (mirrors [`markets`](#prediction-markets)). |
 | `last_reconcile_failed_at` | `timestamptz` | Backoff bookkeeping for the inference reconciler. |
 | `reconcile_attempts` | `integer` default `0` | Diagnostic counter. |
+| `superseded_at` | `timestamptz` (nullable) | Set when this book is retired as a stale duplicate of a higher-version book for the same model (cross-version contract redeploy). NULL = active. Non-NULL = retired; excluded from discovery, the read API, and the discovering/visible/failing metric buckets. |
 | `last_swept_at` | `timestamptz` (nullable) | Stamped `now()` on every sweep batch tick that passes the catch-up gates — not only on cycle completion. It drives the Queue B sweep cadence (`now() - last_swept_at >= inference_sweep_interval_ms`), so it must advance each tick. NULL until the first sweep. Used with `inference_markets_sweep_idx` to drive Queue B sweep scheduling. |
 | `sweep_cursor` | `numeric(78,0)` (nullable) | The `order_id` cursor for the current bounded round-robin sweep of `OPEN` orders. NULL at cycle start (or after a reset). The sweep resumes from this cursor on the next tick; NULL means start from the lowest `order_id`. |
 | `sweep_cycle_max` | `numeric(78,0)` (nullable) | Snapshot of the highest `order_id` at sweep-cycle start. Newly-minted orders above this bound are deferred to the next cycle — they cannot be phantoms yet when the book just accepted them. NULL when no cycle is in progress. |
@@ -389,7 +388,7 @@ Indices:
 
 ## Read-model — inference deals
 
-The inference settlement side tracks the lifecycle of each deal escrow (`TokenContract` — a per-deal streaming-payment contract auto-deployed when a SELL offer is matched) and the individual finalized ticks within it. These tables are written by the SETTLEMENT projector and are intended to back the forthcoming rewards service as its primary read-model. Both tables are created by migration `0007_inference_deals.sql`.
+The inference settlement side tracks the lifecycle of each deal escrow (`TokenContract` — a per-deal streaming-payment contract auto-deployed when a SELL offer is matched) and the individual finalized ticks within it. These tables are written by the SETTLEMENT projector and are intended to back the forthcoming rewards service as its primary read-model.
 
 ### `inference_deals`
 
