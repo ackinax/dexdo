@@ -28,11 +28,17 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use ackinacki_kit::tvm_client::abi::Signer;
 use ackinacki_kit::tvm_client::crypto::KeyPair;
+use ackinacki_kit::tvm_client::ClientConfig;
+use ackinacki_kit::tvm_client::ClientContext;
+use dodex_contracts::dex::oracle_event_list::OracleEventList;
+use dodex_contracts::dex::oracle_event_list::ParamsOfAddRangeEvent;
+use dodex_contracts::dex::oracle_event_list::ParamsOfResolveRange;
 use dodex_contracts::dex::private_note::ParamsOfCancelAllOrders;
 use dodex_contracts::dex::private_note::ParamsOfMergeFullSet;
 use dodex_contracts::dex::private_note::ParamsOfPlaceOrder;
@@ -40,6 +46,7 @@ use dodex_contracts::dex::private_note::ParamsOfSetStake;
 use dodex_contracts::dex::private_note::ParamsOfStakeKey;
 use dodex_contracts::dex::private_note::ParamsOfWithdrawTokens;
 use dodex_contracts::dex::pmp::ParamsOfSubmitResolve;
+use dodex_sdk::dex_contract_params;
 use dodex_sdk::Dex;
 use dodex_sdk::DexConfig;
 use serde::Deserialize;
@@ -96,6 +103,14 @@ impl Flags {
 fn dex(endpoint: &str) -> Result<Dex, String> {
     Dex::new(DexConfig { endpoints: vec![endpoint.to_string()], ..Default::default() })
         .map_err(|e| format!("cannot create Dex client: {e:?}"))
+}
+
+/// Raw tvm-client context for contracts the `Dex` facade does not wrap directly
+/// (the `OracleEventList` oracle-side ops). Library-only — no REST.
+fn tvm_context(endpoint: &str) -> Result<Arc<ClientContext>, String> {
+    let mut config = ClientConfig::default();
+    config.network.endpoints = Some(vec![endpoint.to_string()]);
+    ClientContext::new(config).map(Arc::new).map_err(|e| format!("cannot create tvm context: {e:?}"))
 }
 
 // ----------------------------- shared helpers -----------------------------
@@ -615,6 +630,83 @@ async fn cmd_resolve(f: Flags) -> ExitCode {
     }
 }
 
+/// `dexdo add-range-event` — register a numeric RANGE event on an
+/// `OracleEventList` whose outcome is decided by a bound `InferenceOrderBook`'s
+/// weekly-median price (spec §6.2). This is how an oracle "supports" an inference
+/// market: `--bounds` (strictly increasing upper bounds) bucket the median into
+/// one of N+1 outcomes labelled by `--outcomes`, and `resolve-range` (after
+/// `--deadline`) pulls the price via `requestWeeklyMedian → onWeeklyMedian`.
+/// Signed with the oracle owner keys (the `pubkey_hex`/`secret_hex` printed by
+/// `deploy_oracle`). Library-only — talks straight to the contract, no REST.
+async fn cmd_add_range_event(f: Flags) -> ExitCode {
+    let event_list = match f.require("event-list-address") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let public = match f.require("oracle-pubkey-hex") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let secret = match f.require("oracle-secret-hex") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let event_name = match f.require("event-name") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let ob = match f.require("ob") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let describe = f.get("describe").unwrap_or("").to_string();
+    let oracle_fee: u128 = match f.get("oracle-fee").unwrap_or("0").parse() {
+        Ok(v) => v, Err(e) => return fail(&format!("--oracle-fee: {e}")),
+    };
+    let deadline: u64 = match f.require("deadline").and_then(|v| v.parse().map_err(|e| format!("--deadline: {e}"))) {
+        Ok(v) => v, Err(e) => return fail(&e),
+    };
+    let bounds: Vec<String> = match f.require("bounds") {
+        Ok(v) => v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Err(e) => return fail(&e),
+    };
+    let labels: Vec<String> = match f.require("outcomes") {
+        Ok(v) => v.split(',').map(|s| s.trim().to_string()).collect(),
+        Err(e) => return fail(&e),
+    };
+    if bounds.is_empty() {
+        return fail("--bounds needs at least one upper bound (comma-separated, strictly increasing)");
+    }
+    if labels.len() != bounds.len() + 1 {
+        return fail(&format!(
+            "--outcomes must have bounds+1 = {} labels (got {}); labels are the dense 0..N buckets",
+            bounds.len() + 1, labels.len()
+        ));
+    }
+    let outcome_names: HashMap<u32, String> =
+        labels.into_iter().enumerate().map(|(i, s)| (i as u32, s)).collect();
+    let ctx = match tvm_context(&f.endpoint()) { Ok(c) => c, Err(e) => return fail(&e) };
+    let el = OracleEventList::new(ctx, dex_contract_params(&event_list));
+    eprintln!("[dexdo add-range-event] list {event_list} event '{event_name}' → ob {ob} bounds {bounds:?}");
+    match el.add_range_event(
+        ParamsOfAddRangeEvent { event_name, oracle_fee, deadline, describe, bounds, outcome_names, ob },
+        Signer::Keys { keys: KeyPair { public, secret } },
+    ).await {
+        Ok(r) => { println!("[dexdo add-range-event] DONE: {r:?}"); ExitCode::SUCCESS }
+        Err(e) => fail(&format!("add_range_event failed: {e:?}")),
+    }
+}
+
+/// `dexdo resolve-range` — after the event deadline, pull the bound
+/// `InferenceOrderBook`'s weekly median and resolve the range event (the median
+/// is mapped to an outcome bucket in the `onWeeklyMedian` callback). Callable by
+/// anyone; signed with the oracle owner keys. Library-only — no REST.
+async fn cmd_resolve_range(f: Flags) -> ExitCode {
+    let event_list = match f.require("event-list-address") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let public = match f.require("oracle-pubkey-hex") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let secret = match f.require("oracle-secret-hex") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let event_id = match f.require("event-id") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let oracle_list_hash = match f.require("oracle-list-hash") { Ok(v) => v.to_string(), Err(e) => return fail(&e) };
+    let token_type: u32 = match f.require("token-type").and_then(|v| v.parse().map_err(|e| format!("--token-type: {e}"))) {
+        Ok(v) => v, Err(e) => return fail(&e),
+    };
+    let ctx = match tvm_context(&f.endpoint()) { Ok(c) => c, Err(e) => return fail(&e) };
+    let el = OracleEventList::new(ctx, dex_contract_params(&event_list));
+    eprintln!("[dexdo resolve-range] list {event_list} event {event_id} (token {token_type})");
+    match el.resolve_range(
+        ParamsOfResolveRange { event_id, oracle_list_hash, token_type },
+        Signer::Keys { keys: KeyPair { public, secret } },
+    ).await {
+        Ok(r) => { println!("[dexdo resolve-range] DONE: {r:?}"); ExitCode::SUCCESS }
+        Err(e) => fail(&format!("resolve_range failed: {e:?}")),
+    }
+}
+
 // ----------------------------- dispatch -----------------------------
 
 fn fail(msg: &str) -> ExitCode {
@@ -645,7 +737,16 @@ fn usage() -> String {
        withdraw      --pn-state-file <path> --dest 0:<multisig> [--dapp-id <id>]\n                  \
        Sweep the note's free collateral to a wallet (the multisig).\n  \
        pmp-details   --market-address 0:<pmp> [--endpoint host]\n                  \
-       Read a market's phase window, outcomes, and identity (read-only).\n\n\
+       Read a market's phase window, outcomes, and identity (read-only).\n  \
+       add-range-event  --event-list-address 0:<el> --oracle-pubkey-hex <hex> \
+     --oracle-secret-hex <hex> --event-name <str> --ob 0:<inferenceOrderBook> \
+     --deadline <unix> --bounds <n1,n2,..> --outcomes <l0,l1,..> \
+     [--oracle-fee <raw>] [--describe <str>]\n                  \
+       Bind an oracle range event to an inference order book: its weekly-median \
+     price resolves the outcome (spec 6.2). Sign with the oracle keys from deploy_oracle.\n  \
+       resolve-range  --event-list-address 0:<el> --oracle-pubkey-hex <hex> \
+     --oracle-secret-hex <hex> --event-id <uint256> --oracle-list-hash <uint256> --token-type <id>\n                  \
+       After the deadline, pull the bound order book's weekly median and resolve the range event.\n\n\
      common flags:\n  \
        --endpoint    network host (default shellnet.ackinacki.org)\n"
         .to_string()
@@ -664,6 +765,8 @@ async fn dispatch(sub: &str, rest: &[String]) -> ExitCode {
         "cancel-stake" => cmd_cancel_stake(flags).await,
         "delete-stake" => stake_key_op(flags, "delete-stake").await,
         "resolve" => cmd_resolve(flags).await,
+        "add-range-event" => cmd_add_range_event(flags).await,
+        "resolve-range" => cmd_resolve_range(flags).await,
         "merge-full-set" => cmd_merge_full_set(flags).await,
         "claim" => cmd_claim(flags).await,
         "withdraw" => cmd_withdraw(flags).await,
