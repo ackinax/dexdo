@@ -162,6 +162,223 @@ pub enum InferenceMarketsRequest {
     Listing(InferenceMarketsListing),
 }
 
+/// Keyset cursor for `/api/v1/inference/orders`: the `order_id` of the last row on the
+/// previous page. Unlike the prediction-orders cursor (an opaque chain-order string),
+/// this one is fed into a `::numeric` predicate, so it is validated as an unsigned
+/// integer here rather than surfacing as a SQL cast error. `order_id` is `uint128`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InferenceOrdersCursor(u128);
+
+impl InferenceOrdersCursor {
+    pub fn new(raw: String) -> Result<Self, DomainError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(DomainError::MissingParameter);
+        }
+        // Bound the input before touching it: this endpoint is public and unauthenticated,
+        // so an arbitrarily long all-digits cursor must not buy an arbitrarily long scan.
+        if trimmed.len() > MAX_CURSOR_LEN {
+            return Err(DomainError::InvalidParameter);
+        }
+        if !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(DomainError::InvalidParameter);
+        }
+        trimmed.parse::<u128>().map(Self).map_err(|_| DomainError::InvalidParameter)
+    }
+
+    pub fn as_u128(&self) -> u128 {
+        self.0
+    }
+}
+
+/// Status vocabulary exposed by the inference orders endpoint. It partitions the read
+/// model: `Live` is exactly `OPEN` (every chain placement path requires a non-zero size, and
+/// the fill projector moves a row to `FILLED` as soon as its remainder reaches zero, so an
+/// `OPEN` row is always still resting). Every row falls under exactly one value, which is
+/// what lets the default all-statuses query claim to be exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceOrderStatus {
+    Live,
+    Filled,
+    Cancelled,
+}
+
+impl InferenceOrderStatus {
+    pub const ALL: [Self; 3] = [Self::Live, Self::Filled, Self::Cancelled];
+
+    /// The `inference_orders.status` value this maps to.
+    pub fn db_status(self) -> &'static str {
+        match self {
+            Self::Live => "OPEN",
+            Self::Filled => "FILLED",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+
+    /// Inverse of [`Self::db_status`]: maps a stored `inference_orders.status`
+    /// value back onto the enum through its own match arms, a separate table kept
+    /// consistent with [`Self::db_status`] by a round-trip test covering every
+    /// variant. An unknown value is read-model corruption, surfaced as
+    /// [`DomainError::MarketInconsistent`] so the read path fails closed.
+    pub fn from_db_status(raw: &str) -> Result<Self, DomainError> {
+        match raw {
+            "OPEN" => Ok(Self::Live),
+            "FILLED" => Ok(Self::Filled),
+            "CANCELLED" => Ok(Self::Cancelled),
+            _ => Err(DomainError::MarketInconsistent),
+        }
+    }
+
+    pub fn as_public(self) -> &'static str {
+        match self {
+            Self::Live => "LIVE",
+            Self::Filled => "FILLED",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+
+    /// Parse a comma-separated filter into a non-empty status set. A present-but-blank
+    /// value is a client bug (an unbound template variable), not "no filter", and is
+    /// rejected as [`DomainError::MissingParameter`]; an unknown token is
+    /// [`DomainError::InvalidParameter`]. Duplicate tokens collapse, preserving the
+    /// order of first appearance.
+    pub fn from_csv(raw: &str) -> Result<InferenceOrderStatusSet, DomainError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(DomainError::MissingParameter);
+        }
+        let mut out = Vec::new();
+        for token in trimmed.split(',') {
+            let parsed = match token.trim() {
+                "LIVE" => Self::Live,
+                "FILLED" => Self::Filled,
+                "CANCELLED" => Self::Cancelled,
+                _ => return Err(DomainError::InvalidParameter),
+            };
+            if !out.contains(&parsed) {
+                out.push(parsed);
+            }
+        }
+        // `out` is non-empty: `trimmed` is non-blank, so `split(',')` yields at least one
+        // token that either parsed or already returned an error.
+        InferenceOrderStatusSet::new(out)
+    }
+}
+
+/// Non-empty set of inference order statuses to filter on. The tuple field is private
+/// and every constructor rejects an empty set, so a query can never carry zero status
+/// branches — the state that would make [`InferenceOrdersQuery`]'s snapshot query emit an
+/// empty `page as ( )` and 500. [`InferenceOrderStatusSet::new`] de-duplicates, preserving
+/// the caller's order of first appearance, so every producer that builds through it — not
+/// just [`InferenceOrderStatus::from_csv`] — gets uniqueness for free. [`all`](Self::all) is
+/// distinct by construction and does not route through `new`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InferenceOrderStatusSet(Vec<InferenceOrderStatus>);
+
+impl InferenceOrderStatusSet {
+    /// The full status vocabulary — the set an absent `status` filter resolves to.
+    pub fn all() -> Self {
+        Self(InferenceOrderStatus::ALL.to_vec())
+    }
+
+    /// Build a set from an explicit list. De-duplicates, preserving the order of first
+    /// appearance, then returns [`DomainError::MissingParameter`] if the deduplicated
+    /// result is empty — the only way the empty state could otherwise be reached.
+    pub fn new(statuses: Vec<InferenceOrderStatus>) -> Result<Self, DomainError> {
+        let mut deduped = Vec::with_capacity(statuses.len());
+        for status in statuses {
+            if !deduped.contains(&status) {
+                deduped.push(status);
+            }
+        }
+        if deduped.is_empty() {
+            Err(DomainError::MissingParameter)
+        } else {
+            Ok(Self(deduped))
+        }
+    }
+
+    /// The statuses to query, always at least one.
+    pub fn as_slice(&self) -> &[InferenceOrderStatus] {
+        &self.0
+    }
+
+    /// Iterate the statuses to query, always yielding at least one.
+    pub fn iter(&self) -> impl Iterator<Item = &InferenceOrderStatus> + '_ {
+        self.0.iter()
+    }
+
+    /// Whether `status` is in the set.
+    pub fn contains(&self, status: &InferenceOrderStatus) -> bool {
+        self.0.contains(status)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceSide {
+    Buy,
+    Sell,
+}
+
+impl InferenceSide {
+    pub fn parse(raw: &str) -> Result<Self, DomainError> {
+        match raw.trim() {
+            "BUY" => Ok(Self::Buy),
+            "SELL" => Ok(Self::Sell),
+            "" => Err(DomainError::MissingParameter),
+            _ => Err(DomainError::InvalidParameter),
+        }
+    }
+
+    pub fn is_buy(self) -> bool {
+        matches!(self, Self::Buy)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InferenceOrdersQuery {
+    pub orderbook_address: String,
+    pub token_contract: Option<String>,
+    pub note: Option<String>,
+    pub side: Option<InferenceSide>,
+    /// Non-empty by type; an absent filter resolves to [`InferenceOrderStatusSet::all`].
+    pub statuses: InferenceOrderStatusSet,
+    pub limit: OrdersLimit,
+    pub cursor: Option<InferenceOrdersCursor>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InferenceOrderRow {
+    pub order_id: String,
+    pub token_contract: Option<String>,
+    pub note: Option<String>,
+    pub is_buy: bool,
+    pub price: String,
+    pub ticks: String,
+    pub ticks_initial: String,
+    pub deadline: Option<String>,
+    pub status: InferenceOrderStatus,
+    /// Unix seconds, as every timestamp this API returns. `None` when the chain
+    /// timestamp was not recovered — the row is still served.
+    ///
+    /// Deliberately not `chrono::DateTime`: `dodex-application` carries no chrono
+    /// dependency, and the repo-wide contract is unix seconds anyway. The repository
+    /// extracts the epoch in SQL.
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+}
+
+/// A page of inference orders. `next_cursor` is the single source of "there is a next
+/// page": `Some` exactly when the scan was truncated (a further page exists) and carries
+/// the last returned `order_id` to resume from; `None` on the last page. A caller derives
+/// the wire `hasMore` from `next_cursor.is_some()`.
+#[derive(Debug, Clone)]
+pub struct InferenceOrdersPage {
+    pub orders: Vec<InferenceOrderRow>,
+    pub next_cursor: Option<String>,
+    pub last_update_id: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OraclesFilter {
     pub oracle_address: Option<String>,
@@ -529,6 +746,15 @@ pub trait InferenceReadRepository: Send + Sync {
         orderbook_address: &str,
         limit: u16,
     ) -> Result<InferenceDepthSnapshot, anyhow::Error>;
+
+    /// List a book's orders. Unknown / unreconciled address → `InvalidMarketOrSymbol`.
+    /// A book whose view the indexer cannot vouch for yields `MarketInconsistent` for
+    /// queries that ask about a TokenContract among live SELLs — see the fail-closed gate
+    /// in the repository. The book exists; our coverage of it does not.
+    async fn list_inference_orders(
+        &self,
+        query: &InferenceOrdersQuery,
+    ) -> Result<InferenceOrdersPage, anyhow::Error>;
 }
 
 #[async_trait]
@@ -546,6 +772,13 @@ impl<T: ?Sized + InferenceReadRepository> InferenceReadRepository for Arc<T> {
         limit: u16,
     ) -> Result<InferenceDepthSnapshot, anyhow::Error> {
         (**self).get_inference_depth(orderbook_address, limit).await
+    }
+
+    async fn list_inference_orders(
+        &self,
+        query: &InferenceOrdersQuery,
+    ) -> Result<InferenceOrdersPage, anyhow::Error> {
+        (**self).list_inference_orders(query).await
     }
 }
 
@@ -977,6 +1210,77 @@ where
         query: GetInferenceDepthQuery,
     ) -> Result<InferenceDepthSnapshot, anyhow::Error> {
         self.repo.get_inference_depth(&query.orderbook_address, query.limit).await
+    }
+}
+
+/// Raw request values for [`GetInferenceOrdersUseCase::execute`]. Strings are pre-trimmed
+/// at the HTTP boundary; everything else is validated here so the error mapping lives in
+/// one place.
+pub struct GetInferenceOrdersInput {
+    pub orderbook_address: String,
+    pub token_contract: Option<String>,
+    pub note: Option<String>,
+    pub side: Option<String>,
+    pub status_csv: Option<String>,
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+pub struct GetInferenceOrdersUseCase<R> {
+    repo: R,
+}
+
+impl<R> GetInferenceOrdersUseCase<R> {
+    pub fn new(repo: R) -> Self {
+        Self { repo }
+    }
+}
+
+impl<R> GetInferenceOrdersUseCase<R>
+where
+    R: InferenceReadRepository,
+{
+    pub async fn execute(
+        &self,
+        input: GetInferenceOrdersInput,
+    ) -> Result<InferenceOrdersPage, anyhow::Error> {
+        if input.orderbook_address.trim().is_empty() {
+            return Err(DomainError::MissingParameter.into());
+        }
+        // Neither index pins both filters, so the pair would leave one of them an unbounded
+        // residual over the other's history on a public endpoint. InvalidParameter, not
+        // MissingParameter: both were supplied, and it is the combination that is refused.
+        if input.token_contract.is_some() && input.note.is_some() {
+            return Err(DomainError::InvalidParameter.into());
+        }
+
+        let side = input.side.as_deref().map(InferenceSide::parse).transpose()?;
+        let statuses = match input.status_csv.as_deref() {
+            Some(csv) => InferenceOrderStatus::from_csv(csv)?,
+            None => InferenceOrderStatusSet::all(),
+        };
+        // Out-of-range numeric limits map to MissingParameter, matching
+        // `/api/v1/prediction/orders`; a non-numeric limit is rejected earlier by the HTTP
+        // boundary as InvalidParameter.
+        let limit = match input.limit {
+            Some(raw) => {
+                let narrowed = u16::try_from(raw).map_err(|_| DomainError::MissingParameter)?;
+                OrdersLimit::new(narrowed)?
+            }
+            None => OrdersLimit::DEFAULT,
+        };
+        let cursor = input.cursor.map(InferenceOrdersCursor::new).transpose()?;
+
+        let query = InferenceOrdersQuery {
+            orderbook_address: input.orderbook_address,
+            token_contract: input.token_contract,
+            note: input.note,
+            side,
+            statuses,
+            limit,
+            cursor,
+        };
+        self.repo.list_inference_orders(&query).await
     }
 }
 
@@ -6842,21 +7146,43 @@ mod buy_full_set_use_case_tests {
 #[cfg(test)]
 mod inference_usecase_tests {
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use dodex_domain::InferenceDepthSnapshot;
     use dodex_domain::InferenceMarketsPage;
 
+    use super::DomainError;
     use super::GetInferenceDepthQuery;
     use super::GetInferenceDepthUseCase;
     use super::GetInferenceMarketsUseCase;
+    use super::GetInferenceOrdersInput;
+    use super::GetInferenceOrdersUseCase;
     use super::InferenceMarketsRequest;
+    use super::InferenceOrderStatus;
+    use super::InferenceOrderStatusSet;
+    use super::InferenceOrdersCursor;
+    use super::InferenceOrdersPage;
+    use super::InferenceOrdersQuery;
     use super::InferenceReadRepository;
+    use super::OrdersLimit;
+    use super::MAX_CURSOR_LEN;
+    use super::ORDERS_DEFAULT_LIMIT;
+    use super::ORDERS_MAX_LIMIT;
 
-    struct StubRepo;
+    #[derive(Clone, Default)]
+    struct StubInferenceRepo {
+        last_query: Arc<Mutex<Option<InferenceOrdersQuery>>>,
+    }
+
+    impl StubInferenceRepo {
+        fn last_query(&self) -> InferenceOrdersQuery {
+            self.last_query.lock().unwrap().clone().expect("list_inference_orders was called")
+        }
+    }
 
     #[async_trait]
-    impl InferenceReadRepository for StubRepo {
+    impl InferenceReadRepository for StubInferenceRepo {
         async fn list_inference_markets(
             &self,
             request: &InferenceMarketsRequest,
@@ -6883,11 +7209,23 @@ mod inference_usecase_tests {
                 asks: vec![],
             })
         }
+
+        async fn list_inference_orders(
+            &self,
+            query: &InferenceOrdersQuery,
+        ) -> Result<InferenceOrdersPage, anyhow::Error> {
+            *self.last_query.lock().unwrap() = Some(query.clone());
+            Ok(InferenceOrdersPage {
+                orders: vec![],
+                next_cursor: None,
+                last_update_id: "0".into(),
+            })
+        }
     }
 
     #[tokio::test]
     async fn markets_use_case_passes_request_through() {
-        let uc = GetInferenceMarketsUseCase::new(Arc::new(StubRepo));
+        let uc = GetInferenceMarketsUseCase::new(Arc::new(StubInferenceRepo::default()));
         let page = uc
             .execute(InferenceMarketsRequest::One { orderbook_address: "0:ob".into() })
             .await
@@ -6897,12 +7235,179 @@ mod inference_usecase_tests {
 
     #[tokio::test]
     async fn depth_use_case_passes_args_through() {
-        let uc = GetInferenceDepthUseCase::new(Arc::new(StubRepo));
+        let uc = GetInferenceDepthUseCase::new(Arc::new(StubInferenceRepo::default()));
         let snap = uc
             .execute(GetInferenceDepthQuery { orderbook_address: "0:ob".into(), limit: 7 })
             .await
             .unwrap();
         assert_eq!(snap.orderbook_address, "0:ob");
         assert_eq!(snap.last_update_id, "7");
+    }
+
+    #[test]
+    fn inference_cursor_rejects_non_numeric_blank_and_oversized() {
+        assert!(matches!(
+            InferenceOrdersCursor::new("  ".into()),
+            Err(DomainError::MissingParameter)
+        ));
+        assert!(matches!(
+            InferenceOrdersCursor::new("abc".into()),
+            Err(DomainError::InvalidParameter)
+        ));
+        assert!(matches!(
+            InferenceOrdersCursor::new("-1".into()),
+            Err(DomainError::InvalidParameter)
+        ));
+        // 100 digits overflows u128 (order_id is uint128 on chain).
+        let huge = "9".repeat(100);
+        assert!(matches!(InferenceOrdersCursor::new(huge), Err(DomainError::InvalidParameter)));
+        // Beyond MAX_CURSOR_LEN: rejected on length, before any scan of the input.
+        let oversized = "9".repeat(MAX_CURSOR_LEN + 1);
+        assert!(matches!(
+            InferenceOrdersCursor::new(oversized),
+            Err(DomainError::InvalidParameter)
+        ));
+        assert_eq!(InferenceOrdersCursor::new(" 834 ".into()).unwrap().as_u128(), 834);
+    }
+
+    #[test]
+    fn inference_status_csv_parses_and_rejects_unknown() {
+        let parsed = InferenceOrderStatus::from_csv("LIVE,CANCELLED").unwrap();
+        assert_eq!(
+            parsed.as_slice(),
+            &[InferenceOrderStatus::Live, InferenceOrderStatus::Cancelled][..]
+        );
+        // Duplicate tokens collapse, preserving order of first appearance.
+        let deduped = InferenceOrderStatus::from_csv("FILLED,LIVE,FILLED").unwrap();
+        assert_eq!(
+            deduped.as_slice(),
+            &[InferenceOrderStatus::Filled, InferenceOrderStatus::Live][..]
+        );
+        assert_eq!(InferenceOrderStatus::Live.db_status(), "OPEN");
+        assert!(matches!(
+            InferenceOrderStatus::from_csv("NEW"),
+            Err(DomainError::InvalidParameter)
+        ));
+        assert!(matches!(InferenceOrderStatus::from_csv(""), Err(DomainError::MissingParameter)));
+    }
+
+    #[test]
+    fn inference_status_csv_dedupes_and_trims_whitespace() {
+        // Two identical tokens collapse to a single entry, not two.
+        let all_live = InferenceOrderStatus::from_csv("LIVE,LIVE").unwrap();
+        assert_eq!(all_live.as_slice(), &[InferenceOrderStatus::Live][..]);
+
+        // Whitespace around both the separator and the tokens is trimmed before parsing.
+        let live_and_filled = InferenceOrderStatus::from_csv("LIVE , FILLED").unwrap();
+        assert_eq!(
+            live_and_filled.as_slice(),
+            &[InferenceOrderStatus::Live, InferenceOrderStatus::Filled][..]
+        );
+    }
+
+    #[test]
+    fn inference_order_status_set_new_dedupes() {
+        // `new` itself enforces uniqueness, not just the `from_csv` parser that calls it.
+        let deduped = InferenceOrderStatusSet::new(vec![
+            InferenceOrderStatus::Live,
+            InferenceOrderStatus::Live,
+        ])
+        .unwrap();
+        assert_eq!(deduped.as_slice(), &[InferenceOrderStatus::Live][..]);
+        // Distinct values keep their first-appearance order; a later repeat is dropped.
+        let interleaved = InferenceOrderStatusSet::new(vec![
+            InferenceOrderStatus::Filled,
+            InferenceOrderStatus::Live,
+            InferenceOrderStatus::Filled,
+        ])
+        .unwrap();
+        assert_eq!(
+            interleaved.as_slice(),
+            &[InferenceOrderStatus::Filled, InferenceOrderStatus::Live][..]
+        );
+    }
+
+    #[test]
+    fn inference_db_status_round_trips() {
+        // `db_status` and `from_db_status` are exact inverses for every variant.
+        for status in InferenceOrderStatus::ALL {
+            assert_eq!(InferenceOrderStatus::from_db_status(status.db_status()), Ok(status));
+        }
+        assert!(matches!(
+            InferenceOrderStatus::from_db_status("bogus"),
+            Err(DomainError::MarketInconsistent)
+        ));
+        // An empty set is unrepresentable.
+        assert!(matches!(InferenceOrderStatusSet::new(vec![]), Err(DomainError::MissingParameter)));
+    }
+
+    #[tokio::test]
+    async fn get_inference_orders_rejects_note_with_token_contract() {
+        let use_case = GetInferenceOrdersUseCase::new(StubInferenceRepo::default());
+        let err = use_case
+            .execute(GetInferenceOrdersInput {
+                orderbook_address: "0:ob".into(),
+                token_contract: Some("0:tc".into()),
+                note: Some("0:note".into()),
+                side: None,
+                status_csv: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap_err();
+        // -1130, not -1102: both parameters are present, so nothing is missing. The
+        // combination is what the endpoint cannot serve.
+        assert!(matches!(err.downcast_ref::<DomainError>(), Some(DomainError::InvalidParameter)));
+    }
+
+    #[tokio::test]
+    async fn get_inference_orders_rejects_out_of_range_limit_as_missing_parameter() {
+        let use_case = GetInferenceOrdersUseCase::new(StubInferenceRepo::default());
+        for limit in [0i64, 501] {
+            let err = use_case
+                .execute(GetInferenceOrdersInput {
+                    orderbook_address: "0:ob".into(),
+                    token_contract: None,
+                    note: None,
+                    side: None,
+                    status_csv: None,
+                    limit: Some(limit),
+                    cursor: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err.downcast_ref::<DomainError>(),
+                Some(DomainError::MissingParameter)
+            ));
+        }
+    }
+
+    #[test]
+    fn inference_orders_limit_accepts_boundaries() {
+        assert_eq!(OrdersLimit::new(1).unwrap().get(), 1);
+        assert_eq!(OrdersLimit::new(ORDERS_MAX_LIMIT).unwrap().get(), ORDERS_MAX_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn get_inference_orders_defaults_to_all_statuses() {
+        let repo = StubInferenceRepo::default();
+        let use_case = GetInferenceOrdersUseCase::new(repo.clone());
+        use_case
+            .execute(GetInferenceOrdersInput {
+                orderbook_address: "0:ob".into(),
+                token_contract: None,
+                note: None,
+                side: None,
+                status_csv: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let seen = repo.last_query();
+        assert_eq!(seen.statuses.as_slice().len(), 3);
+        assert_eq!(seen.limit.get(), ORDERS_DEFAULT_LIMIT);
     }
 }

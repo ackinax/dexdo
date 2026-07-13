@@ -128,6 +128,21 @@ struct PendingRow {
 }
 
 impl IndexerRepository {
+    /// Shared WHERE-clause fragment for the "wedged inference book" predicate:
+    /// visible, not superseded, and with at least one still-unprocessed
+    /// `raw_events` row under the book's `orderbook_address`. Both
+    /// `inference_wedged_books_count` (whole-table) and
+    /// `inference_wedged_book_addresses` (scoped to a caller-supplied address
+    /// set) below build their query from this one constant, so the whole-table
+    /// production count and the scoped query a test exercises can never drift
+    /// apart — edit the predicate here only, never duplicate it.
+    const WEDGED_BOOKS_WHERE: &'static str = r#"m.last_reconciled_at is not null
+                  and m.superseded_at is null
+                  and exists(
+                      select 1 from raw_events e
+                       where e.src_address = m.orderbook_address
+                         and e.processed_at is null)"#;
+
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -900,6 +915,61 @@ impl IndexerRepository {
         .await
         .context("inference order status counts")?;
         Ok(row)
+    }
+
+    /// Visible inference order-book markets currently wedged by an unprojected
+    /// `raw_events` row under their address, backing `indexer_inference_wedged_books`.
+    /// Mirrors the read gate's arm-2 (`inference_read_repo::build_snapshot_query`):
+    /// a book is "wedged" when it is visible AND has at least one `raw_events` row with
+    /// `src_address = orderbook_address and processed_at is null` — the same
+    /// predicate that trips `MarketInconsistent` (503) for a `tokenContract` query that
+    /// scopes live SELLs (`side` not BUY and a status set including LIVE); a `note`
+    /// filter, a `side=BUY` query, or a status set without LIVE against the same book
+    /// still returns 200. The gate spells visibility as `last_reconciled_at is not null` alone; the
+    /// `superseded_at is null` clause below is belt-and-suspenders (superseding always
+    /// nulls `last_reconciled_at` in the same update, so it is redundant) and matches
+    /// the sibling `visible` metric bucket — do not expect to find it in the gate's SQL.
+    /// An ABI-lagging contract upgrade can wedge a book here indefinitely with no
+    /// other symptom, so this is the signal an operator alerts on rather than
+    /// reading 503s as a silent, unexplained outage. The correlated `EXISTS` rides
+    /// `raw_events_unprocessed_src_idx` the same way the gate's probe does. Runs
+    /// `WEDGED_BOOKS_WHERE` above, whole-table.
+    pub async fn inference_wedged_books_count(&self) -> anyhow::Result<i64> {
+        let sql =
+            format!("select count(*) from inference_markets m where {}", Self::WEDGED_BOOKS_WHERE);
+        let count: i64 = sqlx::query_scalar(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .context("inference wedged books count")?;
+        Ok(count)
+    }
+
+    /// The `orderbook_address`es among `scope` that satisfy the same
+    /// wedged-book predicate as `inference_wedged_books_count` above: both
+    /// build from `WEDGED_BOOKS_WHERE`, the identical wedged-book predicate, and
+    /// must stay in lockstep; this method additionally filters on
+    /// `orderbook_address = any($1)`. Ordered by address for a deterministic result. Exists
+    /// so a test can pin exactly which of several seeded addresses the
+    /// predicate selects, scoped to those addresses so a concurrent writer
+    /// elsewhere in the shared test DB cannot perturb the result — the
+    /// whole-table count above can only report a delta, which cannot make that
+    /// distinction.
+    pub async fn inference_wedged_book_addresses(
+        &self,
+        scope: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let sql = format!(
+            "select m.orderbook_address from inference_markets m \
+             where m.orderbook_address = any($1) and {} \
+             order by m.orderbook_address",
+            Self::WEDGED_BOOKS_WHERE
+        );
+        let addrs: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(scope)
+            .fetch_all(&self.pool)
+            .await
+            .context("inference wedged book addresses")?;
+        Ok(addrs)
     }
 
     /// (in_use, idle) sqlx pool connections — cheap in-memory reads, no DB query.
