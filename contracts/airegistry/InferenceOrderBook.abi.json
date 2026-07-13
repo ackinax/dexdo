@@ -24,10 +24,10 @@
 			"inputs": [
 				{"name":"pricePerTick","type":"uint128"},
 				{"name":"maxTicks","type":"uint128"},
-				{"name":"tokenContract","type":"address"},
 				{"name":"flags","type":"uint8"},
 				{"name":"sellerPubkey","type":"uint256"},
-				{"name":"nonce","type":"uint64"}
+				{"name":"nonce","type":"uint64"},
+				{"name":"ownerNote","type":"address"}
 			],
 			"outputs": [
 			]

@@ -172,6 +172,7 @@
 		{"init":false,"name":"_timestamp","type":"uint64"},
 		{"init":false,"name":"_constructorFlag","type":"bool"},
 		{"components":[{"name":"bounds","type":"uint256[]"},{"name":"ob","type":"address"},{"name":"exists","type":"bool"}],"init":false,"name":"_rangeData","type":"map(uint256,tuple)"},
+		{"init":false,"name":"_lastRangeResolveReq","type":"map(uint256,uint64)"},
 		{"init":true,"name":"_oracle","type":"address"},
 		{"init":true,"name":"_index","type":"uint128"},
 		{"init":false,"name":"_oraclePubkey","type":"uint256"},

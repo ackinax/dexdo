@@ -10,7 +10,7 @@ import "./libraries/DexLib.sol";
 contract RootOracle is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.26";
 
     /// @notice Stored code of PrivateNote contract
     TvmCell _privateNoteCode;
@@ -51,8 +51,8 @@ contract RootOracle is Modifiers {
     /// @param oracleName Name of the oracle
     function deployOracle(uint256 oraclePubkey, string oracleName) public view accept {
         ensureBalance();
-        // Mirror the Oracle constructor guard: block the pubkey=0 footgun at
-        // the root so we don't waste gas on a doomed deploy.
+        // Mirror the Oracle constructor guard: reject pubkey=0 at the root so we
+        // don't waste gas on a deploy the Oracle constructor would reject.
         require(oraclePubkey != 0, ERR_INVALID_PARAMS);
         TvmCell stateInit = DexLib.buildOracleStateInit(_oracleCode, oracleName);
         address oracle = new Oracle{

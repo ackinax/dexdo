@@ -14,6 +14,7 @@ import "../OracleEventList.sol";
 import "../OrderBook.sol";
 import "../../airegistry/InferenceOrderBook.sol";
 import "../../airegistry/TokenContract.sol";
+import "../../airegistry/RootModel.sol";
 
 /// @title DexLib
 /// @notice Utility library for deterministic address and StateInit/code construction.
@@ -191,23 +192,84 @@ library DexLib {
         return s.loadRef();
     }
 
-    /// @notice Deterministic inference TokenContract address from its pinned code
-    ///         hash/depth + the seller's statics. `_rootModelAddress` is fixed to
-    ///         `address(0)` (the inference deal convention — no RootModel registry).
-    ///         Mirrors RootModel._calculateTokenContractAddress; used by the seller
-    ///         note to verify a `postSellOffer`'s `tokenContract` is a genuine TC.
-    /// @param codeHash TokenContract canonical code hash.
-    /// @param codeDepth TokenContract canonical code depth.
-    /// @param sellerPubkey Seller key (= the seller note's ephemeral pubkey).
-    /// @param nonce Deal nonce.
-    /// @return TokenContract deterministic address.
-    function computeTokenContractAddressFromHash(
-        uint256 codeHash, uint16 codeDepth, uint256 sellerPubkey, uint64 nonce
+    /// @notice Deterministic per-seller RootModel address from its pinned code
+    ///         hash/depth + the canonical SuperRoot. `_ownerPubkey == sellerPubkey`.
+    /// @param codeHash RootModel canonical code hash.
+    /// @param codeDepth RootModel canonical code depth.
+    /// @param superRoot Canonical SuperRoot address (`_superRootAddress` static).
+    /// @param ownerPubkey Seller pubkey the RootModel is derived for.
+    /// @return RootModel deterministic address.
+    function computeRootModelAddressFromHash(
+        uint256 codeHash, uint16 codeDepth, address superRoot, uint256 ownerPubkey
     ) public returns (address) {
         TvmCell dummyCode;
         TvmCell si = abi.encodeStateInit({
+            code: dummyCode, contr: RootModel, pubkey: ownerPubkey,
+            varInit: { _ownerPubkey: ownerPubkey, _superRootAddress: superRoot }
+        });
+        TvmCell dataCell = _extractDataCell(si);
+        return address.makeAddrStd(0, abi.stateInitHash(codeHash, tvm.hash(dataCell), codeDepth, dataCell.depth()));
+    }
+
+    /// @notice Canonical inference deal addresses: derives the seller's per-seller
+    ///         RootModel from `rmCodeHash`+SuperRoot, then the per-deal
+    ///         TokenContract bound to it. Single source of truth so the buyer/
+    ///         seller PrivateNote (stream-lock auth) and RootPN (fundFromOrderBook
+    ///         hash delivery) derive identical addresses from the same pins.
+    /// @return rootModel Per-seller RootModel address.
+    /// @return tokenContract Per-deal TokenContract address.
+    function computeCanonicalTokenContractAddress(
+        uint256 rmCodeHash, uint16 rmCodeDepth,
+        uint256 tcCodeHash, uint16 tcCodeDepth,
+        address superRoot, uint256 sellerPubkey, uint64 nonce
+    ) public returns (address rootModel, address tokenContract) {
+        rootModel = computeRootModelAddressFromHash(rmCodeHash, rmCodeDepth, superRoot, sellerPubkey);
+        TvmCell dummyCode;
+        TvmCell si = abi.encodeStateInit({
             code: dummyCode, contr: TokenContract, pubkey: sellerPubkey,
-            varInit: { _sellerPubkey: sellerPubkey, _rootModelAddress: address(0), _nonce: nonce }
+            varInit: { _sellerPubkey: sellerPubkey, _rootModelAddress: rootModel, _nonce: nonce }
+        });
+        TvmCell dataCell = _extractDataCell(si);
+        tokenContract = address.makeAddrStd(0, abi.stateInitHash(tcCodeHash, tvm.hash(dataCell), tcCodeDepth, dataCell.depth()));
+    }
+
+    /// @notice Deterministic InferenceOrderBook address from its (unsalted) code
+    ///         hash/depth + the model static — matches
+    ///         computeInferenceOrderBookAddress(code, modelHash) but takes the
+    ///         hash so a TokenContract can verify a `fundFromOrderBook` caller
+    ///         without storing the full book code.
+    /// @param codeHash InferenceOrderBook code hash (`tvm.hash(code)`).
+    /// @param codeDepth InferenceOrderBook code depth.
+    /// @param modelHash Model identity (one book per model).
+    /// @return InferenceOrderBook deterministic address.
+    function computeInferenceOrderBookAddressFromHash(
+        uint256 codeHash, uint16 codeDepth, uint256 modelHash
+    ) public returns (address) {
+        TvmCell dummyCode;
+        TvmCell si = abi.encodeStateInit({
+            contr: InferenceOrderBook, code: dummyCode,
+            varInit: { _modelHash: modelHash }
+        });
+        TvmCell dataCell = _extractDataCell(si);
+        return address.makeAddrStd(0, abi.stateInitHash(codeHash, tvm.hash(dataCell), codeDepth, dataCell.depth()));
+    }
+
+    /// @notice Deterministic PrivateNote address from its (unsalted) code hash/depth
+    ///         + the deposit-identifier static — mirrors buildPrivateNoteInitData but
+    ///         takes the hash so a TokenContract can prove a note-driven caller is a
+    ///         canonical PrivateNote (pinned code) without storing the full note code
+    ///         (which would create a note<->TC pin cycle).
+    /// @param codeHash PrivateNote code hash (`tvm.hash(code)`).
+    /// @param codeDepth PrivateNote code depth.
+    /// @param depositIdentifierHash Note deposit identifier (the note's only static).
+    /// @return PrivateNote deterministic address.
+    function computeCanonicalNoteAddressFromHash(
+        uint256 codeHash, uint16 codeDepth, uint256 depositIdentifierHash
+    ) public returns (address) {
+        TvmCell dummyCode;
+        TvmCell si = abi.encodeStateInit({
+            contr: PrivateNote, code: dummyCode,
+            varInit: { _depositIdentifierHash: depositIdentifierHash }
         });
         TvmCell dataCell = _extractDataCell(si);
         return address.makeAddrStd(0, abi.stateInitHash(codeHash, tvm.hash(dataCell), codeDepth, dataCell.depth()));

@@ -38,4 +38,6 @@ abstract contract AiRegistryErrors {
     uint16 constant ERR_PROBE_ALREADY_FUNDED  = 333;  // fundProbeCommission() called twice
     uint16 constant ERR_NOT_PROBE             = 334;  // op requires the Probe state (probe not yet accepted)
     uint16 constant ERR_ALREADY_STREAMING     = 335;  // probe already accepted, Probe-only op rejected
+    uint16 constant ERR_OFFER_LIVE            = 336;  // destroy blocked: a live sell offer still rests on the book
+    uint16 constant ERR_NO_PREPAID_TICK       = 337;  // advance() in streaming with no delivered tick to finalize
 }

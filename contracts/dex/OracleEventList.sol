@@ -16,7 +16,7 @@ interface IInferenceOB {
 contract OracleEventList is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.26";
 
     // ── Range events (numeric outcomes): the price is resolved on-chain from an
     // InferenceOrderBook's weekly median, mapped to a numeric range = outcome.
@@ -31,7 +31,20 @@ contract OracleEventList is Modifiers {
     }
     mapping(uint256 => RangeData) _rangeData;
 
+    // ── resolveRange rate limit ──────────────────────────────────────────────
+    // resolveRange is permissionless (spec §6): anyone may trigger it after the
+    // deadline. Each call spends value on three contracts (OEL mints/forwards a
+    // vmshell to the OB, the OB replies, OEL forwards submitResolve to the PMP),
+    // so a permissionless entry is rate-limited per event to one call every
+    // RESOLVE_COOLDOWN — enough to still allow a genuine retry if the async
+    // median→resolve chain fails (the OB call is `bounce: false`, so failures are
+    // silent and a retry must remain possible), while bounding the value spent
+    // across the stack per event.
+    uint64 constant RESOLVE_COOLDOWN = 3600;   // 1h between resolveRange requests
+    mapping(uint256 => uint64) _lastRangeResolveReq;
+
     uint16 constant ERR_NOT_RANGE_EVENT = 350;
+    uint16 constant ERR_RESOLVE_COOLDOWN = 351;
 
     /// @notice Oracle contract address bound to this list (state-init static field).
     address static _oracle;
@@ -90,12 +103,10 @@ contract OracleEventList is Modifiers {
     ) {
         tvm.accept();
         // `_oracle` is a static field (set via stateInit to the legitimate
-        // Oracle address). Without this check, the old code was
-        //     _oracle = msg.sender;
-        // which an attacker could exploit by race-deploying OEL at the
-        // deterministic address using a stateInit where _oracle == legit
-        // Oracle, letting the constructor overwrite _oracle with the
-        // attacker's own address. Check sender matches static field instead.
+        // Oracle address). Require the sender to match that static field rather
+        // than assigning `_oracle = msg.sender` in the constructor, so `_oracle`
+        // is fixed by the deterministic stateInit and cannot be reassigned by the
+        // deploying message.
         require(msg.sender == _oracle, ERR_INVALID_SENDER);
         // pubkey=0 would hand OEL admin access (addEvent/deleteEvent) to any
         // keyless ext tx — and since PMP.approveEvent propagates this into
@@ -146,9 +157,8 @@ contract OracleEventList is Modifiers {
         require(outcomeCount < 20, ERR_INVALID_PARAMS);
         // Outcome ids must be a dense 0..n-1 range. PMP derives _numOutcomes from the
         // key count and indexes _typedOutcomePools by id, validating outcomeId <
-        // _numOutcomes (PMP.stake/resolve). A sparse/1-based map (e.g. {1,2}) would
-        // otherwise accept bets on a phantom id 0 yet revert resolve on the labeled
-        // outcome with ERR_INVALID_OUTCOME_ID after quorum.
+        // _numOutcomes (PMP.stake/resolve). Requiring a dense 0-based map keeps the
+        // stakeable ids and the resolvable ids identical.
         for (uint32 i = 0; i < outcomeCount; i++) {
             require(outcomeNames.exists(i), ERR_INVALID_PARAMS);
         }
@@ -225,15 +235,19 @@ contract OracleEventList is Modifiers {
         public senderIs(DexLib.computePMPAddressFromHash(_pmpSaltedCodeHash, _pmpSaltedCodeDepth, eventId, oracleListHash, tokenType)) accept
     {
         ensureBalance();
-        _oracle.transfer({value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ORACLE_DAPP_ID});
+        // Do NOT forward the oracle fee yet: on a reject path the oracle never
+        // services the event, so the fee (msg.currencies) must go back to the
+        // PMP (which handles staker refunds), not be gifted to the oracle. Only
+        // the approve branch below pays the oracle.
         if (!_events.exists(eventId)) {
-            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}();
+            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID}();
             return;
         }
         EventInfo eventInfo = _events[eventId];
         if ((eventInfo.deadline < block.timestamp) || (msg.currencies[CURRENCIES_ID_SHELL] < eventInfo.oracleFee)) {
-            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}();
+            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID}();
         } else {
+            _oracle.transfer({value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ORACLE_DAPP_ID});
             eventInfo.count += 1;
             _events[eventId] = eventInfo;
             PMP(msg.sender).approveEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(_oraclePubkey, eventInfo.outcomeNames, eventInfo.describe, eventInfo.eventName, eventInfo.trustAddr);
@@ -267,8 +281,13 @@ contract OracleEventList is Modifiers {
         require(_rangeData[eventId].exists, ERR_NOT_RANGE_EVENT);
         require(_events.exists(eventId), ERR_NOT_RANGE_EVENT);
         require(_events[eventId].deadline <= block.timestamp, ERR_INVALID_PARAMS);
+        // Rate-limit the permissionless entry: at most one median request per
+        // event every RESOLVE_COOLDOWN. First call (last == 0) always passes.
+        uint64 last = _lastRangeResolveReq[eventId];
+        require(last == 0 || block.timestamp >= last + RESOLVE_COOLDOWN, ERR_RESOLVE_COOLDOWN);
         tvm.accept();
         ensureBalance();
+        _lastRangeResolveReq[eventId] = uint64(block.timestamp);
         IInferenceOB(_rangeData[eventId].ob).requestWeeklyMedian{value: 1 vmshell, flag: 1, bounce: false}(
             eventId, oracleListHash, tokenType);
     }
