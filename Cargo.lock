@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "ackinacki-kit"
-version = "3.0.0"
-source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v3.0.0#69a3026ddc8d71bb67a692b69c326e2a8835d889"
+version = "4.0.1"
+source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v4.0.1#b0e4a042dbe262915aae0db3a3efff1146fd2bc5"
 dependencies = [
  "contracts",
  "shared",
@@ -138,8 +138,8 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "api_derive"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
+version = "3.0.4"
+source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
  "api_info",
  "proc-macro2",
@@ -150,8 +150,8 @@ dependencies = [
 
 [[package]]
 name = "api_info"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
+version = "3.0.4"
+source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
  "serde",
  "serde_derive",
@@ -537,7 +537,7 @@ dependencies = [
  "env_logger",
  "ethers-core",
  "getset",
- "halo2-base 0.4.1",
+ "halo2-base",
  "hasher",
  "itertools 0.11.0",
  "lazy_static",
@@ -1187,8 +1187,8 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "contracts"
-version = "3.0.0"
-source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v3.0.0#69a3026ddc8d71bb67a692b69c326e2a8835d889"
+version = "4.0.1"
+source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v4.0.1#b0e4a042dbe262915aae0db3a3efff1146fd2bc5"
 dependencies = [
  "base64",
  "chrono",
@@ -1202,7 +1202,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
- "tvm_block 3.0.2",
+ "tvm_block",
  "tvm_client",
 ]
 
@@ -1896,11 +1896,11 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
- "tvm_abi 3.0.4",
- "tvm_block 3.0.4",
- "tvm_executor 3.0.4",
- "tvm_types 3.0.4",
- "tvm_vm 3.0.4",
+ "tvm_abi",
+ "tvm_block",
+ "tvm_executor",
+ "tvm_types",
+ "tvm_vm",
  "uuid",
  "zeroize",
 ]
@@ -2669,7 +2669,7 @@ name = "gosh-zk-snark-halo2-utils"
 version = "0.1.0"
 source = "git+https://github.com/gosh-sh/gosh-zk-snark-halo2-utils?branch=main#fcc3ec73510ac61d62848e1fe59617acdbd5c00c"
 dependencies = [
- "halo2-base 0.4.1",
+ "halo2-base",
  "halo2_kzg_srs",
  "halo2curves",
  "rand 0.8.6",
@@ -2743,64 +2743,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "halo2-axiom"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aee3f8178b78275038e5ea0e2577140056d2c4c87fccaf6777dc0a8eebe455a"
-dependencies = [
- "blake2b_simd",
- "crossbeam",
- "ff 0.13.1",
- "group 0.13.0",
- "halo2curves-axiom",
- "itertools 0.11.0",
- "maybe-rayon",
- "pairing",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "rayon",
- "rustc-hash 1.1.0",
- "sha3",
- "tracing",
-]
-
-[[package]]
 name = "halo2-base"
 version = "0.4.1"
 source = "git+https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381?branch=bump-halo2-lib-v0.4.1#026e176de8aff8269ab3bbb7f7192b247adab965"
 dependencies = [
  "ark-std 0.3.0",
  "getset",
- "halo2-axiom 0.4.5",
+ "halo2-axiom",
  "itertools 0.11.0",
  "log",
  "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
- "poseidon-primitives 0.1.1",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
- "rayon",
- "rustc-hash 1.1.0",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "halo2-base"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab57020fceb5657e837836ab89ee87a5e8d5f1e1662a353e23c00f2cde41446f"
-dependencies = [
- "ark-std 0.3.0",
- "getset",
- "halo2-axiom 0.5.1",
- "itertools 0.11.0",
- "log",
- "num-bigint 0.4.6",
- "num-integer",
- "num-traits",
- "poseidon-primitives 0.2.0",
+ "poseidon-primitives",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "rayon",
@@ -2814,7 +2769,7 @@ name = "halo2-ecc"
 version = "0.4.1"
 source = "git+https://github.com/gosh-sh/halo2-lib-zkevm-sha256-and-bls12-381?branch=bump-halo2-lib-v0.4.1#026e176de8aff8269ab3bbb7f7192b247adab965"
 dependencies = [
- "halo2-base 0.4.1",
+ "halo2-base",
  "itertools 0.11.0",
  "num-bigint 0.4.6",
  "num-integer",
@@ -4503,21 +4458,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "poseidon-primitives"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e4aaeda7a092e21165cc5f0cbc738e72a46f31c03c3cbd87b71ceae9d2d93bc"
-dependencies = [
- "bitvec",
- "ff 0.13.1",
- "lazy_static",
- "log",
- "rand 0.8.6",
- "rand_xorshift 0.3.0",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5846,8 +5786,8 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "3.0.0"
-source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v3.0.0#69a3026ddc8d71bb67a692b69c326e2a8835d889"
+version = "4.0.1"
+source = "git+https://github.com/gosh-sh/ackinacki-kit.git?tag=v4.0.1#b0e4a042dbe262915aae0db3a3efff1146fd2bc5"
 dependencies = [
  "tokio",
 ]
@@ -5947,7 +5887,7 @@ name = "snark-verifier"
 version = "0.1.8"
 source = "git+https://github.com/gosh-sh/snark-verifier?rev=164bd42e300b382239e63b16532faca539d6b324#164bd42e300b382239e63b16532faca539d6b324"
 dependencies = [
- "halo2-base 0.4.1",
+ "halo2-base",
  "halo2-ecc",
  "hex",
  "itertools 0.11.0",
@@ -5967,7 +5907,7 @@ source = "git+https://github.com/gosh-sh/snark-verifier?rev=164bd42e300b382239e6
 dependencies = [
  "bincode",
  "getset",
- "halo2-base 0.4.1",
+ "halo2-base",
  "hex",
  "itertools 0.11.0",
  "lazy_static",
@@ -6996,23 +6936,6 @@ dependencies = [
 
 [[package]]
 name = "tvm_abi"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
-dependencies = [
- "anyhow",
- "chrono",
- "hex",
- "num-bigint 0.4.6",
- "num-traits",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tvm_block 3.0.2",
- "tvm_types 3.0.2",
-]
-
-[[package]]
-name = "tvm_abi"
 version = "3.0.4"
 source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
@@ -7024,27 +6947,8 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
- "tvm_block 3.0.4",
- "tvm_types 3.0.4",
-]
-
-[[package]]
-name = "tvm_block"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
-dependencies = [
- "anyhow",
- "base64",
- "crc",
- "ed25519",
- "ed25519-dalek",
- "hex",
- "log",
- "num",
- "num-traits",
- "sha2 0.10.9",
- "thiserror 2.0.18",
- "tvm_types 3.0.2",
+ "tvm_block",
+ "tvm_types",
 ]
 
 [[package]]
@@ -7063,13 +6967,13 @@ dependencies = [
  "num-traits",
  "sha2 0.10.9",
  "thiserror 2.0.18",
- "tvm_types 3.0.4",
+ "tvm_types",
 ]
 
 [[package]]
 name = "tvm_block_json"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
+version = "3.0.4"
+source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
  "anyhow",
  "hex",
@@ -7082,14 +6986,14 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "thiserror 2.0.18",
- "tvm_block 3.0.2",
- "tvm_types 3.0.2",
+ "tvm_block",
+ "tvm_types",
 ]
 
 [[package]]
 name = "tvm_client"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
+version = "3.0.4"
+source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
  "aes",
  "anyhow",
@@ -7134,15 +7038,15 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.28.0",
- "tvm_abi 3.0.2",
- "tvm_block 3.0.2",
+ "tvm_abi",
+ "tvm_block",
  "tvm_block_json",
  "tvm_client_processing",
- "tvm_executor 3.0.2",
+ "tvm_executor",
  "tvm_sdk",
  "tvm_struct",
- "tvm_types 3.0.2",
- "tvm_vm 3.0.2",
+ "tvm_types",
+ "tvm_vm",
  "url",
  "zeroize",
  "zstd",
@@ -7150,8 +7054,8 @@ dependencies = [
 
 [[package]]
 name = "tvm_client_processing"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
+version = "3.0.4"
+source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
  "api_derive",
  "api_info",
@@ -7164,24 +7068,8 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "tokio",
- "tvm_block 3.0.2",
- "tvm_types 3.0.2",
-]
-
-[[package]]
-name = "tvm_executor"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
-dependencies = [
- "anyhow",
- "lazy_static",
- "log",
- "semver",
- "thiserror 2.0.18",
- "tvm_block 3.0.2",
- "tvm_types 3.0.2",
- "tvm_vm 3.0.2",
- "wasmtime",
+ "tvm_block",
+ "tvm_types",
 ]
 
 [[package]]
@@ -7194,16 +7082,16 @@ dependencies = [
  "log",
  "semver",
  "thiserror 2.0.18",
- "tvm_block 3.0.4",
- "tvm_types 3.0.4",
- "tvm_vm 3.0.4",
+ "tvm_block",
+ "tvm_types",
+ "tvm_vm",
  "wasmtime",
 ]
 
 [[package]]
 name = "tvm_sdk"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
+version = "3.0.4"
+source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
  "anyhow",
  "api_derive",
@@ -7220,50 +7108,19 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
- "tvm_abi 3.0.2",
- "tvm_block 3.0.2",
- "tvm_types 3.0.2",
+ "tvm_abi",
+ "tvm_block",
+ "tvm_types",
 ]
 
 [[package]]
 name = "tvm_struct"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
+version = "3.0.4"
+source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.4.an#54b627cc8e3d2d361e99cb550ce40dcfeb4f4b5d"
 dependencies = [
  "thiserror 2.0.18",
- "tvm_block 3.0.2",
- "tvm_types 3.0.2",
-]
-
-[[package]]
-name = "tvm_types"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
-dependencies = [
- "aes",
- "anyhow",
- "base64",
- "blst",
- "crc",
- "ctr",
- "curve25519-dalek",
- "ed25519",
- "ed25519-dalek",
- "fastbloom",
- "hex",
- "lazy_static",
- "lockfree",
- "log",
- "num",
- "num-derive",
- "num-traits",
- "parking_lot",
- "rand 0.8.6",
- "serde",
- "sha2 0.10.9",
- "smallvec",
- "thiserror 2.0.18",
- "x25519-dalek",
+ "tvm_block",
+ "tvm_types",
 ]
 
 [[package]]
@@ -7295,67 +7152,6 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
  "x25519-dalek",
-]
-
-[[package]]
-name = "tvm_vm"
-version = "3.0.2"
-source = "git+https://github.com/tvmlabs/tvm-sdk.git?tag=v3.0.2.an#3b6a038067fa162c5ab11ef28851d2cc9655a705"
-dependencies = [
- "anyhow",
- "ark-bls12-381",
- "ark-bn254",
- "ark-crypto-primitives",
- "ark-ec",
- "ark-ff",
- "ark-groth16",
- "ark-r1cs-std",
- "ark-relations",
- "ark-serialize",
- "ark-snark",
- "ark-std 0.4.0",
- "base64ct",
- "bls12_381",
- "byte-slice-cast",
- "chrono",
- "derive_more 0.99.20",
- "diffy",
- "ed25519",
- "ed25519-dalek",
- "fastcrypto",
- "ff 0.13.1",
- "halo2-base 0.5.1",
- "hex",
- "itertools 0.13.0",
- "lazy_static",
- "log",
- "neptune",
- "num",
- "num-bigint 0.4.6",
- "num-traits",
- "once_cell",
- "pse-poseidon",
- "rand 0.8.6",
- "rand_chacha 0.2.2",
- "regex",
- "reqwest 0.13.4",
- "schemars",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "similar",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tvm_abi 3.0.2",
- "tvm_block 3.0.2",
- "tvm_types 3.0.2",
- "typenum",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
- "zstd",
 ]
 
 [[package]]
@@ -7387,7 +7183,7 @@ dependencies = [
  "fastcrypto",
  "ff 0.13.1",
  "gosh-zk-snark-halo2-utils",
- "halo2-base 0.4.1",
+ "halo2-base",
  "hex",
  "itertools 0.13.0",
  "lazy_static",
@@ -7411,9 +7207,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tvm_abi 3.0.4",
- "tvm_block 3.0.4",
- "tvm_types 3.0.4",
+ "tvm_abi",
+ "tvm_block",
+ "tvm_types",
  "typenum",
  "wasmtime",
  "wasmtime-wasi",
@@ -8785,7 +8581,7 @@ dependencies = [
  "array-init",
  "ethers-core",
  "getset",
- "halo2-base 0.4.1",
+ "halo2-base",
  "itertools 0.11.0",
  "lazy_static",
  "log",
