@@ -10,8 +10,8 @@ depends_on:
 
 variables:
   - &ansible_image "docker.gosh.sh/ansible-ubuntu:24-fix"
-  - &acki_branch "history_cursor"
-  - &allbin_image "docker.gosh.sh/ackinacki-all-bin:br_history_cursor"
+  - &acki_branch "dev"
+  - &allbin_image "docker.gosh.sh/ackinacki-all-bin:latest-dev"
   - &busybox_image "busybox:musl"
   - &tvm_cli_version "v3.0.4-rc.an"
   - &sold_version "gosh_0.79.4-rc"
