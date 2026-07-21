@@ -71,9 +71,12 @@ const CREATION_SHELL: u64 = 200_000_000_000;
 const SUPER_ROOT_ADDR: &str = "0:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c";
 
 /// Immutable deal config passed to the `TokenContract` constructor.
+///
+/// These are also the terms the TC posts to the book: `postSellOffer` on the
+/// note carries only `(flags, nonce)`, so an offer always rests at this
+/// `price_per_tick` for this `max_ticks`.
 pub struct TokenDeal {
     pub model_name: String,
-    pub tick_size: u128,
     pub price_per_tick: u128,
     pub max_ticks: u128,
 }
@@ -140,7 +143,6 @@ pub async fn deploy_token_contract(
             // to the name's preimage — otherwise the deploy reverts and the TC is
             // never funded.
             "modelHash": model_hash_dec(&deal.model_name),
-            "tickSize": deal.tick_size.to_string(),
             "pricePerTick": deal.price_per_tick.to_string(),
             "maxTicks": deal.max_ticks.to_string(),
             "sellerNote": seller_note_addr,

@@ -221,29 +221,17 @@ async fn setup_deal(
         nonce,
         TokenDeal {
             model_name: model_name.to_string(),
-            tick_size: 1,
             price_per_tick: PRICE_PER_TICK,
-            max_ticks: 8,
+            max_ticks: DEAL_TICKS,
         },
         keys.clone(),
     )
     .await
     .map_err(|e| format!("deploy TokenContract: {e:?}"))?;
 
-    dex.post_sell_offer(
-        &note.address,
-        ParamsOfPostSellOffer {
-            model_hash: model_hash.to_string(),
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: DEAL_TICKS,
-            token_contract: tc.clone(),
-            flags: 0,
-            nonce,
-        },
-        signer(),
-    )
-    .await
-    .map_err(|e| format!("postSellOffer: {e:?}"))?;
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+        .await
+        .map_err(|e| format!("postSellOffer: {e:?}"))?;
     wait_until(dex, ob, |s| s.order_count >= 1).await;
 
     dex.place_inference_buy(

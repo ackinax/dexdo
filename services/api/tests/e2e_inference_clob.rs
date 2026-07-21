@@ -117,12 +117,7 @@ async fn inference_partial_fill_leaves_remainder() {
         &note.owner_public_key_hex,
         &note.address,
         nonce,
-        TokenDeal {
-            model_name: model_name.clone(),
-            tick_size: 1,
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 4,
-        },
+        TokenDeal { model_name: model_name.clone(), price_per_tick: PRICE_PER_TICK, max_ticks: 2 },
         keys.clone(),
     )
     .await
@@ -130,20 +125,9 @@ async fn inference_partial_fill_leaves_remainder() {
     eprintln!("[e2e_clob] order_book={ob} token_contract={tc}");
 
     // 2-tick SELL offer rests.
-    dex.post_sell_offer(
-        &note.address,
-        ParamsOfPostSellOffer {
-            model_hash: model_hash.clone(),
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 2,
-            token_contract: tc.clone(),
-            flags: 0,
-            nonce,
-        },
-        signer(),
-    )
-    .await
-    .expect("postSellOffer");
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+        .await
+        .expect("postSellOffer");
     for _ in 0..POLL_TICKS {
         tokio::time::sleep(POLL_TICK).await;
         let Ok(stats) = dex.inference_get_stats(&ob).await else { continue };
@@ -306,31 +290,15 @@ async fn inference_match_emits_filled_event() {
         &note.owner_public_key_hex,
         &note.address,
         nonce,
-        TokenDeal {
-            model_name: model_name.clone(),
-            tick_size: 1,
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 4,
-        },
+        TokenDeal { model_name: model_name.clone(), price_per_tick: PRICE_PER_TICK, max_ticks: 2 },
         keys.clone(),
     )
     .await
     .expect("deploy TokenContract");
 
-    dex.post_sell_offer(
-        &note.address,
-        ParamsOfPostSellOffer {
-            model_hash: model_hash.clone(),
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 2,
-            token_contract: tc.clone(),
-            flags: 0,
-            nonce,
-        },
-        signer(),
-    )
-    .await
-    .expect("postSellOffer");
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+        .await
+        .expect("postSellOffer");
     for _ in 0..POLL_TICKS {
         tokio::time::sleep(POLL_TICK).await;
         let Ok(stats) = dex.inference_get_stats(&ob).await else { continue };

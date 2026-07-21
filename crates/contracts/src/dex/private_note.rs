@@ -433,10 +433,16 @@ pub struct ParamsOfOnBatchComplete {
 /// Parameters for the stream-lock callbacks `streamLock`, `streamUnlock`,
 /// `streamDisputeLock`, `streamDisputeUnlock`.
 ///
-/// `deal` is the streaming-deal (TokenContract) address; the contract requires
-/// `msg.sender == deal`, so these are normally only invoked by the deal itself.
+/// The deal is identified by the pair it is derived from rather than by its
+/// address: the note recomputes the canonical `TokenContract` address from
+/// `(seller_pubkey, nonce)` and requires `msg.sender` to equal it, so a foreign
+/// caller cannot lock the note by naming someone else's deal.
 pub struct ParamsOfStreamLock {
-    pub deal: String,
+    /// `uint256`, decimal or hex string — the seller note's owner pubkey the
+    /// deal address is derived from.
+    pub seller_pubkey: String,
+    /// Deal nonce the `TokenContract` address was computed from.
+    pub nonce: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -468,17 +474,16 @@ pub struct ParamsOfDeployInferenceOrderBook {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 /// Parameters for `PrivateNote.postSellOffer`.
+///
+/// The note no longer carries the offer terms: it derives the canonical
+/// `TokenContract` from `(ephemeralPubkey, nonce)` and calls `postFromNote` on
+/// it, and the TC posts to the book using its own constructor-pinned
+/// `pricePerTick` / `maxTicks` / `modelHash`. To change the terms, deploy a TC
+/// with different ones — they cannot be overridden per offer.
 pub struct ParamsOfPostSellOffer {
-    /// `uint256` model hash, decimal/hex string — identifies the book.
-    pub model_hash: String,
-    pub price_per_tick: u128,
-    pub max_ticks: u128,
-    pub token_contract: String,
+    /// Order flags (POST_ONLY / IOC / FOK / MARKET) forwarded to the book.
     pub flags: u8,
-    /// Deal nonce. The contract verifies `token_contract` is the canonical
-    /// TokenContract derived from the pinned code + the seller note's key and
-    /// this nonce (else the offer reverts with `ERR_BAD_TOKEN_CONTRACT`); it
-    /// must match the nonce the `token_contract` address was computed from.
+    /// Deal nonce the `TokenContract` address is derived from.
     pub nonce: u64,
 }
 
@@ -1187,8 +1192,9 @@ impl PrivateNote {
     // ─── Inference market: stream locks (spec §4.3) ───────────────────
     // Stream/dispute locks are set by a streaming-deal (TokenContract); while
     // any lock is held the note cannot withdraw / split / merge. The contract
-    // gates these on `msg.sender == deal`, so they are normally only invoked by
-    // the deal — exposed here for admin tools and tests.
+    // recomputes the canonical deal address from `(sellerPubkey, nonce)` and
+    // gates on `msg.sender` matching it, so these are normally only invoked by
+    // the deal itself — exposed here for admin tools and tests.
 
     /// Original contract method: `streamLock` (callback from a streaming deal).
     pub async fn stream_lock(
@@ -1289,6 +1295,10 @@ impl PrivateNote {
     /// # Post a SELL offer to an InferenceOrderBook
     ///
     /// Original contract method: `postSellOffer`
+    ///
+    /// Indirect: the note authorises its canonical `TokenContract` for `nonce`
+    /// (`postFromNote`) and that TC posts the offer on the book with its own
+    /// pinned terms. The TC must already be deployed, or the call is a no-op.
     ///
     /// Should be signed with PrivateNote owner keys.
     pub async fn post_sell_offer(
@@ -1554,14 +1564,7 @@ mod inference_abi_tests {
             abi_input_names("getInferenceOrderBookAddress")
         );
         assert_eq!(
-            keys(&ParamsOfPostSellOffer {
-                model_hash: "1".into(),
-                price_per_tick: 1,
-                max_ticks: 1,
-                token_contract: "0:1".into(),
-                flags: 0,
-                nonce: 0,
-            }),
+            keys(&ParamsOfPostSellOffer { flags: 0, nonce: 0 }),
             abi_input_names("postSellOffer")
         );
         assert_eq!(
@@ -1605,6 +1608,14 @@ mod inference_abi_tests {
             keys(&ParamsOfStreamDeal { token_contract: "0:1".into() }),
             abi_input_names("streamReclaim")
         );
-        assert_eq!(keys(&ParamsOfStreamLock { deal: "0:1".into() }), abi_input_names("streamLock"));
+        // All four lock callbacks share `ParamsOfStreamLock`; pin each so a
+        // divergence in any one of them cannot hide behind the others.
+        for func in ["streamLock", "streamUnlock", "streamDisputeLock", "streamDisputeUnlock"] {
+            assert_eq!(
+                keys(&ParamsOfStreamLock { seller_pubkey: "1".into(), nonce: 1 }),
+                abi_input_names(func),
+                "{func} inputs drifted from ParamsOfStreamLock"
+            );
+        }
     }
 }

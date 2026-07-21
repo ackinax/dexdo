@@ -194,6 +194,15 @@ fn token_contract_params_match_abi() {
         }),
         abi_input_names(TOKEN_CONTRACT_ABI, "fundFromOrderBook")
     );
+    // `fund` is argument-less (the buyer is bound beforehand via
+    // `authorizeDirectFund`, the deposit rides on the message value), so it has
+    // no `Params` struct. Pin the emptiness: if the contract grows inputs again,
+    // `TokenContract::fund` needs a struct and this fails instead of silently
+    // sending `{}`.
+    assert!(
+        abi_input_names(TOKEN_CONTRACT_ABI, "fund").is_empty(),
+        "TokenContract.fund gained inputs — give it a Params struct"
+    );
 }
 
 #[test]
@@ -259,10 +268,10 @@ fn inference_order_book_params_match_abi() {
         serialized_keys(&ParamsOfPlaceSellOffer {
             price_per_tick: 1,
             max_ticks: 1,
-            token_contract: SAMPLE_ADDRESS.into(),
             flags: 0,
             seller_pubkey: "1".into(),
             nonce: 1,
+            owner_note: SAMPLE_ADDRESS.into(),
         }),
         abi_input_names(INFERENCE_ORDER_BOOK_ABI, "placeSellOffer")
     );

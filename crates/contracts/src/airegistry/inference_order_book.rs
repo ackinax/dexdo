@@ -77,14 +77,18 @@ impl AsyncGuardedMut<Account> for InferenceOrderBook {
 pub struct ParamsOfPlaceSellOffer {
     pub price_per_tick: u128,
     pub max_ticks: u128,
-    pub token_contract: String,
     pub flags: u8,
     /// `uint256`, decimal or hex string — the seller note's owner pubkey. The
-    /// book recomputes the canonical TokenContract address from `sellerPubkey`
-    /// + `nonce` and rejects offers whose `tokenContract` does not match.
+    /// book recomputes the canonical TokenContract address from this pubkey and
+    /// `nonce`, then requires the caller to be it, so the deal address is never
+    /// taken from the message.
     pub seller_pubkey: String,
-    /// Deal nonce — must match the nonce `token_contract` was derived from.
+    /// Deal nonce — must match the nonce the calling TokenContract was derived
+    /// from.
     pub nonce: u64,
+    /// The seller's note, recorded as the offer's owner so a fill can settle
+    /// back to it.
+    pub owner_note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

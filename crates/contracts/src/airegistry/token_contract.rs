@@ -72,14 +72,6 @@ impl AsyncGuardedMut<Account> for TokenContract {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-/// Parameters for `TokenContract.fund`.
-pub struct ParamsOfFund {
-    /// `uint256`, decimal or hex string.
-    pub buyer_pubkey: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 /// Parameters for `TokenContract.fundFromOrderBook` (callback from the order
 /// book on a match; sender must be the order book).
 pub struct ParamsOfFundFromOrderBook {
@@ -262,13 +254,11 @@ impl TokenContract {
     /// # Direct fund (buyer pays the deposit straight to the deal)
     ///
     /// Original contract method: `fund`
-    pub async fn fund(
-        &self,
-        params: ParamsOfFund,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set =
-            CallSet { function_name: "fund".to_string(), header: None, input: Some(json!(params)) };
+    ///
+    /// Takes no arguments: the buyer must first be bound to the deal via
+    /// `authorizeDirectFund`, and the deposit rides on the message value.
+    pub async fn fund(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
+        let call_set = CallSet { function_name: "fund".to_string(), header: None, input: None };
         self.send_message(Some(call_set), None, signer).await
     }
 

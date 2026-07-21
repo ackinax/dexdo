@@ -111,9 +111,8 @@ async fn inference_stream_open_advance_stop_against_shellnet() {
         nonce,
         TokenDeal {
             model_name: model_name.clone(),
-            tick_size: 1,
             price_per_tick: PRICE_PER_TICK,
-            max_ticks: 8,
+            max_ticks: DEAL_TICKS,
         },
         keys.clone(),
     )
@@ -122,20 +121,9 @@ async fn inference_stream_open_advance_stop_against_shellnet() {
     eprintln!("[e2e_stream] order_book={ob} token_contract={tc}");
 
     // 3. Offer ↔ buy ⇒ handover funds the TokenContract.
-    dex.post_sell_offer(
-        &note.address,
-        ParamsOfPostSellOffer {
-            model_hash: model_hash.clone(),
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: DEAL_TICKS,
-            token_contract: tc.clone(),
-            flags: 0,
-            nonce,
-        },
-        signer(),
-    )
-    .await
-    .expect("postSellOffer accepted");
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+        .await
+        .expect("postSellOffer accepted");
     wait_until(&dex, &ob, |s| s.order_count >= 1, "sell offer to rest").await;
 
     dex.place_inference_buy(

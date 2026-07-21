@@ -111,9 +111,8 @@ async fn inference_offer_matches_buy_and_funds_token_contract() {
         nonce,
         TokenDeal {
             model_name: model_name.clone(),
-            tick_size: 1,
             price_per_tick: PRICE_PER_TICK,
-            max_ticks: 5,
+            max_ticks: OFFER_TICKS,
         },
         keys.clone(),
     )
@@ -122,20 +121,9 @@ async fn inference_offer_matches_buy_and_funds_token_contract() {
     eprintln!("[e2e_match] token_contract={tc}");
 
     // 3. Seller posts a SELL offer backed by the TokenContract.
-    dex.post_sell_offer(
-        &note.address,
-        ParamsOfPostSellOffer {
-            model_hash: model_hash.clone(),
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: OFFER_TICKS,
-            token_contract: tc.clone(),
-            flags: 0,
-            nonce,
-        },
-        signer(),
-    )
-    .await
-    .expect("postSellOffer accepted");
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+        .await
+        .expect("postSellOffer accepted");
 
     // Wait until the offer rests in the book.
     let mut offer_rested = false;
