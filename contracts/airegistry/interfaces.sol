@@ -13,8 +13,8 @@ interface IRootModelRegistry {
 ///         notes during a dispute (spec §4.3). Implemented in PrivateNote
 ///         (phase 3); calls are fire-and-forget (flag:1, bounce:false).
 interface IStreamNote {
-    function streamLock(address stream) external;
-    function streamUnlock(address stream) external;
-    function streamDisputeLock(address stream) external;
-    function streamDisputeUnlock(address stream) external;
+    function streamLock(uint256 sellerPubkey, uint64 nonce) external;
+    function streamUnlock(uint256 sellerPubkey, uint64 nonce) external;
+    function streamDisputeLock(uint256 sellerPubkey, uint64 nonce) external;
+    function streamDisputeUnlock(uint256 sellerPubkey, uint64 nonce) external;
 }

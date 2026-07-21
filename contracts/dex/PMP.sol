@@ -13,7 +13,7 @@ import "./libraries/DexLib.sol";
 contract PMP is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.27";
 
     /// @notice PMP name (static, unique identifier)
     string _name;
@@ -387,6 +387,14 @@ contract PMP is Modifiers {
             );
         }
 
+        // Return the oracle fee to the depositor (the note that funded the event),
+        // not the protocol: the event was rejected, no oracle service was rendered.
+        // `msg.currencies` is exactly the fee OEL forwarded back (SHELL only); the
+        // PMP's remaining balance (initial-stake ECC) still goes to RootPN below.
+        if (uint128(msg.currencies[CURRENCIES_ID_SHELL]) > 0) {
+            _deployer.transfer({value: 0.1 vmshell, flag: 1, bounce: false, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID});
+        }
+
         selfdestruct(ROOT_PN_ADDRESS);
     }
 
@@ -442,6 +450,12 @@ contract PMP is Modifiers {
                 PrivateNote(_deployer).onInitialStakesFailed{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(
                     _eventId, _oracleListHash, _tokenType, refundTotal
                 );
+                // This OracleEventList (msg.sender) counted the event in confirmEvent; ask it to
+                // cancel so its per-event count is decremented before this PMP self-destructs.
+                // The oracle fee stays with the oracle here -- only the count is corrected.
+                OracleEventList(msg.sender).cancelEvent{
+                    value: 0.1 vmshell, flag: 1, dest_dapp_id: ORACLE_DAPP_ID
+                }(_eventId, _oracleListHash, _tokenType);
                 selfdestruct(ROOT_PN_ADDRESS);
                 return;
             }
@@ -1113,9 +1127,9 @@ contract PMP is Modifiers {
 
             // Coupon coefficient (capped at COUPON_MAX_PAYOUT_MULTIPLIER).
             // Exception: when ONLY coupon stakes won (no clean/debt winners),
-            // the cap is lifted so the surplus is not stranded in the contract
-            // and eventually swept to the creator. Coupon winners absorb the
-            // whole profitBudget instead.
+            // the cap is lifted so the surplus flows to the coupon winners (who
+            // absorb the whole profitBudget) rather than remaining in the contract
+            // to be swept to the creator.
             uint128 profitPerUnit = uint128(
                 (uint256(profitBudget) * FULL_PERCENT) / totalWinMass
             );

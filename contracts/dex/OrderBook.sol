@@ -17,7 +17,7 @@ import "./libraries/DexLib.sol";
 contract OrderBook is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.27";
 
     /// @notice Event identifier associated with this order book.
     uint256 static _eventId;
@@ -368,7 +368,9 @@ contract OrderBook is Modifiers {
             bool opIsFok      = (op.flags & FLAG_FOK)       != 0;
 
             if (op.amount == 0) valid = false;
-            else if (opIsPostOnly && (opIsMarket || opIsIoc || opIsFok)) valid = false;
+            // A POST_ONLY order only ever rests, so a taker-side minAmount is meaningless on it —
+            // reject it here rather than let it pass validation and be dropped silently in _doPlace.
+            else if (opIsPostOnly && (opIsMarket || opIsIoc || opIsFok || op.minAmount != 0)) valid = false;
             else if (opIsIoc && opIsFok) valid = false;
             else if (opIsMarket && (opIsIoc || opIsFok)) valid = false;
             else if (opIsMarket) {
@@ -1003,7 +1005,7 @@ contract OrderBook is Modifiers {
         // continuations, no other place/cancel runs in between) guarantees that
         // the available liquidity does not shrink before we consume it. Levels
         // are now keyed by epochId, so foreign-epoch orders cannot inflate
-        // totalAmount nor force phantom-skip walks.
+        // totalAmount nor force extra skip walks.
 
         if (remaining > 0) {
             if (isIoc || isFok || isMarket) {

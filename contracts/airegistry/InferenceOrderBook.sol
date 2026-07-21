@@ -19,6 +19,9 @@ import "./RootModel.sol";
 ///         SHELL and binds the buyer note (spec §2.3).
 interface ITokenContractDeal {
     function fundFromOrderBook(address buyerNote, uint256 buyerPubkey) external;
+    // Called when the TC's resting sell offer is cancelled (removed WITHOUT a
+    // fill) so the TC can clear its `_offerPosted` latch and re-list.
+    function onSellClosed() external;
 }
 
 /// @notice Async pull sink (spec §6.2): the weekly median is handed back here.
@@ -28,7 +31,7 @@ interface IWeeklyMedianSink {
 
 /// @notice Owner-facing confirmation mirrors pushed into a PrivateNote so the order owner can read
 ///         just its own note's ext-out and learn the deal `tokenContract`. The note authenticates the
-///         caller as the canonical book for `_modelHash` (pinned IOB code), so the TC cannot be spoofed.
+///         caller as the canonical book for `_modelHash` (pinned IOB code).
 interface IPrivateNote {
     function onInferencePlaced(uint256 modelHash, address tokenContract, uint128 orderId, bool isBuy, uint256 price, uint128 ticks) external;
     function onInferenceFilled(uint256 modelHash, address tokenContract, uint128 orderId, uint128 ticks, uint256 clearingPrice, bool isBuy) external;
@@ -53,37 +56,38 @@ interface IPrivateNote {
 ///         quote/base + collateral, event-resolution shutdown, and PN callbacks
 ///         (inference order entry is fire-and-forget; the note tracks via getters).
 contract InferenceOrderBook is AiRegistryModifiers {
-    string constant version = "4.0.16";
+    string constant version = "4.0.27";
 
     // ⚠ Re-pin whenever dex/PrivateNote is recompiled (note↔OB layout coupling:
     //   the note bakes this book's state layout via `new InferenceOrderBook`, so any
     //   OB layout change forces a note rebuild → new note hash → re-pin → OB rebuild).
-    uint256 constant NOTE_CODE_HASH  = 0x210add37d09ea16a89db9eccd3e3ef56b48a7b69f57006c991e4329fa192f009;
-    uint16  constant NOTE_CODE_DEPTH = 18;
+    uint256 constant NOTE_CODE_HASH  = 0x5f78299c6438d3e156042ef1ed9fcd70064a3f34221b2c051c99567c9f21ef2e;
+    uint16  constant NOTE_CODE_DEPTH = 19;
 
     // Canonical inference TokenContract (deal contract) code. placeSellOffer verifies
     // the sell offer's `tokenContract` derives from this pinned code + the seller's
     // statics — else a fill would route the BUYER's SHELL to a fake (the IOB is the
     // contract that forwards SHELL on a fill, so the check must live HERE, not only in
     // the note: placeSellOffer is public and a direct call would bypass a note check).
-    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xddc8f81a2a5c3b86c6b7ae221e7df39aa36f23bb3ee8fd3c4746a34553ec78f4;
-    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 11;
+    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xa2c32147ed9bedec588e81ad2f55300e0640635428254b710964f38331c84f45;
+    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 10;
 
     // Canonical RootModel code. The seller's per-deal TokenContract is bound to its RootModel
     // (its `_rootModelAddress` static is the seller's RootModel, NOT address(0)). To verify a
     // TokenContract the IOB first recomputes the seller's RootModel address from this pinned code
     // hash + the canonical SuperRoot, then derives the TC address from it (see _tokenContractAddr).
     // Re-pin whenever airegistry/RootModel is recompiled.
-    uint256 constant ROOT_MODEL_CODE_HASH  = 0x1974f43fb11d1ef35516ee8a0c858baf7bc429e929d863603d65f3e627018732;
+    uint256 constant ROOT_MODEL_CODE_HASH  = 0x0a6fe90e89faa99bdd4286965ec75e5085d7c0f365b8c2e3e1467cf584d359bc;
     uint16  constant ROOT_MODEL_CODE_DEPTH = 8;
 
     // Canonical AI SuperRoot account id (workchain 0). Every RootModel registers under it via its
     // `_superRootAddress` static, so it is the anchor for the RootModel-address derivation. Must
     // match the live SuperRoot the sellers' RootModels were deployed under; re-pin if the SuperRoot
     // is redeployed at a different address.
-    // LOCAL/MAINNET build: FIXED SuperRoot at the vanity 0:0c0c… address — the zerostate force-places
-    // the SuperRoot here (removed from PremineAddresses), and the address is stable across contract
-    // changes. (SHELLNET uses a code-derived SuperRoot instead — see dexdo-specs/shellnet-update.md.)
+    // FIXED SuperRoot at the vanity 0:0c0c… address on LOCAL, SHELLNET and MAINNET — the zerostate
+    // force-places the SuperRoot here (removed from PremineAddresses), and the address is stable
+    // across contract changes and versions. shellnet == local, no per-version / code-derived
+    // rotation. (See dexdo-specs/shellnet-update.md.)
     uint256 constant SUPER_ROOT_ADDR = 0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c;
 
     // Local errors (NOT in shared AiRegistryErrors — avoids rippling RootModel/TC/SuperRoot pins).
@@ -159,6 +163,10 @@ contract InferenceOrderBook is AiRegistryModifiers {
     uint128 _nextOrderId;
     uint128 _orderCount;
 
+    // One resting SELL per deal TokenContract is now enforced by the TC itself
+    // (`TokenContract._offerPosted`), because the TC posts its own offer. A TC is a
+    // single one-shot deal, so it posts at most once (re-listing needs a new TC).
+
     struct PriceLevel { uint128 firstOrderId; uint128 lastOrderId; uint128 totalAmount; }
     mapping(bool => mapping(uint256 => PriceLevel)) _levels;   // isBuy → price → level
 
@@ -182,10 +190,11 @@ contract InferenceOrderBook is AiRegistryModifiers {
         address tokenContract;  // SELL TC
         uint64  deadline;
         uint128 targetOrderId;  // CANCEL target
-        // Match continuation cursor (BUY taker crossing > one tx of liquidity):
+        // Match continuation cursor (taker crossing > one tx of liquidity):
         uint128 contOrderId;    // assigned on first run; 0 = not started
         uint128 contRemaining;
         uint128 contLeftover;
+        uint128 contScanOrder;  // resting maker to resume the scan from (0 = from best)
     }
     mapping(uint8 => QueueEntry) _queue;
     uint8 _queueHead;
@@ -362,6 +371,10 @@ contract InferenceOrderBook is AiRegistryModifiers {
         // Idempotency guard: a removed/empty slot has amount 0. Prevents a double
         // _removeFromBook from underflowing _orderCount below (see OrderBook).
         if (o.amount == 0) { return; }
+        // Drop any §8 subscription metadata for this order on EVERY removal path — fill, expire, AND
+        // cancel/cancelAll — so `getSubscription(orderId).exists` never outlives the resting order.
+        // No-op for non-sub orders.
+        delete _subs[orderId];
         uint128 prevP = o.prevAtPrice;
         uint128 nextP = o.nextAtPrice;
         PriceLevel level = _levels[o.isBuy][o.price];
@@ -399,7 +412,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
 
         // Owner-facing confirmation mirrors: push the deal `sellerTC` into each side's note so the
         // owner reads only its note's ext-out. Each side gets ITS own order id (maker/taker depends
-        // on which side is the taker). bounce:false — a mirror failure must never strand the fill.
+        // on which side is the taker). bounce:false — the mirror is best-effort and never blocks the fill.
         uint128 buyerOrderId  = takerIsBuy ? takerId : makerId;
         uint128 sellerOrderId = takerIsBuy ? makerId : takerId;
         IPrivateNote(buyerNote).onInferenceFilled{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
@@ -409,20 +422,41 @@ contract InferenceOrderBook is AiRegistryModifiers {
         return cost;
     }
 
-    function _enoughLiquidity(bool takerIsBuy, uint256 takerPrice, bool isMarket, uint128 need) private view returns (bool) {
+    /// @notice FOK pre-check: enough crossing liquidity (and, for a taker BUY, enough
+    ///         escrow to pay for it) to fully fill `need`. The escrow bound makes a
+    ///         FLAG_MARKET|FLAG_FOK buy check its budget, not just raw volume, so it fills
+    ///         all-or-nothing.
+    /// @dev    LIMITATION: this checks volume/cost by price level and does NOT simulate the
+    ///         per-order min-fill=2 rule. So a FOK can pass here yet fill short in `_match`
+    ///         when the only path leaves a sub-2 remainder: (i) a taker BUY with an odd
+    ///         `need` against 2-tick lots; (ii) a taker SELL, whose one-maker-stop caps it at
+    ///         a single bid regardless of summed volume. In both, funds stay safe — the
+    ///         filled part funds real deals and the sub-2 shard is refunded — only the FOK
+    ///         all-or-nothing atomicity is approximate. A precise check needs a per-order
+    ///         match simulation.
+    function _enoughLiquidity(bool takerIsBuy, uint256 takerPrice, bool isMarket, uint128 need, uint128 escrow) private view returns (bool) {
         uint128 accum = 0;
+        uint256 cost = 0;
         uint8 walked = 0;
         optional(uint256, PriceLevel) it = _bestOpposite(takerIsBuy);
         while (it.hasValue()) {
             (uint256 lp, PriceLevel lvl) = it.get();
             if (!_crosses(takerIsBuy, takerPrice, isMarket, lp)) { break; }
-            accum += lvl.totalAmount;
-            if (accum >= need) { return true; }
+            uint128 take = lvl.totalAmount;
+            if (accum + take > need) { take = need - accum; }
+            if (takerIsBuy) { cost += uint256(take) * _unit(lp); }   // price each crossing tick
+            accum += take;
+            if (accum >= need) { break; }
             walked++;
             if (walked >= MAX_PRECHECK_LEVELS) { break; }
             it = _nextOpposite(takerIsBuy, lp);
         }
-        return accum >= need;
+        if (accum < need) { return false; }
+        // A taker BUY must AFFORD the fill, not just find the volume: the running cost of
+        // `need` ticks must fit the escrow, so a FLAG_MARKET|FLAG_FOK buy (no price cap)
+        // fills all-or-nothing. (SELL takers carry no escrow → skip.)
+        if (takerIsBuy && cost > uint256(escrow)) { return false; }
+        return true;
     }
 
     // ========================================================
@@ -433,24 +467,47 @@ contract InferenceOrderBook is AiRegistryModifiers {
     ///         per-tx cap with crossing liquidity left → caller continues).
     function _match(
         uint128 takerId, bool takerIsBuy, uint256 takerPrice, bool isMarket,
-        address takerNote, address takerTC, uint256 takerBuyerPubkey, uint128 amount, uint128 buyEscrow
-    ) private returns (uint128 remaining, uint128 leftoverEscrow, bool capped) {
+        address takerNote, address takerTC, uint256 takerBuyerPubkey, uint128 amount, uint128 buyEscrow,
+        uint128 resumeFrom
+    ) private returns (uint128 remaining, uint128 leftoverEscrow, bool capped, uint128 nextResume) {
         remaining = amount;
         leftoverEscrow = buyEscrow;
         capped = false;
+        nextResume = 0;
         uint8 matches = 0;
 
-        optional(uint256, PriceLevel) it = _bestOpposite(takerIsBuy);
+        // Resume the scan from `resumeFrom` — a maker skipped on a prior tx — so a taker
+        // crossing many un-fillable makers advances instead of re-scanning the same head
+        // each continuation. The book is frozen while a continuation holds the queue head,
+        // so the saved position stays valid; if that order was removed since, fall back to
+        // the best level.
+        uint256 startLevel = 0;
+        uint128 startOrder = 0;
+        if (resumeFrom != 0 && _orders[resumeFrom].amount != 0 && _orders[resumeFrom].isBuy != takerIsBuy) {
+            startLevel = _orders[resumeFrom].price;
+            startOrder = resumeFrom;
+        }
+        optional(uint256, PriceLevel) it;
+        if (startOrder != 0) { it.set(startLevel, _levels[!takerIsBuy][startLevel]); }
+        else { it = _bestOpposite(takerIsBuy); }
         while (it.hasValue() && remaining > 0) {
             (uint256 lp, ) = it.get();
             if (!_crosses(takerIsBuy, takerPrice, isMarket, lp)) { break; }
 
-            uint128 cur = _levels[!takerIsBuy][lp].firstOrderId;
+            uint128 cur = (lp == startLevel && startOrder != 0) ? startOrder : _levels[!takerIsBuy][lp].firstOrderId;
+            startOrder = 0;   // the resume position applies only to the first scanned level
             while (cur != 0 && remaining > 0) {
-                if (matches >= MAX_MATCHES_PER_CALL) { return (remaining, leftoverEscrow, true); }
+                if (matches >= MAX_MATCHES_PER_CALL) { return (remaining, leftoverEscrow, true, cur); }
                 Order mk = _orders[cur];
                 uint128 nextOrd = mk.nextAtPrice;
-                uint256 clearing = lp;
+                // Clearing = the SELLER's ask, both directions (Variant 2):
+                //  - taker BUY: lp = the maker SELL's ask (already the seller's price);
+                //  - taker SELL: takerPrice = the taker SELL's ask (_pricePerTick), NOT the
+                //    maker BID's lp. This caps the fund at maxTicks*unit(ask) so the TC is
+                //    never over-funded; the bid-ask spread stays in the maker buyer's escrow
+                //    and refunds via the residual path. SELLs are limit-only (no market), so
+                //    takerPrice > 0 here.
+                uint256 clearing = takerIsBuy ? lp : takerPrice;
 
                 // §8 subscription maker (resting buy): roll cycles + cap by cycle budget.
                 bool makerSub = (!takerIsBuy) && _subs[cur].exists;
@@ -462,10 +519,10 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 }
 
                 // GTD limit BUY resting past its deadline: refund the buyer's escrow and remove it
-                // before it can settle as live liquidity (P1). Subscriptions roll/expire via _subTouch
-                // above; a plain GTD bid had no match-time deadline check, so the deadline field was a
-                // no-op for resting orders. Skip taker BUY (mk = a SELL offer; deadline only on buys).
-                if (!takerIsBuy && !makerSub && mk.deadline != 0 && block.timestamp >= mk.deadline) {
+                // before it can settle as live liquidity. Subscriptions roll/expire via _subTouch
+                // above; a plain GTD bid enforces its deadline here at match time. Skip taker BUY
+                // (mk = a SELL offer; deadline only on buys).
+                if (!takerIsBuy && _isExpiredGtdBid(mk.deadline, makerSub)) {
                     _refundAndRemove(cur);
                     cur = nextOrd;
                     continue;
@@ -489,9 +546,24 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 }
                 uint128 afford = unit > 0 ? uint128(uint256(budget) / unit) : trade;
                 if (afford < trade) { trade = afford; }
-                if (trade == 0) {
-                    if (takerIsBuy) { return (remaining, leftoverEscrow, false); }
-                    if (makerSub) { cur = nextOrd; continue; }   // cycle budget spent; keep for next cycle
+                // Min-fill = 2 ticks: a deal needs probe + >=1 stream tick, and
+                // fundFromOrderBook rejects a sub-2 fund. A 0/1-tick fill is not a settleable
+                // deal. trade==0 is un-tradeable; trade==1 is a sub-2 dust remainder.
+                if (trade < 2) {
+                    // Taker BUY can't take >=2 from the best SELL (remaining<2, or escrow
+                    // affords <2 and pricier levels afford even less) -> stop; _finalizeTaker
+                    // refunds the sub-2 remainder rather than resting it as dust.
+                    if (takerIsBuy) { return (remaining, leftoverEscrow, false, 0); }
+                    // Count the skip toward MAX_MATCHES_PER_CALL so a taker-SELL scans a
+                    // bounded number of levels per tx. On the cap it returns `capped` and
+                    // resumes; the removals below shrink the book so the resume makes progress
+                    // (no re-scan of the same dust).
+                    matches++;
+                    if (makerSub) { cur = nextOrd; continue; }   // subscription rolls to next cycle
+                    // Plain bid offering < 2 ticks (0 = un-tradeable, or a 1-tick dust remainder
+                    // left by a partial fill): refund the owner IN FULL and remove it. Removing —
+                    // rather than skipping — keeps the scan bounded and stops dust from
+                    // accumulating in the book.
                     _refundAndRemove(cur);
                     cur = nextOrd;
                     continue;
@@ -515,13 +587,13 @@ contract InferenceOrderBook is AiRegistryModifiers {
                     _removeFromBook(cur);                       // maker SELL: no buyer escrow to return
                 } else if (mk.amount == trade) {
                     // Fully-filled maker BUY: the residual escrow (over-fund + clearing-remainder
-                    // = mk.escrow - cost, set above) must NOT strand (#116).
+                    // = mk.escrow - cost, set above) is returned to the buyer.
                     if (makerSub) {
-                        // §8.3/§8.4 (#116-F2): an early full-fill forfeits ONLY the CURRENT cycle's own
+                        // §8.3/§8.4: an early full-fill forfeits ONLY the CURRENT cycle's own
                         // unspent (cycleBudget - cycleSpent) to that cycle's sellers (claimForfeit); the
-                        // FUTURE cycles' budget (weeks not yet served) refunds to the BUYER — never to the
-                        // current cycle's sellers, else a low-price seller filling cycle 0 would capture
-                        // weeks 2-4. Read escrow/note/sub before _removeFromBook deletes the order.
+                        // FUTURE cycles' budget (weeks not yet served) refunds to the BUYER, so each
+                        // cycle's sellers earn only from the cycle they served. Read escrow/note/sub
+                        // before _removeFromBook deletes the order.
                         uint128 resid = _orders[cur].escrow;
                         address bnote = _orders[cur].note;
                         Sub s = _subs[cur];
@@ -531,18 +603,23 @@ contract InferenceOrderBook is AiRegistryModifiers {
                             uint128 refundFuture = resid - cycUnspent;
                             _orders[cur].escrow = 0;
                             if (cycUnspent > 0) {
-                                _forfeitPool[cur][s.curCycle] += cycUnspent;
-                                emit InferenceCycleForfeited{dest: address.makeAddrExtern(CycleForfeitedEmit, bitCntAddress)}(cur, s.curCycle, cycUnspent, _cycleFundedTicks[cur][s.curCycle]);
+                                if (_cycleFundedTicks[cur][s.curCycle] == 0) {
+                                    // No seller served this cycle, so a forfeit pool would be
+                                    // unclaimable — return this cycle's unspent to the buyer instead.
+                                    refundFuture += cycUnspent;
+                                } else {
+                                    _forfeitPool[cur][s.curCycle] += cycUnspent;
+                                    emit InferenceCycleForfeited{dest: address.makeAddrExtern(CycleForfeitedEmit, bitCntAddress)}(cur, s.curCycle, cycUnspent, _cycleFundedTicks[cur][s.curCycle]);
+                                }
                             }
                             if (refundFuture > 0) {
                                 _payShell(bnote, refundFuture);
                                 emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(bnote, refundFuture);
                             }
                         }
-                        _removeFromBook(cur);
-                        delete _subs[cur];
+                        _removeFromBook(cur);   // _subs[cur] dropped inside _removeFromBook
                     } else {
-                        _refundAndRemove(cur);                  // limit BUY: residual escrow back to the buyer (#116)
+                        _refundAndRemove(cur);                  // limit BUY: residual escrow back to the buyer
                     }
                 } else {
                     _orders[cur].amount = mk.amount - trade;
@@ -558,7 +635,15 @@ contract InferenceOrderBook is AiRegistryModifiers {
             }
             it = _nextOpposite(takerIsBuy, lp);
         }
-        return (remaining, leftoverEscrow, false);
+        return (remaining, leftoverEscrow, false, 0);
+    }
+
+    /// @notice A resting order is an expired plain GTD bid when it is not a
+    ///         subscription and its non-zero deadline has passed. Subscriptions
+    ///         roll/expire via `_subTouch`, so they are excluded. Single source
+    ///         of the expiry rule shared by the match loop and the pre-check purge.
+    function _isExpiredGtdBid(uint64 deadline, bool isSub) private view returns (bool) {
+        return !isSub && deadline != 0 && block.timestamp >= deadline;
     }
 
     function _refundAndRemove(uint128 orderId) private {
@@ -568,6 +653,38 @@ contract InferenceOrderBook is AiRegistryModifiers {
         if (refund > 0) { _payShell(o.note, refund); emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(o.note, refund); }
     }
 
+    /// @notice Refund + remove expired GTD BUYs a SELL taker at `takerPrice` crosses, mirroring the
+    ///         match-time expiry sweep (§ `_match` deadline branch) so POST_ONLY/FOK prechecks see
+    ///         only live liquidity. Subscriptions roll/expire via `_subTouch`, so they are skipped.
+    ///         Bounded by `MAX_PRECHECK_LEVELS`.
+    function _purgeExpiredBids(uint256 takerPrice, bool isMarket) private {
+        optional(uint256, PriceLevel) it = _bestOpposite(false);   // best resting BUY
+        uint8 walked = 0;
+        uint8 purged = 0;
+        while (it.hasValue()) {
+            (uint256 lp, ) = it.get();
+            if (!_crosses(false, takerPrice, isMarket, lp)) { break; }
+            optional(uint256, PriceLevel) nxt = _nextOpposite(false, lp);   // capture before mutation
+            uint128 cur = _levels[true][lp].firstOrderId;
+            while (cur != 0) {
+                uint128 nextP = _orders[cur].nextAtPrice;
+                if (_isExpiredGtdBid(_orders[cur].deadline, _subs[cur].exists)) {
+                    _refundAndRemove(cur);
+                    // Per-call cap: each purge is a refund + emit (an output action), so a
+                    // single SELL placement purges a bounded number of expired bids. Any
+                    // leftover expired bids are purged on a later placement or lazily by the
+                    // match loop's own deadline check.
+                    purged++;
+                    if (purged >= MAX_MATCHES_PER_CALL) { return; }
+                }
+                cur = nextP;
+            }
+            walked++;
+            if (walked >= MAX_PRECHECK_LEVELS) { break; }
+            it = nxt;
+        }
+    }
+
     /// @notice Rest leftover (limit) or refund (taker-only / market) after a match completes.
     function _finalizeTaker(
         uint128 orderId, uint256 buyerPubkey, bool isBuy, uint256 storedPrice, address note, address tc,
@@ -575,7 +692,10 @@ contract InferenceOrderBook is AiRegistryModifiers {
     ) private {
         bool takerOnly = (flags & FLAG_MARKET) != 0 || (flags & (FLAG_IOC | FLAG_FOK)) != 0;
         if (isBuy) {
-            if (remaining == 0 || takerOnly) {
+            // remaining < 2: a 1-tick remainder can never fund a deal (min-fill skips it),
+            // so resting it would only leave unfillable dust. Refund the leftover escrow
+            // instead of inserting it — same as the fully-filled/taker-only case.
+            if (remaining < 2 || takerOnly) {
                 if (leftover > 0) { _payShell(note, leftover); emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(note, leftover); }
                 return;
             }
@@ -595,6 +715,13 @@ contract InferenceOrderBook is AiRegistryModifiers {
                     flags: flags, isBuy: false,
                     nextAtPrice: 0, prevAtPrice: 0, nextInOwner: 0, prevInOwner: 0
                 }));
+            } else if (remaining > 0 && tc != address(0)) {
+                // Taker-only SELL (IOC/FOK) that did NOT rest and was NOT funded:
+                // remaining>0 means it never matched a buyer — a filled taker-SELL leaves
+                // remaining==0 via one-maker-stop, and its latch was cleared in _recordFunding.
+                // This offer never rests and gets no other callback, so notify the TC here
+                // (onSellClosed frees the `_offerPosted` latch) to keep it usable.
+                ITokenContractDeal(tc).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();
             }
         }
     }
@@ -621,7 +748,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         _queue[slot] = QueueEntry({
             entryType: QENTRY_PLACE, owner: owner, buyerPubkey: buyerPubkey, isBuy: isBuy, flags: flags, price: price,
             amount: amount, escrow: escrow, tokenContract: tc, deadline: deadline,
-            targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0
+            targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
         });
     }
 
@@ -631,7 +758,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         _queue[slot] = QueueEntry({
             entryType: QENTRY_CANCEL, owner: owner, buyerPubkey: 0, isBuy: false, flags: 0, price: 0,
             amount: 0, escrow: 0, tokenContract: address(0), deadline: 0,
-            targetOrderId: targetOrderId, contOrderId: 0, contRemaining: 0, contLeftover: 0
+            targetOrderId: targetOrderId, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
         });
     }
 
@@ -641,7 +768,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         _queue[slot] = QueueEntry({
             entryType: QENTRY_CANCEL_ALL, owner: owner, buyerPubkey: 0, isBuy: false, flags: 0, price: 0,
             amount: 0, escrow: 0, tokenContract: address(0), deadline: 0,
-            targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0
+            targetOrderId: 0, contOrderId: 0, contRemaining: 0, contLeftover: 0, contScanOrder: 0
         });
     }
 
@@ -684,11 +811,15 @@ contract InferenceOrderBook is AiRegistryModifiers {
         bool isMarket = (e.flags & FLAG_MARKET) != 0;
 
         if (firstRun) {
-            emit InferenceOrderPlaced{dest: address.makeAddrExtern(OfferPlacedEmit, bitCntAddress)}(
-                orderId, e.isBuy, e.price, e.amount, e.owner, e.tokenContract, e.deadline);
-            // Owner mirror: confirm the placement into the owner's note (tokenContract = SELL's TC, 0 for BUY).
-            IPrivateNote(e.owner).onInferencePlaced{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
-                _modelHash, e.tokenContract, orderId, e.isBuy, e.price, e.amount);
+            // One resting SELL per deal TokenContract is now enforced by the TC
+            // itself (`_offerPosted`), since the TC posts its own offer — no
+            // per-TC map here.
+            // Purge expired GTD bids that a SELL taker crosses BEFORE the prechecks, so POST_ONLY
+            // crossing and FOK `_enoughLiquidity` see the same live liquidity `_match` would (it
+            // lazily refunds expired bids). This keeps the prechecks consistent with the match:
+            // POST_ONLY tests only live liquidity, and FOK counts only fillable volume.
+            // (Only BUYs carry a deadline → purge for taker SELLs.)
+            if (!e.isBuy) { _purgeExpiredBids(e.price, isMarket); }
 
             // POST_ONLY: reject if it would cross.
             if ((e.flags & FLAG_POST_ONLY) != 0) {
@@ -697,27 +828,47 @@ contract InferenceOrderBook is AiRegistryModifiers {
                     (uint256 bp, ) = best.get();
                     if (_crosses(e.isBuy, e.price, false, bp)) {
                         if (e.isBuy && e.escrow > 0) { _payShell(e.owner, e.escrow); }
+                        else if (!e.isBuy && e.tokenContract != address(0)) {
+                            // SELL rejected before resting -> notify the TC (onSellClosed frees
+                            // the `_offerPosted` latch) so it stays usable.
+                            ITokenContractDeal(e.tokenContract).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();
+                        }
                         return false;
                     }
                 }
             }
             // FOK: all-or-nothing pre-check (bounded level walk).
-            if ((e.flags & FLAG_FOK) != 0 && !_enoughLiquidity(e.isBuy, e.price, isMarket, e.amount)) {
+            if ((e.flags & FLAG_FOK) != 0 && !_enoughLiquidity(e.isBuy, e.price, isMarket, e.amount, e.escrow)) {
                 if (e.isBuy && e.escrow > 0) { _payShell(e.owner, e.escrow); }
+                else if (!e.isBuy && e.tokenContract != address(0)) {
+                    ITokenContractDeal(e.tokenContract).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();  // free the TC's offer latch
+                }
                 return false;
             }
+
+            // Mirror the placement ONLY after the rejection checks pass — a crossing POST_ONLY or
+            // under-liquid FOK returns above without inserting/filling, so it must NOT emit
+            // InferenceOrderPlaced / onInferencePlaced (else clients would track an order that
+            // never rested).
+            emit InferenceOrderPlaced{dest: address.makeAddrExtern(OfferPlacedEmit, bitCntAddress)}(
+                orderId, e.isBuy, e.price, e.amount, e.owner, e.tokenContract, e.deadline);
+            IPrivateNote(e.owner).onInferencePlaced{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(
+                _modelHash, e.tokenContract, orderId, e.isBuy, e.price, e.amount);
         }
 
         uint128 inAmount   = firstRun ? e.amount  : e.contRemaining;
         uint128 inEscrow   = firstRun ? e.escrow  : e.contLeftover;
-        (uint128 remaining, uint128 leftover, bool capped) =
-            _match(orderId, e.isBuy, e.price, isMarket, e.owner, e.tokenContract, e.buyerPubkey, inAmount, inEscrow);
+        uint128 resumeFrom = firstRun ? 0 : e.contScanOrder;
+        (uint128 remaining, uint128 leftover, bool capped, uint128 nextResume) =
+            _match(orderId, e.isBuy, e.price, isMarket, e.owner, e.tokenContract, e.buyerPubkey, inAmount, inEscrow, resumeFrom);
 
         if (capped) {
-            // BUY taker crossed > one tx of liquidity → persist cursor, resume next tx.
+            // Taker crossed > one tx of liquidity → persist cursor + scan position, resume
+            // next tx from where it stopped so an un-fillable head is not re-scanned.
             e.contOrderId = orderId;
             e.contRemaining = remaining;
             e.contLeftover = leftover;
+            e.contScanOrder = nextResume;
             _queue[_queueHead] = e;
             return true;
         }
@@ -730,9 +881,15 @@ contract InferenceOrderBook is AiRegistryModifiers {
         if (o.amount == 0 && o.note == address(0)) { return; }
         if (o.note != owner) { return; }
         uint128 refund = o.escrow;
+        // A cancelled SELL is removed WITHOUT a fill → free the TC's `_offerPosted`
+        // latch so the seller can re-list on the same (still-live) TC. Read the TC
+        // BEFORE `_removeFromBook` deletes the order.
+        bool    freeTc = !o.isBuy && o.tokenContract != address(0);
+        address tc     = o.tokenContract;
         _removeFromBook(orderId);
         emit InferenceOrderCancelled{dest: address.makeAddrExtern(OfferCancelledEmit, bitCntAddress)}(orderId, refund, owner);
         _payShell(owner, refund);
+        if (freeTc) { ITokenContractDeal(tc).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(); }
     }
 
     function _doCancelAll(address owner) private returns (uint8 cancelled) {
@@ -742,9 +899,12 @@ contract InferenceOrderBook is AiRegistryModifiers {
             Order o = _orders[cur];
             uint128 next = o.nextInOwner;
             uint128 refund = o.escrow;
+            bool    freeTc = !o.isBuy && o.tokenContract != address(0);
+            address tc     = o.tokenContract;
             _removeFromBook(cur);
             emit InferenceOrderCancelled{dest: address.makeAddrExtern(OfferCancelledEmit, bitCntAddress)}(cur, refund, owner);
             if (refund > 0) { _payShell(owner, refund); }
+            if (freeTc) { ITokenContractDeal(tc).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}(); }
             cur = next;
             cancelled++;
         }
@@ -754,27 +914,48 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // Public order entry (enqueue + drain)
     // ========================================================
 
-    function placeSellOffer(uint128 pricePerTick, uint128 maxTicks, address tokenContract, uint8 flags, uint256 sellerPubkey, uint64 nonce) public {
+    /// @dev The deal TokenContract posts its OWN offer now (not the seller note),
+    ///      so `msg.sender` IS the deal contract. Requiring `msg.sender` to be the
+    ///      canonical TC for (sellerPubkey, nonce) proves the TC is deployed AND
+    ///      note-confirmed (only a confirmed TC can reach `TokenContract.placeSellOffer`)
+    ///      → every resting offer maps to a live, canonical TC, so a match always funds
+    ///      a real deal contract. `ownerNote` is the seller note (resting-order owner,
+    ///      for onInferencePlaced/handover). A TC is one-shot (enforces one offer
+    ///      itself), so no `_sellTcInUse` map.
+    function placeSellOffer(uint128 pricePerTick, uint128 maxTicks, uint8 flags, uint256 sellerPubkey, uint64 nonce, address ownerNote) public {
         ensureBalance();
-        require(maxTicks > 0, ERR_BAD_PARAM);
-        require((flags & FLAG_POST_ONLY) == 0 || (flags & TAKER_FLAGS) == 0, ERR_BAD_FLAGS);
-        require((flags & FLAG_IOC) == 0 || (flags & FLAG_FOK) == 0, ERR_BAD_FLAGS);
-        bool isMarket = (flags & FLAG_MARKET) != 0;
-        require(isMarket || pricePerTick > 0, ERR_BAD_PARAM);
-        // The deal contract MUST be a canonical TokenContract — else a fill forwards
-        // the BUYER's matched SHELL to a fake (no streaming/dispute/reclaim). Verified
-        // HERE because placeSellOffer is public: a direct call would bypass the seller
-        // note's own check. Derivation from the canonical code hash forces any caller
-        // (note or attacker) to point at a genuine TC for (sellerPubkey, nonce).
-        require(tokenContract == _tokenContractAddr(sellerPubkey, nonce), ERR_BAD_TOKEN_CONTRACT);
+        // Auth BEFORE accept: a non-canonical sender is rejected without charging the
+        // contract. A real TC always passes this, so a genuine offer never reverts here.
+        require(msg.sender == _tokenContractAddr(sellerPubkey, nonce), ERR_BAD_TOKEN_CONTRACT);
         tvm.accept();
-        _enqueuePlace(msg.sender, 0, false, flags, isMarket ? 0 : pricePerTick, maxTicks, 0, tokenContract, 0);
+        // Param / capacity checks AFTER accept: the TC latched `_offerPosted` optimistically
+        // and forwarded bounce:false. On ANY non-resting outcome, notify the TC (onSellClosed
+        // frees the latch) and return rather than revert, so the TC stays usable (re-list /
+        // close / destroy all remain available).
+        //  - deal serves >= 2 ticks (fundFromOrderBook floor);
+        //  - a SELL is a fixed-price limit, never a market order (market clearing = 0);
+        //  - price > 0; flag combos consistent (POST_ONLY xor taker; IOC xor FOK);
+        //  - the placement queue has room (else _enqueuePlace rejects with ERR_QUEUE_FULL).
+        bool bad = maxTicks < 2
+            || pricePerTick == 0
+            || (flags & FLAG_MARKET) != 0
+            || ((flags & FLAG_POST_ONLY) != 0 && (flags & TAKER_FLAGS) != 0)
+            || ((flags & FLAG_IOC) != 0 && (flags & FLAG_FOK) != 0)
+            // maxTicks*(price + fee) must fit uint128 so the fill cost never overflows the cast.
+            || uint256(maxTicks) * _unit(pricePerTick) > uint256(type(uint128).max);
+        if (bad || _queueSize >= QUEUE_PLACE_LIMIT) {
+            ITokenContractDeal(msg.sender).onSellClosed{value: REGISTER_FORWARD_VALUE, flag: 1, bounce: false}();
+            return;
+        }
+        _enqueuePlace(ownerNote, 0, false, flags, pricePerTick, maxTicks, 0, msg.sender, 0);
         _processHeadCore();
     }
 
     function placeBuyOrder(uint128 maxPricePerTick, uint128 ticks, uint8 flags, uint64 deadline, uint256 buyerPubkey) public {
         ensureBalance();
-        require(ticks > 0, ERR_BAD_PARAM);
+        // A deal serves >= 2 ticks (probe + >=1 stream); a 1-tick buy can never fund a
+        // deal (fundFromOrderBook rejects < 2), so it is rejected up front.
+        require(ticks >= 2, ERR_BAD_PARAM);
         require((flags & FLAG_POST_ONLY) == 0 || (flags & TAKER_FLAGS) == 0, ERR_BAD_FLAGS);
         require((flags & FLAG_IOC) == 0 || (flags & FLAG_FOK) == 0, ERR_BAD_FLAGS);
         require(deadline == 0 || deadline > block.timestamp, ERR_EXPIRED);
@@ -820,6 +1001,9 @@ contract InferenceOrderBook is AiRegistryModifiers {
         require(currencies.exists(SHELL_ECC_ID), ERR_NO_SHELL);
         uint128 escrow = uint128(currencies[SHELL_ECC_ID]);
         require(escrow >= uint128(uint256(ticks) * _unit(maxPricePerTick)), ERR_INSUFFICIENT_DEPOSIT);
+        // Each of the SUB_CYCLES cycles must be able to fund a real deal (min-fill = 2 ticks):
+        // the per-cycle budget (escrow / SUB_CYCLES) covers at least two ticks at the ceiling price.
+        require(escrow / uint128(SUB_CYCLES) >= 2 * _unit(maxPricePerTick), ERR_INSUFFICIENT_DEPOSIT);
         tvm.accept();
 
         address buyerNote = msg.sender;
@@ -850,8 +1034,15 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 Order o = _orders[orderId];
                 if (o.escrow < unspent) { unspent = o.escrow; }
                 _orders[orderId].escrow = o.escrow - unspent;
-                _forfeitPool[orderId][s.curCycle] += unspent;
-                emit InferenceCycleForfeited{dest: address.makeAddrExtern(CycleForfeitedEmit, bitCntAddress)}(orderId, s.curCycle, unspent, _cycleFundedTicks[orderId][s.curCycle]);
+                if (_cycleFundedTicks[orderId][s.curCycle] == 0) {
+                    // No seller served this cycle, so a forfeit pool would be unclaimable —
+                    // return this cycle's unspent to the buyer instead.
+                    _payShell(o.note, unspent);
+                    emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(o.note, unspent);
+                } else {
+                    _forfeitPool[orderId][s.curCycle] += unspent;
+                    emit InferenceCycleForfeited{dest: address.makeAddrExtern(CycleForfeitedEmit, bitCntAddress)}(orderId, s.curCycle, unspent, _cycleFundedTicks[orderId][s.curCycle]);
+                }
             }
             s.cycleSpent = 0;
             s.curCycle += 1;
@@ -863,8 +1054,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     function _expireSub(uint128 orderId) private {
         Order o = _orders[orderId];
         uint128 refund = o.escrow;
-        _removeFromBook(orderId);
-        delete _subs[orderId];
+        _removeFromBook(orderId);   // _subs[orderId] dropped inside _removeFromBook
         if (refund > 0) { _payShell(o.note, refund); emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(o.note, refund); }
     }
 

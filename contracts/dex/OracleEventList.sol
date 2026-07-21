@@ -16,7 +16,7 @@ interface IInferenceOB {
 contract OracleEventList is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.27";
 
     // ── Range events (numeric outcomes): the price is resolved on-chain from an
     // InferenceOrderBook's weekly median, mapped to a numeric range = outcome.
@@ -90,12 +90,10 @@ contract OracleEventList is Modifiers {
     ) {
         tvm.accept();
         // `_oracle` is a static field (set via stateInit to the legitimate
-        // Oracle address). Without this check, the old code was
-        //     _oracle = msg.sender;
-        // which an attacker could exploit by race-deploying OEL at the
-        // deterministic address using a stateInit where _oracle == legit
-        // Oracle, letting the constructor overwrite _oracle with the
-        // attacker's own address. Check sender matches static field instead.
+        // Oracle address). Require the sender to match that static field rather
+        // than assigning `_oracle = msg.sender` in the constructor, so `_oracle`
+        // is fixed by the deterministic stateInit and cannot be reassigned by the
+        // deploying message.
         require(msg.sender == _oracle, ERR_INVALID_SENDER);
         // pubkey=0 would hand OEL admin access (addEvent/deleteEvent) to any
         // keyless ext tx — and since PMP.approveEvent propagates this into
@@ -146,9 +144,8 @@ contract OracleEventList is Modifiers {
         require(outcomeCount < 20, ERR_INVALID_PARAMS);
         // Outcome ids must be a dense 0..n-1 range. PMP derives _numOutcomes from the
         // key count and indexes _typedOutcomePools by id, validating outcomeId <
-        // _numOutcomes (PMP.stake/resolve). A sparse/1-based map (e.g. {1,2}) would
-        // otherwise accept bets on a phantom id 0 yet revert resolve on the labeled
-        // outcome with ERR_INVALID_OUTCOME_ID after quorum.
+        // _numOutcomes (PMP.stake/resolve). Requiring a dense 0-based map keeps the
+        // stakeable ids and the resolvable ids identical.
         for (uint32 i = 0; i < outcomeCount; i++) {
             require(outcomeNames.exists(i), ERR_INVALID_PARAMS);
         }
@@ -225,15 +222,19 @@ contract OracleEventList is Modifiers {
         public senderIs(DexLib.computePMPAddressFromHash(_pmpSaltedCodeHash, _pmpSaltedCodeDepth, eventId, oracleListHash, tokenType)) accept
     {
         ensureBalance();
-        _oracle.transfer({value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ORACLE_DAPP_ID});
+        // Do NOT forward the oracle fee yet: on a reject path the oracle never
+        // services the event, so the fee (msg.currencies) must go back to the
+        // PMP (which handles staker refunds), not be gifted to the oracle. Only
+        // the approve branch below pays the oracle.
         if (!_events.exists(eventId)) {
-            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}();
+            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID}();
             return;
         }
         EventInfo eventInfo = _events[eventId];
         if ((eventInfo.deadline < block.timestamp) || (msg.currencies[CURRENCIES_ID_SHELL] < eventInfo.oracleFee)) {
-            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}();
+            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID}();
         } else {
+            _oracle.transfer({value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ORACLE_DAPP_ID});
             eventInfo.count += 1;
             _events[eventId] = eventInfo;
             PMP(msg.sender).approveEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(_oraclePubkey, eventInfo.outcomeNames, eventInfo.describe, eventInfo.eventName, eventInfo.trustAddr);
@@ -260,14 +261,17 @@ contract OracleEventList is Modifiers {
         return n;
     }
 
-    /// @notice Resolve a RANGE event — callable by ANYONE after the deadline
-    ///         (spec §6: on-chain event). Pulls the OB weekly median async; the
-    ///         mapping + PMP resolve happen in onWeeklyMedian.
-    function resolveRange(uint256 eventId, uint256 oracleListHash, uint32 tokenType) public {
+    /// @notice Resolve a RANGE event — callable by the oracle owner after the
+    ///         deadline, once at least one PMP has confirmed the event. Pulls the
+    ///         OB weekly median async; the mapping + PMP resolve happen in
+    ///         onWeeklyMedian.
+    function resolveRange(uint256 eventId, uint256 oracleListHash, uint32 tokenType)
+        external onlyOwnerPubkey(_oraclePubkey) accept
+    {
         require(_rangeData[eventId].exists, ERR_NOT_RANGE_EVENT);
         require(_events.exists(eventId), ERR_NOT_RANGE_EVENT);
         require(_events[eventId].deadline <= block.timestamp, ERR_INVALID_PARAMS);
-        tvm.accept();
+        require(_events[eventId].count > 0, ERR_INVALID_PARAMS);
         ensureBalance();
         IInferenceOB(_rangeData[eventId].ob).requestWeeklyMedian{value: 1 vmshell, flag: 1, bounce: false}(
             eventId, oracleListHash, tokenType);
