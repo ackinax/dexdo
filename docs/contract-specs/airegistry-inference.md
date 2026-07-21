@@ -16,8 +16,11 @@ with, but separate from, the DEX.DO prediction-market core under `contracts/dex/
 Inference settles in **SHELL held physically by the note**, so the
 `PrivateNote` itself is the on-chain market participant — the inference
 order/stream methods live on the note (`deployInferenceOrderBook`,
-`postSellOffer`, `placeInferenceBuy`, `streamStop`, …), keyed by `modelHash`
-(the book code is baked into the note at deploy).
+`postSellOffer`, `placeInferenceBuy`, `streamStop`, …). Most are keyed by
+`modelHash` — the book code is baked into the note at deploy, so the note
+derives the book address itself. The seller side is keyed by the deal's
+`nonce` instead: `postSellOffer` addresses the note's canonical
+`TokenContract`, and that TC carries the model and the offer terms.
 
 ## Rust support
 

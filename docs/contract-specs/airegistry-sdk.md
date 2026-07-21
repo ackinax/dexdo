@@ -56,7 +56,7 @@ reclaim`.
 
 | Method | Contract method | Params / Result | Description |
 | --- | --- | --- | --- |
-| `fund` | `fund` | `ParamsOfFund` | Buyer pays the deposit straight to the deal. |
+| `fund` | `fund` | — | Buyer pays the deposit straight to the deal. Argument-less: the buyer is bound beforehand via `authorizeDirectFund` and the deposit rides on the message value. |
 | `fund_from_order_book` | `fundFromOrderBook` | `ParamsOfFundFromOrderBook` | Funded from a matched order-book buy; sender must be the order book. |
 | `fund_probe_commission` | `fundProbeCommission` | — | Seller posts the probe commission (ECC[2] SHELL). |
 
@@ -102,7 +102,7 @@ BUY orders / subscriptions paid in SHELL escrow (spec §2 + §8).
 | Method | Contract method | Params / Result | Description |
 | --- | --- | --- | --- |
 | `process_head` | `processHead` | — | Drain the matching queue across continuation txs (`> MAX_MATCHES_PER_CALL`). |
-| `place_sell_offer` | `placeSellOffer` | `ParamsOfPlaceSellOffer { price_per_tick, max_ticks, token_contract, flags, seller_pubkey, nonce }` | Post a SELL offer; the book recomputes the canonical `TokenContract` address from `seller_pubkey + nonce` and rejects a mismatch. Sender is normally the seller note. |
+| `place_sell_offer` | `placeSellOffer` | `ParamsOfPlaceSellOffer { price_per_tick, max_ticks, flags, seller_pubkey, nonce, owner_note }` | Post a SELL offer; the book recomputes the canonical `TokenContract` address from `seller_pubkey + nonce` and requires the **caller** to be it, so the deal address is never taken from the message. Sender is the seller's `TokenContract`, not the note; `owner_note` records the note a fill settles back to. |
 | `place_buy_order` | `placeBuyOrder` | `ParamsOfPlaceBuyOrder { max_price_per_tick, ticks, flags, deadline, buyer_pubkey }` | Place a BUY order; sender (buyer note) forwards the SHELL escrow. `deadline = 0` is good-till-cancel. |
 | `place_subscription` | `placeSubscription` | `ParamsOfPlaceSubscription { max_price_per_tick, ticks, auto_renew, buyer_pubkey }` | Place a subscription (weekly semantic order, spec §8). |
 | `poke_subscription` | `pokeSubscription` | `ParamsOfOrderId { order_id }` | Roll a subscription onto its next cycle / forfeit the closing cycle's unspent budget. |
@@ -136,7 +136,7 @@ on-chain.
 | Method | Contract method | Params | Description |
 | --- | --- | --- | --- |
 | `deploy_inference_order_book` | `deployInferenceOrderBook` | `ParamsOfDeployInferenceOrderBook` | Deploy an `InferenceOrderBook` from this note (permissionless at the deterministic per-model address). The book code is baked into the note. |
-| `post_sell_offer` | `postSellOffer` | `ParamsOfPostSellOffer` | Post a SELL offer to a book. |
+| `post_sell_offer` | `postSellOffer` | `ParamsOfPostSellOffer { flags, nonce }` | Post a SELL offer to a book, indirectly: the note authorises its canonical `TokenContract` for `nonce` (`postFromNote`) and that TC posts the offer with its own constructor-pinned `price_per_tick` / `max_ticks` / `model_hash`. The terms cannot be overridden per offer — deploy a TC with different ones. The TC must already exist, or the call is a no-op. |
 | `place_inference_buy` | `placeInferenceBuy` | `ParamsOfPlaceInferenceBuy` | Place a BUY order with SHELL escrow. |
 | `place_inference_subscription` | `placeInferenceSubscription` | `ParamsOfPlaceInferenceSubscription` | Place a subscription (semantic order). |
 | `cancel_inference_order` | `cancelInferenceOrder` | `ParamsOfCancelInferenceOrder` | Cancel one resting inference order owned by this note. |
@@ -155,6 +155,12 @@ on-chain.
 | `get_stream_locks` | `getStreamLocks` | Read the current lock state. |
 | `get_pending_place_buy_lock` / `get_pending_place_buy_token_type` | getters | Inspect a pending buy in flight. |
 | `get_inference_order_book_address` | `getInferenceOrderBookAddress` | Deterministic book address for a `modelHash`. |
+
+The four lock callbacks all take `ParamsOfStreamLock { seller_pubkey, nonce }`:
+the deal is named by the pair its address is derived from, not by the address
+itself. The note recomputes the canonical `TokenContract` from that pair and
+requires `msg.sender` to equal it, so a foreign caller cannot lock the note by
+naming someone else's deal.
 
 ---
 
