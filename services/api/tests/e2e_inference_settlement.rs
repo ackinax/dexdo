@@ -61,7 +61,8 @@ async fn inference_settlement_immediate_stop_does_not_pay_streaming_tick() {
         .try_init();
 
     let pool = TestPnPool::load();
-    let note = pool.first().clone();
+    // Test isolation: own note per binary (shared notes leak stream/dispute locks).
+    let note = pool.notes[8 % pool.notes.len()].clone();
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
         secret: note.owner_secret_key_hex.clone(),

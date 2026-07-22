@@ -70,7 +70,8 @@ async fn inference_dispute_timeout_window_gated_settlement() {
         .try_init();
 
     let pool = TestPnPool::load();
-    let note = pool.first().clone();
+    // Test isolation: own note per binary (shared notes leak stream/dispute locks).
+    let note = pool.notes[5 % pool.notes.len()].clone();
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
         secret: note.owner_secret_key_hex.clone(),

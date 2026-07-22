@@ -42,7 +42,7 @@ const POLL_TICKS: u32 = 45;
 const PRICE_PER_TICK: u128 = 1_000_000;
 
 fn note_and_signer() -> (common::test_pns::TestPn, KeyPair) {
-    let note = TestPnPool::load().first().clone();
+    let note = { let p = TestPnPool::load(); p.notes[9 % p.notes.len()].clone() };
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
         secret: note.owner_secret_key_hex.clone(),
@@ -128,13 +128,19 @@ async fn inference_partial_fill_leaves_remainder() {
     dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
         .await
         .expect("postSellOffer");
+    let mut rested = false;
     for _ in 0..POLL_TICKS {
         tokio::time::sleep(POLL_TICK).await;
         let Ok(stats) = dex.inference_get_stats(&ob).await else { continue };
         if stats.order_count >= 1 {
+            rested = true;
             break;
         }
     }
+    // Assert the precondition instead of falling through: with no resting ask the
+    // buy below has nothing to cross, and the real cause resurfaces much later as a
+    // misleading "match never funded" / ERR_NO_LIQUIDITY out of getWeeklyMedianPrice.
+    assert!(rested, "sell offer never rested in the book — no liquidity to match");
 
     // 4-tick limit BUY crosses: 2 fill (fund the TC), 2 rest.
     dex.place_inference_buy(
@@ -299,13 +305,19 @@ async fn inference_match_emits_filled_event() {
     dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
         .await
         .expect("postSellOffer");
+    let mut rested = false;
     for _ in 0..POLL_TICKS {
         tokio::time::sleep(POLL_TICK).await;
         let Ok(stats) = dex.inference_get_stats(&ob).await else { continue };
         if stats.order_count >= 1 {
+            rested = true;
             break;
         }
     }
+    // Assert the precondition instead of falling through: with no resting ask the
+    // buy below has nothing to cross, and the real cause resurfaces much later as a
+    // misleading "match never funded" / ERR_NO_LIQUIDITY out of getWeeklyMedianPrice.
+    assert!(rested, "sell offer never rested in the book — no liquidity to match");
     dex.place_inference_buy(
         &note.address,
         ParamsOfPlaceInferenceBuy {

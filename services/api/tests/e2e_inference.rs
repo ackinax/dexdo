@@ -63,7 +63,8 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
         .try_init();
 
     let pool = TestPnPool::load();
-    let note = pool.first().clone();
+    // Test isolation: own note per binary (shared notes leak stream/dispute locks).
+    let note = pool.notes[9 % pool.notes.len()].clone();
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
         secret: note.owner_secret_key_hex.clone(),

@@ -61,7 +61,8 @@ async fn inference_offer_matches_buy_and_funds_token_contract() {
         .try_init();
 
     let pool = TestPnPool::load();
-    let note = pool.first().clone();
+    // Test isolation: own note per binary (shared notes leak stream/dispute locks).
+    let note = pool.notes[6 % pool.notes.len()].clone();
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
         secret: note.owner_secret_key_hex.clone(),
