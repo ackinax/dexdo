@@ -128,7 +128,9 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
 
     // 4. Place a resting BUY (flags=0 = limit/rest; no offers ⇒ it just rests).
     //    Escrow is physical SHELL held by the note.
-    let ticks: u128 = 1;
+    // Two ticks is the book's minimum: a deal serves a probe tick plus at least
+    // one stream tick, so `placeBuyOrder` rejects `ticks < 2` outright.
+    let ticks: u128 = 2;
     let place = dex
         .place_inference_buy(
             &note.address,

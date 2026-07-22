@@ -494,7 +494,12 @@ pub struct ParamsOfPlaceInferenceBuy {
     /// `uint256` model hash, decimal/hex string — identifies the book.
     pub model_hash: String,
     pub max_price_per_tick: u128,
+    /// Must be `>= 2`: a deal serves a probe tick plus at least one stream tick,
+    /// so the book rejects a 1-tick buy outright and never rests a sub-2
+    /// remainder.
     pub ticks: u128,
+    /// Must cover `ticks * (max_price_per_tick + 2.5% fee)` for a limit buy, or
+    /// the book rejects the placement and bounces the escrow back.
     pub escrow: u128,
     pub flags: u8,
     /// Time-in-force deadline (`0` = good-till-cancel).

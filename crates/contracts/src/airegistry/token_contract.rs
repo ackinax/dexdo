@@ -108,6 +108,19 @@ pub struct ParamsOfDestroy {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Result of `TokenContract.getOffer`.
+///
+/// The whole sell-offer chain (note → `postFromNote` → book) is `bounce:false`,
+/// so this latch is the only readable evidence of where an offer got to:
+/// `offer_posted` is set the moment the TC forwards to the book and cleared
+/// again by `onSellClosed` when the book refuses to rest it.
+pub struct ResultOfGetOffer {
+    pub offer_posted: bool,
+    pub closing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// Result of `TokenContract.getState`.
 pub struct ResultOfGetState {
     pub funded: bool,
@@ -407,6 +420,11 @@ impl TokenContract {
     /// Original contract method: `getProbe`.
     pub async fn get_probe(&self) -> KitResult<ResultOfGetProbe> {
         self.call_get_method::<ResultOfGetProbe>("getProbe").await
+    }
+
+    /// Original contract method: `getOffer`.
+    pub async fn get_offer(&self) -> KitResult<ResultOfGetOffer> {
+        self.call_get_method::<ResultOfGetOffer>("getOffer").await
     }
 
     /// Original contract method: `getConfig`.

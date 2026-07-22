@@ -21,6 +21,7 @@ use dodex_contracts::airegistry::inference_order_book::ResultOfGetStats as IobSt
 use dodex_contracts::airegistry::inference_order_book::ResultOfGetSubscription as IobSubscription;
 use dodex_contracts::airegistry::token_contract::ParamsOfOpen;
 use dodex_contracts::airegistry::token_contract::ParamsOfWithdrawShell;
+use dodex_contracts::airegistry::token_contract::ResultOfGetOffer as TcOffer;
 use dodex_contracts::airegistry::token_contract::ResultOfGetParties as TcParties;
 use dodex_contracts::airegistry::token_contract::ResultOfGetProbe as TcProbe;
 use dodex_contracts::airegistry::token_contract::ResultOfGetState as TcState;
@@ -509,6 +510,16 @@ impl Dex {
     ) -> ChainResult<TcProbe> {
         TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
             .get_probe()
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn token_contract_get_offer(
+        &self,
+        token_contract_address: &str,
+    ) -> ChainResult<TcOffer> {
+        TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
+            .get_offer()
             .await
             .map_err(Into::into)
     }

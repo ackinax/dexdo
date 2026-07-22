@@ -100,9 +100,11 @@ async fn inference_offer_matches_buy_and_funds_token_contract() {
     wait_book_live(&dex, &ob).await;
 
     // 2. Deploy the seller's TokenContract externally (giver-funded). Self-trade
-    //    ⇒ seller pubkey/note are this note; root model is a harmless placeholder.
-    // postSellOffer verifies token_contract derives from the seller key + this
-    // nonce, so the offer must pass the SAME nonce the TokenContract was deployed with.
+    //    ⇒ seller pubkey/note are this note; the root model is the canonical one
+    //    the live SuperRoot derives, since the address must match what the note
+    //    and the book recompute. postSellOffer addresses the TC by
+    //    (seller key, nonce), so the offer must pass the SAME nonce it was
+    //    deployed with.
     let nonce = (suffix % 1_000_000_000) as u64 + 1;
     let tc = deploy_token_contract(
         dex.context(),
@@ -137,7 +139,16 @@ async fn inference_offer_matches_buy_and_funds_token_contract() {
         }
     }
     if !offer_rested {
-        failures.push("sell offer never rested in the book".to_string());
+        // note → postFromNote → placeSellOffer is `bounce:false` end to end, so a
+        // lost offer surfaces nowhere. The TC's own latch says which hop dropped
+        // it: still set ⇒ the book never answered, cleared ⇒ the book refused it
+        // and called `onSellClosed`, unreadable ⇒ the note addressed a TC that is
+        // not the one deployed here.
+        let latch = match dex.token_contract_get_offer(&tc).await {
+            Ok(o) => format!("offerPosted={} closing={}", o.offer_posted, o.closing),
+            Err(err) => format!("getOffer unreadable: {err:?}"),
+        };
+        failures.push(format!("sell offer never rested in the book ({latch})"));
     }
 
     // 4. Crossing BUY (taker): same price ⇒ matches the resting sell.

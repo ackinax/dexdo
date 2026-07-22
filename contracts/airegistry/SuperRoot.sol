@@ -33,7 +33,7 @@ contract SuperRoot is AiRegistryModifiers {
     ///         the value returned by `tvm.decodeStateInit(tvc).code` then
     ///         `tvm.hash`. It is the same as the `code_hash` field
     ///         printed by `tvm-cli decode stateinit --tvc <file>`.
-    uint256 constant ROOT_MODEL_CODE_HASH = 0x0a6fe90e89faa99bdd4286965ec75e5085d7c0f365b8c2e3e1467cf584d359bc;
+    uint256 constant ROOT_MODEL_CODE_HASH = 0xb88723892c07ad3b12eee921b98c3b79d1b853b8af41749474f3536ec1060de8;
 
     event RootRegistered(address rootAddress);
 
