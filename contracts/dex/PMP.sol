@@ -13,7 +13,7 @@ import "./libraries/DexLib.sol";
 contract PMP is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.27";
+    string constant version = "4.0.28";
 
     /// @notice PMP name (static, unique identifier)
     string _name;
@@ -272,7 +272,7 @@ contract PMP is Modifiers {
     event ClaimProcessed(address indexed note, uint128 payout, bool win);
 
     /// @notice Emitted when network fee was burned.
-    /// @dev The contract currently does not emit this event in the shown code; reserved for future accounting.
+    /// @dev Emitted once, at the first PMP approval, when the network fee is burned.
     /// @param amount Burned fee amount in native units.
     event NetworkFeeBurned(uint64 amount);
 
@@ -328,7 +328,7 @@ contract PMP is Modifiers {
         _privateNoteCode = PrivateNoteCode;
         _orderBookCode = orderBookCode;
         _orderBookAddress = DexLib.computeOrderBookAddress(
-            _privateNoteCode, _orderBookCode,
+            _privateNoteCode, tvm.hash(tvm.code()), uint16(tvm.code().depth()), _orderBookCode,
             _eventId, _oracleListHash, _tokenType
         );
         _approved = false;
@@ -474,6 +474,31 @@ contract PMP is Modifiers {
             );
         }
         _oracleEventsConfirmed[msg.sender.value] = true;
+        // Governance votes (setTimings / resolve / cancelEvent) are keyed by oracle
+        // pubkey, while the quorum is sized by the oracle-event-list count. Two lists
+        // sharing one oracle pubkey drop the distinct-voter count below quorum, so the
+        // event can never be approved and the deployer's initial stakes would be locked
+        // with no resolve or cancel path. Reject on the first duplicate pubkey: refund
+        // the initial stakes, cancel every confirmed list, and self-destruct before the
+        // duplicate is recorded.
+        if (_oracleEventsPubkeys.exists(oraclePubkey)) {
+            uint128 dupRefund = 0;
+            for (uint32 di = 0; di < _initialStakes.length; di++) {
+                dupRefund += _initialStakes[di];
+            }
+            PrivateNote(_deployer).onInitialStakesFailed{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(
+                _eventId, _oracleListHash, _tokenType, dupRefund
+            );
+            for ((uint256 dupKey, bool dupConfirmed) : _oracleEventsConfirmed) {
+                if (dupConfirmed) {
+                    OracleEventList(address.makeAddrStd(0, dupKey)).cancelEvent{
+                        value: 0.1 vmshell, flag: 1, dest_dapp_id: ORACLE_DAPP_ID
+                    }(_eventId, _oracleListHash, _tokenType);
+                }
+            }
+            selfdestruct(ROOT_PN_ADDRESS);
+            return;
+        }
         _oracleEventsPubkeys[oraclePubkey] = true;
         if (trustAddr.hasValue()) {
             require(!_oracleEventsAddress.exists(trustAddr.get()), ERR_ALREADY_INITIALIZED);
@@ -550,6 +575,11 @@ contract PMP is Modifiers {
         if (_stakeStart == 0) {
             require(resultStart >= uint64(block.timestamp) + MIN_RESULT_GAP, ERR_INVALID_PARAMS);
             _stakeStart = uint64(block.timestamp);
+            // The network fee is consumed when the market goes live. By this first
+            // approval every oracle fee has already been dispatched, so the only SHELL
+            // held by the contract is the network fee: burn it and report the burn.
+            gosh.burnecc(NETWORK_FEE_AMOUNT, CURRENCIES_ID_SHELL);
+            emit NetworkFeeBurned{dest: address.makeAddrExtern(PMP_NETWORK_FEE_BURNED, bitCntAddress)}(NETWORK_FEE_AMOUNT);
         }
 
         _resultStart = resultStart;
@@ -694,6 +724,9 @@ contract PMP is Modifiers {
 
         address wallet = DexLib.computePrivateNoteAddress(_privateNoteCode, depositIdentifierHash);
         require(msg.sender == wallet, ERR_INVALID_SENDER);
+        // Deployer's stake.amount trails the freeze-time clean refund until it is
+        // acknowledged; scope the guard to the deployer, mirroring split/merge.
+        require(!_normRefundPending || wallet != _deployer, ERR_NORM_REFUND_PENDING);
 
         tvm.accept();
         ensureBalance();
@@ -883,6 +916,8 @@ contract PMP is Modifiers {
         // in `_orderBookAddress`).
         TvmCell stateInit = DexLib.buildOrderBookStateInit(
             _privateNoteCode,
+            tvm.hash(tvm.code()),
+            uint16(tvm.code().depth()),
             _orderBookCode,
             _eventId,
             _oracleListHash,
@@ -893,7 +928,7 @@ contract PMP is Modifiers {
             stateInit: stateInit,
             value: 10 vmshell,
             flag: 1
-        }(tvm.hash(tvm.code()), tvm.code().depth(), _resultStart, _numOutcomes);
+        }(_resultStart, _numOutcomes);
 
         address addrExtern = address.makeAddrExtern(PMP_POOLS_FROZEN, bitCntAddress);
         emit PoolsFrozen{dest: addrExtern}(_baseTotalPool);
@@ -1684,6 +1719,12 @@ contract PMP is Modifiers {
                 }(_eventId, _oracleListHash, _tokenType, refundTotal);
             }
 
+            // The bounced confirmEvent carries the oracle fee (SHELL) back. Return it
+            // to the deployer rather than sweeping it to RootPN on self-destruct,
+            // mirroring rejectEvent — the oracle rendered no service on a bounce.
+            if (uint128(msg.currencies[CURRENCIES_ID_SHELL]) > 0) {
+                _deployer.transfer({value: 0.1 vmshell, flag: 1, bounce: false, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID});
+            }
             selfdestruct(ROOT_PN_ADDRESS);
         }
     }

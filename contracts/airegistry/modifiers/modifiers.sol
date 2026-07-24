@@ -81,6 +81,7 @@ abstract contract AiRegistryModifiers is AiRegistryErrors {
     uint128 constant CycleForfeitedEmit          = 1006;
     uint128 constant ForfeitClaimedEmit          = 1007;
     uint128 constant InferenceOBDeployedEmit     = 1008;
+    uint128 constant OfferCancelRejectedEmit     = 1009;
 
     modifier accept() {
         tvm.accept();

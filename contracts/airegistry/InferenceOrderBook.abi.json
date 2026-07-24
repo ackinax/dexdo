@@ -230,6 +230,16 @@
 			]
 		},
 		{
+			"name": "InferenceOrderCancelRejected",
+			"inputs": [
+				{"name":"orderId","type":"uint128"},
+				{"name":"reason","type":"uint8"},
+				{"name":"note","type":"address"}
+			],
+			"outputs": [
+			]
+		},
+		{
 			"name": "InferenceFilled",
 			"inputs": [
 				{"name":"makerId","type":"uint128"},

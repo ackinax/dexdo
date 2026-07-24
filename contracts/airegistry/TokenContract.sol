@@ -56,7 +56,7 @@ import "./InferenceOrderBook.sol";
 ///         4c.`reclaimOnTimeout()` — seller no-show after `STREAM_TIMEOUT`.
 ///         5. `withdrawShell`/`destroy` — seller pulls finalized SHELL (§3.5).
 contract TokenContract is AiRegistryModifiers {
-    string constant version = "4.0.27";
+    string constant version = "4.0.28";
 
     // Canonical AI SuperRoot account id (workchain 0) — same anchor IOB/PN pin. Used ONLY as the
     // fixed sink for `cleanupUnopened`'s residual-native sweep (so a permissionless caller cannot
@@ -72,8 +72,8 @@ contract TokenContract is AiRegistryModifiers {
     // book hash is authoritative — the TC needs no RootPN round-trip. The note does
     // NOT pin the TC code (RootPN bakes it into the note at deploy), so this pin is
     // one-way (TC->note) and the build stays cycle-free. Re-pin when PrivateNote is rebuilt.
-    uint256 constant PRIVATE_NOTE_CODE_HASH  = 0x2894e9c978a9554f22ddd6d502d8580d847f67acf1af3fc4bae2496deb117c24;
-    uint16  constant PRIVATE_NOTE_CODE_DEPTH = 19;
+    uint256 constant PRIVATE_NOTE_CODE_HASH  = 0x6b5311e6c8674aff4c091e4e7c61a684d9c978d46360861aeada61a2ccb2245e;
+    uint16  constant PRIVATE_NOTE_CODE_DEPTH = 20;
 
     // Native value attached to THIS contract's cross-dapp messages (register / stream-lock /
     // payout). Tunable; recipients self-fund via `accept`/`ensureBalance`, so this
@@ -716,6 +716,22 @@ contract TokenContract is AiRegistryModifiers {
         emit StreamDisputed{dest: address.makeAddrExtern(StreamDisputedEmit, bitCntAddress)}(_buyer, _disputeTime);
     }
 
+    /// @dev One TC address hosts exactly one funded deal. A fully settled deal
+    ///      carries no remaining claim — the buyer has been refunded and the seller
+    ///      is owed nothing — so the TC is swept rather than left resting at its
+    ///      canonical (sellerPubkey, nonce) address, where `fundFromOrderBook`
+    ///      would refund a later match instead of opening a second deal. While
+    ///      `_finalizedOwed > 0` the TC stays alive and `withdrawShell` performs the
+    ///      equivalent sweep to the seller's chosen recipient. Residual native gas
+    ///      goes to the fixed SuperRoot sink because this path takes no payout
+    ///      address and `_sellerNote` is an unvalidated constructor argument.
+    function _destroyIfSettled() private {
+        if (_funded && !_opened && !_disputed && _finalizedOwed == 0 && !_offerPosted) {
+            emit ContractDestroyed{dest: address.makeAddrExtern(ContractDestroyedEmit, bitCntAddress)}(address(this));
+            selfdestruct(address.makeAddrStd(0, SUPER_ROOT_ADDR));
+        }
+    }
+
     /// @notice Seller concedes. In `Probe`: the probe tick goes back to the buyer
     ///         and the commission is returned to the seller (a seller concession
     ///         is not a buyer stop → no burn, §3.1.2). In `Streaming`: contested
@@ -739,6 +755,7 @@ contract TokenContract is AiRegistryModifiers {
             _payShell(_buyer, refund);
 
             emit DisputeResolved{dest: address.makeAddrExtern(DisputeResolvedEmit, bitCntAddress)}(0, refund, true);
+            _destroyIfSettled();
             return;
         }
 
@@ -752,6 +769,7 @@ contract TokenContract is AiRegistryModifiers {
         _payShell(_buyer, refundB);
 
         emit DisputeResolved{dest: address.makeAddrExtern(DisputeResolvedEmit, bitCntAddress)}(0, refundB, true);
+        _destroyIfSettled();
     }
 
     /// @notice Anyone, after `DISPUTE_WINDOW`. In `Probe`: reduces to the probe

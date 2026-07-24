@@ -193,6 +193,11 @@ abstract contract Errors {
     ///         would overwrite the committed stake and re-debit the balance.
     uint16 constant ERR_STAKE_EXISTS = 169;
 
+    /// @notice A root (RootPN / RootOracle) may only be brought up via the
+    ///         stub + `updateCode` bootstrap; deploying it with its own
+    ///         constructor is not a supported path and is rejected outright.
+    uint16 constant ERR_NOT_ALLOWED_CONSTRUCTOR = 170;
+
     // ===== Replay protection =====
 
     /// @notice External message hash already processed within its expireAt window.

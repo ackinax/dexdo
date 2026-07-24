@@ -27,7 +27,7 @@ interface IInferenceDeal {
 contract PrivateNote is Modifiers, ReplayProtection {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.27";
+    string constant version = "4.0.28";
 
     /// @notice Canonical-deal derivation anchors (note-funded model). The TokenContract
     ///         and RootModel code hashes/depths are NOT pinned constants here — they are
@@ -1960,8 +1960,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
             _stakes[hash] = stake;
         }
 
-        address obAddress = DexLib.computeOrderBookAddress(
+        address obAddress = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2010,8 +2011,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
     ) public accept {
         // Sender check: allow either active single-op OB (_busy) or any OB from this event
         // (because in batch mode _busy is cleared in onBatchComplete, not on first callback).
-        address expectedOb = DexLib.computeOrderBookAddress(
+        address expectedOb = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2103,8 +2105,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
         uint64  opNonce
     ) public accept {
         ensureBalance();
-        address expectedOb = DexLib.computeOrderBookAddress(
+        address expectedOb = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2196,8 +2199,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
         require(!_busy.hasValue(), ERR_NOTE_BUSY);
 
 
-        address obAddress = DexLib.computeOrderBookAddress(
+        address obAddress = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2234,8 +2238,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
         // cancel until OB has confirmed via onOrderPlaced.
         require(orderId != type(uint128).max, ERR_NOTE_BUSY);
 
-        address obAddress = DexLib.computeOrderBookAddress(
+        address obAddress = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2277,8 +2282,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
         uint64  opNonce
     ) public accept {
         // Verify sender is the correct OrderBook (same pattern as onOrderFilled)
-        address expectedOb = DexLib.computeOrderBookAddress(
+        address expectedOb = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2400,8 +2406,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
     ) public accept {
         ensureBalance();
         // Verify sender is the OrderBook for this event
-        address expectedOb = DexLib.computeOrderBookAddress(
+        address expectedOb = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2631,8 +2638,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
             _stakes[hash] = stake;
         }
 
-        address obAddress = DexLib.computeOrderBookAddress(
+        address obAddress = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2665,8 +2673,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
         ensureBalance();
         require(!_busy.hasValue(), ERR_NOTE_BUSY);
 
-        address obAddress = DexLib.computeOrderBookAddress(
+        address obAddress = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
@@ -2697,8 +2706,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
         uint32 tokenType,
         uint64  opNonce
     ) public accept {
-        address expectedOb = DexLib.computeOrderBookAddress(
+        address expectedOb = DexLib.computeOrderBookAddressFromPmpCode(
             _privateNoteCode,
+            _pmpCode,
             _orderBookCode,
             eventId,
             oracleListHash,
