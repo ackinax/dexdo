@@ -6,7 +6,7 @@ All notable changes to DEX.DO are recorded here. Entries are date-based, newest 
 
 ### Changed
 
-- Vendored contracts → inference-market **4.0.28**: `InferenceOrderBook` hardening (issues #558–#567) — true fill-or-kill (per-order simulation), unknown flag-bit rejection, `ticks >= 2` subscriptions serialized through the match queue with the current-cycle forfeit settled on cancel, bounded expired-GTD cleanup, a terminal result for `cancelOrder`, and POST_ONLY tested against executable liquidity. Re-pinned `ModelRegistry.IOB_CODE_HASH → 0f073d8b`; local pins.
+- Vendored contracts → inference-market **4.0.28**: `InferenceOrderBook` hardening (issues #558–#567) — true fill-or-kill (per-order simulation), unknown flag-bit rejection, `ticks >= 2` subscriptions serialized through the match queue with the current-cycle forfeit settled on cancel, bounded expired-GTD cleanup, a terminal result for `cancelOrder`, POST_ONLY tested against executable liquidity, and a minimum price step of 1 SHELL (order prices must be a whole multiple of `1_000_000_000`). Re-pinned `ModelRegistry.IOB_CODE_HASH → 19014ccc`; local pins.
 
 ## [2026-06-10]
 

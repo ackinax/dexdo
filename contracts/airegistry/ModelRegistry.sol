@@ -28,7 +28,7 @@ contract ModelRegistry {
 
     // ── pinned InferenceOrderBook code (cascade-updated on version bump) ──
     /// @dev InferenceOrderBook 4.0.20 (tickSize=1M) code hash + depth. One model ⇒ one book.
-    uint256 constant IOB_CODE_HASH  = 0x0f073d8bc4fd69da72424f3247b63311b774fa4617712915e7d6d7c06a381a45;
+    uint256 constant IOB_CODE_HASH  = 0x19014ccc64f5aa97fd93e64fc3e3d66e4d938c7d67af601127a9e05f2d7c6021;
     uint16  constant IOB_CODE_DEPTH = 35;
 
     /// @notice Self-top-up floor (mirrors the airegistry stack).

@@ -143,6 +143,9 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // Reference-price stats.
     uint64  constant SECS_PER_DAY  = 86400;
     uint128 constant MIN_LIQUIDITY = 1;
+    // Minimum price step: order prices are quoted in whole SHELL (1e9 base units), so a price
+    // must be a positive multiple of PRICE_STEP. Rejects sub-SHELL dust granularity.
+    uint128 constant PRICE_STEP = 1_000_000_000;
 
     // Static — address derivation: one book per model.
     uint256 static _modelHash;
@@ -1093,6 +1096,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         //  - the placement queue has room (else _enqueuePlace rejects with ERR_QUEUE_FULL).
         bool bad = maxTicks < 2
             || pricePerTick == 0
+            || pricePerTick % PRICE_STEP != 0          // price must be a whole multiple of 1 SHELL
             || (flags & FLAG_MARKET) != 0
             || ((flags & FLAG_POST_ONLY) != 0 && (flags & TAKER_FLAGS) != 0)
             || ((flags & FLAG_IOC) != 0 && (flags & FLAG_FOK) != 0)
@@ -1117,7 +1121,8 @@ contract InferenceOrderBook is AiRegistryModifiers {
         require((flags & ~SUPPORTED_FLAGS) == 0, ERR_BAD_FLAGS);
         require(deadline == 0 || deadline > block.timestamp, ERR_EXPIRED);
         bool isMarket = (flags & FLAG_MARKET) != 0;
-        require(isMarket || maxPricePerTick > 0, ERR_BAD_PARAM);
+        // Limit price must be a positive whole multiple of 1 SHELL (market buys carry no price).
+        require(isMarket || (maxPricePerTick > 0 && maxPricePerTick % PRICE_STEP == 0), ERR_BAD_PARAM);
 
         mapping(uint32 => varuint32) currencies = msg.currencies;
         require(currencies.exists(SHELL_ECC_ID), ERR_NO_SHELL);
@@ -1159,7 +1164,8 @@ contract InferenceOrderBook is AiRegistryModifiers {
         // A deal serves >= 2 ticks (probe + >=1 stream); a 1-tick subscription can never
         // fund a deal (fundFromOrderBook rejects < 2), so it is rejected up front — the
         // same floor placeBuyOrder enforces, and it keeps unfillable bids out of the book.
-        require(ticks >= 2 && maxPricePerTick > 0, ERR_BAD_PARAM);
+        // Price must be a positive whole multiple of 1 SHELL (same step as placeBuyOrder).
+        require(ticks >= 2 && maxPricePerTick > 0 && maxPricePerTick % PRICE_STEP == 0, ERR_BAD_PARAM);
         mapping(uint32 => varuint32) currencies = msg.currencies;
         require(currencies.exists(SHELL_ECC_ID), ERR_NO_SHELL);
         uint128 escrow = uint128(currencies[SHELL_ECC_ID]);
