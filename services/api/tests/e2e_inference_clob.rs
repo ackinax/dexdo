@@ -42,7 +42,10 @@ const POLL_TICKS: u32 = 45;
 const PRICE_PER_TICK: u128 = 1_000_000;
 
 fn note_and_signer() -> (common::test_pns::TestPn, KeyPair) {
-    let note = { let p = TestPnPool::load(); p.notes[9 % p.notes.len()].clone() };
+    let note = {
+        let p = TestPnPool::load();
+        p.notes[9 % p.notes.len()].clone()
+    };
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
         secret: note.owner_secret_key_hex.clone(),

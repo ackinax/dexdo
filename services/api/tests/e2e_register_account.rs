@@ -145,7 +145,10 @@ async fn register_deployed_pn_against_shellnet() {
     // `first()` note is fine even though trading tests use it too: clearing
     // the account row first makes the insert-only registration start clean,
     // and the read-only path never touches the PN `_busy` lock.
-    let pn = { let p = TestPnPool::load(); p.notes[9 % p.notes.len()].clone() };
+    let pn = {
+        let p = TestPnPool::load();
+        p.notes[9 % p.notes.len()].clone()
+    };
     delete_account(&pool, &pn.address).await;
 
     let body = json!({
