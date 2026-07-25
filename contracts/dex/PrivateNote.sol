@@ -600,8 +600,8 @@ contract PrivateNote is Modifiers, ReplayProtection {
     }
 
     /// @notice Place a §8 subscription (semantic order) from this note: budget
-    ///         (escrow) throttled into weekly cycles, unspent forfeited by-fact to
-    ///         sellers. `autoRenew` is a client hint (renewal = re-place, §8.2).
+    ///         (escrow) throttled into weekly cycles; unused cycle budget is returned
+    ///         to the buyer. `autoRenew` is a client hint (renewal = re-place, §8.2).
     function placeInferenceSubscription(
         uint256 modelHash,
         uint128 maxPricePerTick,
@@ -618,18 +618,6 @@ contract PrivateNote is Modifiers, ReplayProtection {
         // bounce:true — escrow returns to this note if the book rejects the placement.
         InferenceOrderBook(orderBook).placeSubscription{value: 2 vmshell, flag: 1, bounce: true, currencies: ecc}(
             maxPricePerTick, ticks, autoRenew, _ephemeralPubkey);
-    }
-
-    /// @notice Claim this note's pro-rata share of a subscription cycle's forfeited
-    ///         budget (spec §8.2). Sent FROM this note so the order book credits the
-    ///         caller (`msg.sender`) as a seller that served `orderId`'s `cycle`; the
-    ///         share is paid back to this note.
-    function claimInferenceForfeit(uint256 modelHash, uint128 orderId, uint8 cycle)
-        public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg
-    {
-        ensureBalance();
-        address orderBook = DexLib.computeInferenceOrderBookAddress(_inferenceOrderBookCode, modelHash);
-        InferenceOrderBook(orderBook).claimForfeit{value: 2 vmshell, flag: 1, bounce: false}(orderId, cycle);
     }
 
     /// @notice Cancel one resting inference order owned by this note (refunds any

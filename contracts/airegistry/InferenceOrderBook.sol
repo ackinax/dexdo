@@ -61,7 +61,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // ⚠ Re-pin whenever dex/PrivateNote is recompiled (note↔OB layout coupling:
     //   the note bakes this book's state layout via `new InferenceOrderBook`, so any
     //   OB layout change forces a note rebuild → new note hash → re-pin → OB rebuild).
-    uint256 constant NOTE_CODE_HASH  = 0x6b5311e6c8674aff4c091e4e7c61a684d9c978d46360861aeada61a2ccb2245e;
+    uint256 constant NOTE_CODE_HASH  = 0x6994811839a1cfba8ce16f24c53ec6bab449fdc34cabc521f0209822b1f5ab61;
     uint16  constant NOTE_CODE_DEPTH = 20;
 
     // Canonical inference TokenContract (deal contract) code. placeSellOffer verifies
@@ -69,15 +69,15 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // statics — else a fill would route the BUYER's SHELL to a fake (the IOB is the
     // contract that forwards SHELL on a fill, so the check must live HERE, not only in
     // the note: placeSellOffer is public and a direct call would bypass a note check).
-    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xe1a2f6335b612c0946ec948c1f1956cb116da00deec3a014dc718a0b69807d44;
-    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 11;
+    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xc50e36e8b595b99c24cba9473ab79ca37f4871f54a9d7fbfcda292f636968444;
+    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 10;
 
     // Canonical RootModel code. The seller's per-deal TokenContract is bound to its RootModel
     // (its `_rootModelAddress` static is the seller's RootModel, NOT address(0)). To verify a
     // TokenContract the IOB first recomputes the seller's RootModel address from this pinned code
     // hash + the canonical SuperRoot, then derives the TC address from it (see _tokenContractAddr).
     // Re-pin whenever airegistry/RootModel is recompiled.
-    uint256 constant ROOT_MODEL_CODE_HASH  = 0x38cd246dfbd665582e6fef6fd07e127519d7be88d175e14a6ee1a7a3410617f2;
+    uint256 constant ROOT_MODEL_CODE_HASH  = 0x0fa1ef352587c12195887fa4693c4cad5e5959d54131e2e2654b3a0090ef763f;
     uint16  constant ROOT_MODEL_CODE_DEPTH = 8;
 
     // Canonical AI SuperRoot account id (workchain 0). Every RootModel registers under it via its
@@ -231,9 +231,6 @@ contract InferenceOrderBook is AiRegistryModifiers {
         bool    exists;
     }
     mapping(uint128 => Sub) _subs;
-    mapping(uint128 => mapping(uint8 => uint128)) _forfeitPool;
-    mapping(uint128 => mapping(uint8 => uint128)) _cycleFundedTicks;
-    mapping(uint128 => mapping(uint8 => mapping(address => uint128))) _cycleSellerTicks;
 
     address _deployerNote;
 
@@ -244,8 +241,6 @@ contract InferenceOrderBook is AiRegistryModifiers {
     event InferenceExecuted(uint128 ticks, uint256 clearingPrice, uint128 cost);
     event InferenceRefunded(address note, uint128 amount);
     event InferenceSubscriptionPlaced(uint128 orderId, address buyerNote, uint128 maxPrice, uint128 ticks, uint128 cycleBudget, bool autoRenew);
-    event InferenceCycleForfeited(uint128 orderId, uint8 cycle, uint128 forfeited, uint128 fundedTicks);
-    event InferenceForfeitClaimed(uint128 orderId, uint8 cycle, address sellerNote, uint128 amount);
     /// @notice Emitted once at book deploy — lets an indexer map `modelHash` → the verified model name
     ///         (and which note opened the market). `modelName` is the genuine sha256 preimage.
     event InferenceOrderBookDeployed(address note, uint256 modelHash, string modelName);
@@ -670,10 +665,10 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 if (takerIsBuy) { leftoverEscrow -= cost; } else { _orders[cur].escrow = mk.escrow - cost; }
 
                 if (makerSub) {
+                    // Track cycle spend for the weekly throttle and the end-of-cycle buyer refund.
+                    // Sellers are paid per finalized tick in their TokenContract, so the book keeps
+                    // no per-seller service ledger.
                     _subs[cur].cycleSpent += cost;
-                    uint8 cy = _subs[cur].curCycle;
-                    _cycleFundedTicks[cur][cy] += trade;
-                    _cycleSellerTicks[cur][cy][takerNote] += trade;   // takerNote = seller note
                 }
 
                 _orders[cur].filledAccum += trade;
@@ -682,41 +677,10 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 if (takerIsBuy) {
                     _removeFromBook(cur);                       // maker SELL: no buyer escrow to return
                 } else if (mk.amount == trade) {
-                    // Fully-filled maker BUY: the residual escrow (over-fund + clearing-remainder
-                    // = mk.escrow - cost, set above) is returned to the buyer.
-                    if (makerSub) {
-                        // §8.3/§8.4: an early full-fill forfeits ONLY the CURRENT cycle's own
-                        // unspent (cycleBudget - cycleSpent) to that cycle's sellers (claimForfeit); the
-                        // FUTURE cycles' budget (weeks not yet served) refunds to the BUYER, so each
-                        // cycle's sellers earn only from the cycle they served. Read escrow/note/sub
-                        // before _removeFromBook deletes the order.
-                        uint128 resid = _orders[cur].escrow;
-                        address bnote = _orders[cur].note;
-                        Sub s = _subs[cur];
-                        if (resid > 0) {
-                            uint128 cycUnspent = s.cycleBudget > s.cycleSpent ? s.cycleBudget - s.cycleSpent : 0;
-                            if (cycUnspent > resid) { cycUnspent = resid; }   // resid caps the forfeit
-                            uint128 refundFuture = resid - cycUnspent;
-                            _orders[cur].escrow = 0;
-                            if (cycUnspent > 0) {
-                                if (_cycleFundedTicks[cur][s.curCycle] == 0) {
-                                    // No seller served this cycle, so a forfeit pool would be
-                                    // unclaimable — return this cycle's unspent to the buyer instead.
-                                    refundFuture += cycUnspent;
-                                } else {
-                                    _forfeitPool[cur][s.curCycle] += cycUnspent;
-                                    emit InferenceCycleForfeited{dest: address.makeAddrExtern(CycleForfeitedEmit, bitCntAddress)}(cur, s.curCycle, cycUnspent, _cycleFundedTicks[cur][s.curCycle]);
-                                }
-                            }
-                            if (refundFuture > 0) {
-                                _payShell(bnote, refundFuture);
-                                emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(bnote, refundFuture);
-                            }
-                        }
-                        _removeFromBook(cur);   // _subs[cur] dropped inside _removeFromBook
-                    } else {
-                        _refundAndRemove(cur);                  // limit BUY: residual escrow back to the buyer
-                    }
+                    // Fully-filled maker BUY (limit or §8 subscription): the residual escrow
+                    // (over-fund + clearing-remainder + any unused cycle budget) returns to the
+                    // buyer. Unused subscription budget is refunded, never forfeited to sellers.
+                    _refundAndRemove(cur);
                 } else {
                     _orders[cur].amount = mk.amount - trade;
                     _levels[!takerIsBuy][lp].totalAmount -= trade;
@@ -1008,10 +972,9 @@ contract InferenceOrderBook is AiRegistryModifiers {
             emit InferenceOrderCancelRejected{dest: address.makeAddrExtern(OfferCancelRejectedEmit, bitCntAddress)}(orderId, CANCEL_REJ_NOT_OWNER, owner);
             return;
         }
-        // A subscription cancel settles the current cycle's forfeit before deletion (see
-        // _settleSubOnCancel) so it cannot reclaim what is owed to sellers who served it; a
-        // plain order refunds its full escrow.
-        uint128 refund = _subs[orderId].exists ? _settleSubOnCancel(orderId) : o.escrow;
+        // Limit or subscription: the full remaining escrow returns to the buyer on cancel
+        // (unused subscription budget is refunded, not forfeited).
+        uint128 refund = o.escrow;
         // A cancelled SELL is removed WITHOUT a fill → free the TC's `_offerPosted`
         // latch so the seller can re-list on the same (still-live) TC. Read the TC
         // BEFORE `_removeFromBook` deletes the order.
@@ -1029,7 +992,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
         while (cur != 0 && cancelled < MAX_CANCEL_PER_CALL) {
             Order o = _orders[cur];
             uint128 next = o.nextInOwner;   // captured before any settle/removal below
-            uint128 refund = _subs[cur].exists ? _settleSubOnCancel(cur) : o.escrow;
+            uint128 refund = o.escrow;
             bool    freeTc = !o.isBuy && o.tokenContract != address(0);
             address tc     = o.tokenContract;
             _removeFromBook(cur);
@@ -1039,32 +1002,6 @@ contract InferenceOrderBook is AiRegistryModifiers {
             cur = next;
             cancelled++;
         }
-    }
-
-    /// @notice Cancel of a §8 subscription: settle any elapsed full cycles, dispose the CURRENT
-    ///         cycle's unspent per the canonical rule — served → forfeit pool for that cycle's
-    ///         sellers; unserved → refund to the buyer (§8, #560a) — and return ONLY the
-    ///         future-cycle budget as the buyer refund. `_removeFromBook` (called by the caller
-    ///         after this) drops `_subs`/`_orders` but leaves the forfeit maps, so `claimForfeit`
-    ///         stays reachable for the sellers credited here.
-    function _settleSubOnCancel(uint128 orderId) private returns (uint128 buyerRefund) {
-        _subTouch(orderId);                                  // settle completed cycles first
-        if (!_subs[orderId].exists) { return _orders[orderId].escrow; }   // expired in the roll → already refunded+removed (escrow 0)
-        Sub s = _subs[orderId];
-        uint128 escrow = _orders[orderId].escrow;
-        uint128 cycUnspent = s.cycleBudget > s.cycleSpent ? s.cycleBudget - s.cycleSpent : 0;
-        if (cycUnspent > escrow) { cycUnspent = escrow; }    // escrow caps the forfeit
-        uint128 future = escrow - cycUnspent;
-        if (cycUnspent > 0) {
-            if (_cycleFundedTicks[orderId][s.curCycle] == 0) {
-                future += cycUnspent;                        // #560(a): no seller served → back to the buyer
-            } else {
-                _forfeitPool[orderId][s.curCycle] += cycUnspent;
-                emit InferenceCycleForfeited{dest: address.makeAddrExtern(CycleForfeitedEmit, bitCntAddress)}(orderId, s.curCycle, cycUnspent, _cycleFundedTicks[orderId][s.curCycle]);
-            }
-        }
-        _orders[orderId].escrow = 0;   // fully accounted; the caller refunds `future` and removes the order
-        return future;
     }
 
     // ========================================================
@@ -1212,15 +1149,10 @@ contract InferenceOrderBook is AiRegistryModifiers {
                 Order o = _orders[orderId];
                 if (o.escrow < unspent) { unspent = o.escrow; }
                 _orders[orderId].escrow = o.escrow - unspent;
-                if (_cycleFundedTicks[orderId][s.curCycle] == 0) {
-                    // No seller served this cycle, so a forfeit pool would be unclaimable —
-                    // return this cycle's unspent to the buyer instead.
-                    _payShell(o.note, unspent);
-                    emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(o.note, unspent);
-                } else {
-                    _forfeitPool[orderId][s.curCycle] += unspent;
-                    emit InferenceCycleForfeited{dest: address.makeAddrExtern(CycleForfeitedEmit, bitCntAddress)}(orderId, s.curCycle, unspent, _cycleFundedTicks[orderId][s.curCycle]);
-                }
+                // Unused cycle budget returns to the buyer (not forfeited to sellers); sellers
+                // are paid per finalized tick in their TokenContract.
+                _payShell(o.note, unspent);
+                emit InferenceRefunded{dest: address.makeAddrExtern(BuyUnmatchedEmit, bitCntAddress)}(o.note, unspent);
             }
             s.cycleSpent = 0;
             s.curCycle += 1;
@@ -1248,22 +1180,6 @@ contract InferenceOrderBook is AiRegistryModifiers {
 
     function _doPokeSubscription(QueueEntry e) private {
         _subTouch(e.targetOrderId);
-    }
-
-    function claimForfeit(uint128 orderId, uint8 cycle) public {
-        ensureBalance();
-        address seller = msg.sender;
-        uint128 pool  = _forfeitPool[orderId][cycle];
-        uint128 total = _cycleFundedTicks[orderId][cycle];
-        uint128 mine  = _cycleSellerTicks[orderId][cycle][seller];
-        require(pool > 0 && total > 0 && mine > 0, ERR_NOTHING_TO_CLAIM);
-        tvm.accept();
-        uint128 share = uint128(uint256(pool) * uint256(mine) / uint256(total));
-        delete _cycleSellerTicks[orderId][cycle][seller];
-        _forfeitPool[orderId][cycle]      = pool - share;
-        _cycleFundedTicks[orderId][cycle] = total - mine;
-        _payShell(seller, share);
-        emit InferenceForfeitClaimed{dest: address.makeAddrExtern(ForfeitClaimedEmit, bitCntAddress)}(orderId, cycle, seller, share);
     }
 
     // ========================================================
@@ -1343,10 +1259,6 @@ contract InferenceOrderBook is AiRegistryModifiers {
     ) {
         Sub s = _subs[orderId];
         return (s.exists, s.periodStart, s.curCycle, s.cycleBudget, s.cycleSpent, s.autoRenew);
-    }
-
-    function getForfeit(uint128 orderId, uint8 cycle) external view returns (uint128 pool, uint128 fundedTicks) {
-        return (_forfeitPool[orderId][cycle], _cycleFundedTicks[orderId][cycle]);
     }
 
     function getParams() external view returns (uint256 modelHash, uint16 platformFeeBps) {

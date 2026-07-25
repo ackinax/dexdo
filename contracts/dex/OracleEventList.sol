@@ -305,6 +305,9 @@ contract OracleEventList is Modifiers {
     {
         ensureBalance();
         EventInfo eventInfo = _events[eventId];
+        // Never decrement below zero: a repeat cancel from the same PMP (normal cancel
+        // then a late bounce, or vice versa) must not underflow the confirmation count.
+        require(eventInfo.count > 0, ERR_INVALID_PARAMS);
         eventInfo.count -= 1;
         _events[eventId] = eventInfo;
     }

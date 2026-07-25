@@ -113,6 +113,11 @@ contract PMP is Modifiers {
     /// @notice Cancellation flag
     bool _isCancelled;
 
+    /// @notice Latch: the confirmed OracleEventList counts have been released (decremented)
+    ///         for this event. Set by the FIRST of the normal cancel or the onBounce cleanup
+    ///         path so the two can never double-decrement an OEL count (#588).
+    bool _countReleased;
+
     /// @notice Mapping of confirmed oracle events
     mapping(uint256 => bool) _oracleEventsConfirmed;
 
@@ -359,16 +364,11 @@ contract PMP is Modifiers {
         ensureBalance();
         address addrExtern = address.makeAddrExtern(PMP_REJECTED_BY_ORACLE, bitCntAddress);
         emit PMPRejected{dest: addrExtern}();
-        
-        for ((uint256 key, bool value) : _oracleEventsConfirmed) {
-            if (value == true) {
-                OracleEventList(address.makeAddrStd(0, key)).cancelEvent{
-                    value: 0.1 vmshell,
-                    flag: 1,
-                    dest_dapp_id: ORACLE_DAPP_ID
-                }(_eventId, _oracleListHash, _tokenType);
-            }
-        }
+
+        // Release the confirmed oracle lists' counts once (#588) — the same idempotent
+        // path as normal cancel / onBounce, so reject after a normal cancel (or vice
+        // versa) cannot double-decrement.
+        _releaseOracleCounts();
 
         // Refund the deployer's initial stakes regardless of approval state:
         //   - Pre-approval (`_approvedOracleEvents == 0`): stakes still in PN's
@@ -605,6 +605,24 @@ contract PMP is Modifiers {
         emit TimingsSet{dest: addrExtern}(_stakeStart, _computeStakeEnd(), _resultStart, _resultStart + GRACE_PERIOD);
     }
 
+    /// @notice Release (decrement) the confirmed OracleEventList counts for this event
+    ///         exactly once (#588). Idempotent via `_countReleased`, so the normal cancel
+    ///         and the onBounce cleanup can both call it without double-decrementing a count.
+    ///         Each confirmed list drops its confirmation for this event, letting the oracle
+    ///         later `deleteEvent` once every confirmed PMP has released (count reaches 0).
+    function _releaseOracleCounts() private {
+        if (_countReleased) return;
+        _countReleased = true;
+        for ((uint256 key, bool confirmed) : _oracleEventsConfirmed) {
+            if (confirmed) {
+                OracleEventList(address.makeAddrStd(0, key)).cancelEvent{
+                    value: 0.1 vmshell,
+                    flag: 1, dest_dapp_id: ORACLE_DAPP_ID
+                }(_eventId, _oracleListHash, _tokenType);
+            }
+        }
+    }
+
     /// @notice Cancels the event
     function cancelEvent() private {
         require(_approvedOracleEvents == _numberOfOracleEvents, ERR_NOT_APPROVED);
@@ -618,6 +636,10 @@ contract PMP is Modifiers {
         // on `_isCancelled` — so flipping the flag first is required for the
         // OB drain to start in the same tx as the cancel.
         ensureBalance();
+
+        // Release the confirmed OracleEventList counts (#588) so the event can later be
+        // deleted (deleteEvent requires count == 0). Idempotent with the onBounce path.
+        _releaseOracleCounts();
 
         address addrExtern = address.makeAddrExtern(PMP_EVENT_CANCELLED, bitCntAddress);
         emit EventCancelled{dest: addrExtern}();
@@ -1695,15 +1717,10 @@ contract PMP is Modifiers {
         ensureBalance();
         body;
         if (_oracleEventsConfirmed.exists(msg.sender.value)) {
-            // Only cancel oracles that have already confirmed (not the one that bounced)
-            for ((uint256 key, bool confirmed) : _oracleEventsConfirmed) {
-                if (confirmed) {
-                    OracleEventList(address.makeAddrStd(0, key)).cancelEvent{
-                        value: 0.1 vmshell,
-                        flag: 1, dest_dapp_id: ORACLE_DAPP_ID
-                    }(_eventId, _oracleListHash, _tokenType);
-                }
-            }
+            // Release the already-confirmed oracle lists' counts once (#588) — the same
+            // idempotent path the normal cancel uses, so a bounce after a normal cancel
+            // (or vice versa) cannot double-decrement.
+            _releaseOracleCounts();
 
             // Refund the deployer's initial stakes — symmetric with rejectEvent.
             // Must fire regardless of `_approvedOracleEvents`: post-partial-approval

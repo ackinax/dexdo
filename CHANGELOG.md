@@ -2,6 +2,16 @@
 
 All notable changes to DEX.DO are recorded here. Entries are date-based, newest first.
 
+## [2026-07-25]
+
+### Changed
+
+- inference-market **4.0.28** — three coordinated changes to the private-inference contracts:
+  - **Subscriptions: unused cycle budget refunds to the buyer** (no longer forfeited to sellers). Removed the per-seller forfeit accounting from `InferenceOrderBook` (the forfeit-pool / cycle-funded / cycle-seller maps, the cycle-forfeited and forfeit-claimed events, and the forfeit-claim entrypoint) and the matching `PrivateNote` relay. Sellers are still paid per delivered tick in their `TokenContract`; the matcher only throttles the weekly spend and returns the remainder to the buyer on cycle rollover, early full-fill, cancel, and expiry — no relationship graph is stored.
+  - **Seller collateral: a symmetric mirror bond held in the `TokenContract`** (spec §4.2). The seller posts a 2-tick bond (`fundProbeCommission` now funds `2P`, not a small commission) that mirrors the buyer's at-risk deposit `D`. On a dispute that reaches timeout with no concession, the disputed `D` is burned AND an equal `D` of the bond is burned (the seller gets nothing from the disputed ticks); the bond returns in full on a clean close, a concession, an abandon, or a seller no-show. Note-locking is removed — both sides' at-risk value lives inside the TC, so `PrivateNote` streams are never frozen; a new `abandonDispute` lets the buyer settle a dispute to the standard split.
+  - **Oracle (#588): a normal PMP cancellation now releases the `OracleEventList` event count.** `PMP.cancelEvent` (and the onBounce / rejectEvent cleanup) call `_releaseOracleCounts` exactly once via a `_countReleased` latch, and `OracleEventList.cancelEvent` guards against underflow — so a normally-cancelled confirmed event decrements its count to zero and can later be deleted.
+  - Full contract-stack re-pin: `InferenceOrderBook → c308b838`, `TokenContract → c50e36e8`, `RootModel → 0fa1ef35`, `SuperRoot → 35258fbb`, `ModelRegistry.IOB_CODE_HASH → c308b838`, `PrivateNote → 69948118`, `RootPN → 662f14ce`, `PMP → c5da4a1c`, `OracleEventList → d2278623`. Local pins.
+
 ## [2026-07-24]
 
 ### Changed

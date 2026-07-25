@@ -125,6 +125,13 @@
 			]
 		},
 		{
+			"name": "abandonDispute",
+			"inputs": [
+			],
+			"outputs": [
+			]
+		},
+		{
 			"name": "reclaimOnTimeout",
 			"inputs": [
 			],
@@ -444,8 +451,8 @@
 		{"init":false,"name":"_everOpened","type":"bool"},
 		{"init":false,"name":"_probeAccepted","type":"bool"},
 		{"init":false,"name":"_disputed","type":"bool"},
-		{"init":false,"name":"_sellerProbeFunded","type":"bool"},
-		{"init":false,"name":"_sellerProbeLocked","type":"uint128"},
+		{"init":false,"name":"_sellerBondFunded","type":"bool"},
+		{"init":false,"name":"_sellerBond","type":"uint128"},
 		{"init":false,"name":"_deposit","type":"uint128"},
 		{"init":false,"name":"_prepaid","type":"uint128"},
 		{"init":false,"name":"_frozen","type":"uint128"},
