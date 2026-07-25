@@ -223,9 +223,6 @@ abstract contract Errors {
     ///         prevent stale-stake races.
     uint16 constant ERR_NORM_REFUND_PENDING = 404;
 
-    /// @notice An inference-market stream/dispute lock is held; withdraw / split
-    ///         / merge are gated until the deal releases it (spec §4.3).
-    uint16 constant ERR_STREAM_LOCKED = 405;
     /// @notice `placeSellOffer` caller is not the canonical TokenContract for
     ///         `(sellerPubkey, nonce)` derived from the pinned code + the seller's
     ///         key, so only a canonical TC can post an offer.

@@ -61,7 +61,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // ⚠ Re-pin whenever dex/PrivateNote is recompiled (note↔OB layout coupling:
     //   the note bakes this book's state layout via `new InferenceOrderBook`, so any
     //   OB layout change forces a note rebuild → new note hash → re-pin → OB rebuild).
-    uint256 constant NOTE_CODE_HASH  = 0x6994811839a1cfba8ce16f24c53ec6bab449fdc34cabc521f0209822b1f5ab61;
+    uint256 constant NOTE_CODE_HASH  = 0x98179ac7cac49872fcf3d72fa711a1a35fbe2d7db246bb8c087c98c27f175e66;
     uint16  constant NOTE_CODE_DEPTH = 20;
 
     // Canonical inference TokenContract (deal contract) code. placeSellOffer verifies
@@ -69,7 +69,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // statics — else a fill would route the BUYER's SHELL to a fake (the IOB is the
     // contract that forwards SHELL on a fill, so the check must live HERE, not only in
     // the note: placeSellOffer is public and a direct call would bypass a note check).
-    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xc50e36e8b595b99c24cba9473ab79ca37f4871f54a9d7fbfcda292f636968444;
+    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0x2f6159b76e7f36f4db960b754da974e0eeaf7453f5cd1be0bca12e0e3c81b4f0;
     uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 10;
 
     // Canonical RootModel code. The seller's per-deal TokenContract is bound to its RootModel
@@ -77,7 +77,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // TokenContract the IOB first recomputes the seller's RootModel address from this pinned code
     // hash + the canonical SuperRoot, then derives the TC address from it (see _tokenContractAddr).
     // Re-pin whenever airegistry/RootModel is recompiled.
-    uint256 constant ROOT_MODEL_CODE_HASH  = 0x0fa1ef352587c12195887fa4693c4cad5e5959d54131e2e2654b3a0090ef763f;
+    uint256 constant ROOT_MODEL_CODE_HASH  = 0x9b09eb904a75375be8dc92cbe9ef54a88f76c092c04343149d3184185d8a284a;
     uint16  constant ROOT_MODEL_CODE_DEPTH = 8;
 
     // Canonical AI SuperRoot account id (workchain 0). Every RootModel registers under it via its
@@ -1092,8 +1092,9 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // ========================================================
 
     /// @notice §8 subscription: a resting limit buy whose budget is throttled into
-    ///         SUB_CYCLES weekly cycles; unspent per-cycle budget is forfeited (not
-    ///         rolled) to the sellers it funded that cycle, pro-rata by funded ticks.
+    ///         SUB_CYCLES weekly cycles; the seller is paid only for by-fact
+    ///         finalized ticks and any unspent per-cycle budget returns to the
+    ///         buyer (no forfeit to sellers, §8 / PR627).
     /// @dev Rests as a standing bid (filled by incoming sells); does not take on
     ///      placement. Renewal = client re-places (§8.2); `autoRenew` is a hint.
     function placeSubscription(uint128 maxPricePerTick, uint128 ticks, bool autoRenew, uint256 buyerPubkey) public {
