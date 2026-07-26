@@ -76,7 +76,7 @@ contract TokenContract is AiRegistryModifiers {
     // book hash is authoritative — the TC needs no RootPN round-trip. The note does
     // NOT pin the TC code (RootPN bakes it into the note at deploy), so this pin is
     // one-way (TC->note) and the build stays cycle-free. Re-pin when PrivateNote is rebuilt.
-    uint256 constant PRIVATE_NOTE_CODE_HASH  = 0x98179ac7cac49872fcf3d72fa711a1a35fbe2d7db246bb8c087c98c27f175e66;
+    uint256 constant PRIVATE_NOTE_CODE_HASH  = 0x87c06324877d417343a4639db1be34e00b388d4bb23dd56df271c5057c9e4d8b;
     uint16  constant PRIVATE_NOTE_CODE_DEPTH = 20;
 
     // Native value attached to THIS contract's cross-dapp messages (register / stream-lock /

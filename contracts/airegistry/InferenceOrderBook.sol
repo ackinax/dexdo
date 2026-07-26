@@ -61,7 +61,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // ⚠ Re-pin whenever dex/PrivateNote is recompiled (note↔OB layout coupling:
     //   the note bakes this book's state layout via `new InferenceOrderBook`, so any
     //   OB layout change forces a note rebuild → new note hash → re-pin → OB rebuild).
-    uint256 constant NOTE_CODE_HASH  = 0x98179ac7cac49872fcf3d72fa711a1a35fbe2d7db246bb8c087c98c27f175e66;
+    uint256 constant NOTE_CODE_HASH  = 0x87c06324877d417343a4639db1be34e00b388d4bb23dd56df271c5057c9e4d8b;
     uint16  constant NOTE_CODE_DEPTH = 20;
 
     // Canonical inference TokenContract (deal contract) code. placeSellOffer verifies
@@ -69,7 +69,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // statics — else a fill would route the BUYER's SHELL to a fake (the IOB is the
     // contract that forwards SHELL on a fill, so the check must live HERE, not only in
     // the note: placeSellOffer is public and a direct call would bypass a note check).
-    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0x2f6159b76e7f36f4db960b754da974e0eeaf7453f5cd1be0bca12e0e3c81b4f0;
+    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0x4f752accc67c087410acc7079fb9ba6f295b303c607f8487089252c6e3862a23;
     uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 10;
 
     // Canonical RootModel code. The seller's per-deal TokenContract is bound to its RootModel
@@ -77,7 +77,7 @@ contract InferenceOrderBook is AiRegistryModifiers {
     // TokenContract the IOB first recomputes the seller's RootModel address from this pinned code
     // hash + the canonical SuperRoot, then derives the TC address from it (see _tokenContractAddr).
     // Re-pin whenever airegistry/RootModel is recompiled.
-    uint256 constant ROOT_MODEL_CODE_HASH  = 0x9b09eb904a75375be8dc92cbe9ef54a88f76c092c04343149d3184185d8a284a;
+    uint256 constant ROOT_MODEL_CODE_HASH  = 0x1fbafb5939b40a2d69584f5023f8a0339e3256c224e3e5c87104e9c0a22dd4e8;
     uint16  constant ROOT_MODEL_CODE_DEPTH = 8;
 
     // Canonical AI SuperRoot account id (workchain 0). Every RootModel registers under it via its
