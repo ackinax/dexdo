@@ -1529,6 +1529,12 @@ contract PMP is Modifiers {
                 flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID
             }(residual, _tokenType, _eventId, _oracleListHash);
         }
+        // Release this PMP's OracleEventList confirmations before it disappears
+        // (#588): a resolved market self-destructs here, so without this the
+        // confirmed lists would hold the count raised forever and the event
+        // could never be deleted. Idempotent via `_countReleased`, so a close
+        // that already released on the cancel path is a no-op.
+        _releaseOracleCounts();
         selfdestruct(_deployer);
     }
 
@@ -1545,6 +1551,11 @@ contract PMP is Modifiers {
                 flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID
             }(residual, _tokenType, _eventId, _oracleListHash);
         }
+        // Release this PMP's OracleEventList confirmations before self-destruct
+        // (#588). On the debt-refund resolve close the count would otherwise leak
+        // and block deleteEvent; on the cancelled close it was already released,
+        // and `_countReleased` makes this call a no-op there.
+        _releaseOracleCounts();
         selfdestruct(_deployer);
     }
 
@@ -1726,10 +1737,13 @@ contract PMP is Modifiers {
         tvm.accept();
         // A bounce from a configured oracle list is one of two things:
         //  (a) during a normal cancel (`_isCancelled`): a release `cancelEvent` that failed to
-        //      deliver. Re-arm exactly that list — `OracleEventList.cancelEvent` is idempotent per
-        //      canonical PMP, so the retry (or a first delivery that actually landed) cannot
-        //      double-decrement. Keep the cancelled market intact: no refund, no self-destruct. No
-        //      `ensureBalance` here, so a permanently undeliverable list cannot mint-and-loop.
+        //      deliver. Re-arm exactly that list once, `bounce: false`, so the automatic resend is
+        //      strictly finite: the first release send bounces here, this single retry is sent one
+        //      way, and if it still cannot be delivered it does not bounce back — no further
+        //      onBounce, no gas loop. `OracleEventList.cancelEvent` is idempotent per canonical PMP
+        //      (a first delivery that actually landed cleared `_pmpConfirmed`), so the retry or a
+        //      late no-op cannot double-decrement. Keep the cancelled market intact: no refund, no
+        //      self-destruct, no `ensureBalance`.
         //  (b) before cancel: a failed constructor-time oracle interaction. Run the half-init
         //      cleanup — release the confirmed counts, refund the deployer's stakes, self-destruct.
         if (!_oracleEventsConfirmed.exists(msg.sender.value)) {
@@ -1737,7 +1751,7 @@ contract PMP is Modifiers {
         }
         if (_isCancelled) {
             OracleEventList(msg.sender).cancelEvent{
-                value: 0.1 vmshell, flag: 1, dest_dapp_id: ORACLE_DAPP_ID
+                value: 0.1 vmshell, flag: 1, bounce: false, dest_dapp_id: ORACLE_DAPP_ID
             }(_eventId, _oracleListHash, _tokenType);
             return;
         }
