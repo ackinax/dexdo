@@ -300,7 +300,10 @@ contract OracleEventList is Modifiers {
         ensureBalance();
         uint32 outcomeId = _priceToOutcome(eventId, price);
         address pmp = DexLib.computePMPAddressFromHash(_pmpSaltedCodeHash, _pmpSaltedCodeDepth, eventId, oracleListHash, tokenType);
-        PMP(pmp).submitResolve{value: 0.2 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(outcomeId);
+        // bounce:false so a rejected resolution (PMP state/time guards) cannot bounce back into
+        // onBounce and be mistaken for a failed approveEvent, which would wrongly release this
+        // PMP's active confirmation. Only approveEvent drives the onBounce count self-heal.
+        PMP(pmp).submitResolve{value: 0.2 vmshell, flag: 1, bounce: false, dest_dapp_id: ROOT_PN_DAPP_ID}(outcomeId);
     }
 
     /// @notice Range-event data (bounds + bound OB) for off-chain inspection.

@@ -1722,39 +1722,49 @@ contract PMP is Modifiers {
     /// - Prevents half-initialized market state after failed oracle interactions.
     /// @param body Bounced message body (unused, accepted to satisfy ABI).
     onBounce(TvmSlice body) external {
-        tvm.accept();
-        ensureBalance();
         body;
-        // Only a failed constructor-time oracle interaction (before any cancel) runs the
-        // half-init cleanup below. Once the PMP is cancelled, a bounced release call is
-        // expected and must not refund stakes or self-destruct a normally cancelled market.
-        if (_oracleEventsConfirmed.exists(msg.sender.value) && !_isCancelled) {
-            // Release the confirmed oracle lists' counts once — the same latched path the
-            // cancel uses, so overlapping bounces cannot double-decrement.
-            _releaseOracleCounts();
-
-            // Refund the deployer's initial stakes — symmetric with rejectEvent.
-            // Must fire regardless of `_approvedOracleEvents`: post-partial-approval
-            // the stakes are already committed in PN as `stake.amount[k]`, and
-            // without this callback they'd stay locked once the PMP is gone.
-            if (_initialStakes.length > 0) {
-                uint128 refundTotal = 0;
-                for (uint32 i = 0; i < _initialStakes.length; i++) {
-                    refundTotal += _initialStakes[i];
-                }
-                PrivateNote(_deployer).onInitialStakesFailed{
-                    value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID
-                }(_eventId, _oracleListHash, _tokenType, refundTotal);
-            }
-
-            // The bounced confirmEvent carries the oracle fee (SHELL) back. Return it
-            // to the deployer rather than sweeping it to RootPN on self-destruct,
-            // mirroring rejectEvent — the oracle rendered no service on a bounce.
-            if (uint128(msg.currencies[CURRENCIES_ID_SHELL]) > 0) {
-                _deployer.transfer({value: 0.1 vmshell, flag: 1, bounce: false, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID});
-            }
-            selfdestruct(ROOT_PN_ADDRESS);
+        tvm.accept();
+        // A bounce from a configured oracle list is one of two things:
+        //  (a) during a normal cancel (`_isCancelled`): a release `cancelEvent` that failed to
+        //      deliver. Re-arm exactly that list — `OracleEventList.cancelEvent` is idempotent per
+        //      canonical PMP, so the retry (or a first delivery that actually landed) cannot
+        //      double-decrement. Keep the cancelled market intact: no refund, no self-destruct. No
+        //      `ensureBalance` here, so a permanently undeliverable list cannot mint-and-loop.
+        //  (b) before cancel: a failed constructor-time oracle interaction. Run the half-init
+        //      cleanup — release the confirmed counts, refund the deployer's stakes, self-destruct.
+        if (!_oracleEventsConfirmed.exists(msg.sender.value)) {
+            return;
         }
+        if (_isCancelled) {
+            OracleEventList(msg.sender).cancelEvent{
+                value: 0.1 vmshell, flag: 1, dest_dapp_id: ORACLE_DAPP_ID
+            }(_eventId, _oracleListHash, _tokenType);
+            return;
+        }
+        ensureBalance();
+        _releaseOracleCounts();
+
+        // Refund the deployer's initial stakes — symmetric with rejectEvent.
+        // Must fire regardless of `_approvedOracleEvents`: post-partial-approval
+        // the stakes are already committed in PN as `stake.amount[k]`, and
+        // without this callback they'd stay locked once the PMP is gone.
+        if (_initialStakes.length > 0) {
+            uint128 refundTotal = 0;
+            for (uint32 i = 0; i < _initialStakes.length; i++) {
+                refundTotal += _initialStakes[i];
+            }
+            PrivateNote(_deployer).onInitialStakesFailed{
+                value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID
+            }(_eventId, _oracleListHash, _tokenType, refundTotal);
+        }
+
+        // The bounced confirmEvent carries the oracle fee (SHELL) back. Return it
+        // to the deployer rather than sweeping it to RootPN on self-destruct,
+        // mirroring rejectEvent — the oracle rendered no service on a bounce.
+        if (uint128(msg.currencies[CURRENCIES_ID_SHELL]) > 0) {
+            _deployer.transfer({value: 0.1 vmshell, flag: 1, bounce: false, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID});
+        }
+        selfdestruct(ROOT_PN_ADDRESS);
     }
 
     /// @notice Returns full current state of the PMP contract.
