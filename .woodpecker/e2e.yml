@@ -10,8 +10,9 @@ depends_on:
 
 variables:
   - &ansible_image "docker.gosh.sh/ansible-ubuntu:24-fix"
-  - &acki_branch "history_cursor"
-  - &allbin_image "docker.gosh.sh/ackinacki-all-bin:br_history_cursor"
+  - &acki_branch "test/dex-4.0.30"
+  - &allbin_image "docker.gosh.sh/ackinacki-all-bin:fafcecd22fe664e6d96209f8d4e59ea74ce89f6b"
+  - &node_image_tag "latest-dev"
   - &busybox_image "busybox:musl"
   - &tvm_cli_version "v3.0.4-rc.an"
   - &sold_version "gosh_0.79.4-rc"
@@ -127,6 +128,7 @@ steps:
       GITHUB_TOKEN: { from_secret: GITHUB_TOKEN }
       ACKI_REPO: { from_secret: acki_repo_url }
       ACKI_BRANCH: *acki_branch
+      NODE_IMAGE_TAG: *node_image_tag
     commands:
       - cp -ar $CI_WORKSPACE/.ssh ~/.ssh
       - >
@@ -136,6 +138,7 @@ steps:
         -e config_src="$CI_WORKSPACE/.acki-nacki/config"
         -e env_src="$CI_WORKSPACE/.acki-nacki/docker/.env"
         -e endpoint_host_dest="$CI_WORKSPACE/acki_net_host"
+        -e dexdo_net_image_tag="$NODE_IMAGE_TAG"
 
   deploy_dexdo:
     depends_on:

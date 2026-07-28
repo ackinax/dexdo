@@ -51,3 +51,8 @@ __pycache__/
 # halo2 KZG SRS + proving-key cache (~500MB), generated at repo root by
 # mint_pn_pool / mint_ob_pool when proving deposit vouchers. Regenerable, never commit.
 params/
+# Solidity compiler byproducts that ride along with a contracts artifact sync.
+# Only the .sol / .abi.json / .tvc triple is consumed (the ABIs are `include_str!`'d
+# into crates/contracts); these are large, regenerable, and not read by anything.
+contracts/**/*.code
+contracts/**/*.debug.json

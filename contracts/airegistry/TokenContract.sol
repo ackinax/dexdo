@@ -4,6 +4,9 @@ pragma AbiHeader pubkey;
 
 import "./modifiers/modifiers.sol";
 import "./interfaces.sol";
+import "../dex/libraries/DexLib.sol";
+import "../dex/RootPN.sol";
+import "./InferenceOrderBook.sol";
 
 /// @title TokenContract (streaming deal / `token_contract` per spec §3-4)
 /// @notice One streaming inference deal between one seller (owner) and one
@@ -12,26 +15,30 @@ import "./interfaces.sol";
 ///
 ///         PROBE TICK (spec §3.1.2). The first tick of every stream is a
 ///         *probe*: it is FROZEN from the buyer's escrow and NOT prepaid to the
-///         seller, and the seller posts `SELLER_PROBE_COMMISSION` (≈ the
-///         platform fee on one tick, `_probeCommission()`). While in `Probe`:
+///         seller, and the seller posts the mirror `SELLER_BOND` (up to `2P`,
+///         `_bondAmount()`, §4.2). While in `Probe` the buyer's at-risk `D = P`:
 ///           - silence through `SETTLE_WINDOW` (advance) → probe accepted: the
-///             probe tick is finalized to the seller, the commission is returned
+///             probe tick is finalized to the seller, the seller bond is returned
 ///             to the seller, the platform fee is taken by-fact, and the deal
 ///             enters `Streaming` with the standard two-tick invariant (§3.2);
-///           - buyer `stop()` → BURN BOTH: the buyer's probe tick AND the
-///             seller's commission go to `gosh.burnecc`; nothing to either side
-///             (scam revenue = 0, §3.1.2/§5.4). Remaining deposit refunds the buyer;
+///           - buyer `stop()` → BURN BOTH: the buyer's probe tick `P` AND a
+///             mirror `P` from the seller's bond go to `gosh.burnecc`; the
+///             remaining bond returns to the seller and the remaining deposit
+///             refunds the buyer (scam revenue = 0, §3.1.2/§5.4);
 ///           - seller no-show (`reclaimOnTimeout`, `STREAM_TIMEOUT`) → the buyer
-///             reclaims the probe tick in full (pays nothing) and the commission
+///             reclaims the probe tick in full (pays nothing) and the seller bond
 ///             is returned to the seller; NO burn (no-show is not slashed, §9.1);
-///           - dispute → both notes lock; on `DISPUTE_WINDOW` timeout it reduces
-///             to the probe rule (burn both, §4.2), not the standard split.
+///           - dispute → the buyer's contested `D` and an equal `D` from the
+///             seller bond are at risk; on `DISPUTE_WINDOW` timeout it reduces to
+///             the burn-both rule (§4.2), not the standard split. Notes are NOT
+///             locked — all dispute economics live in this TokenContract.
 ///         Burn happens ONLY on an active buyer stop, never on a seller no-show.
 ///
 ///         After the probe is accepted (`_probeAccepted`), at any open moment
 ///         exactly one tick is prepaid to the seller (delivered, awaiting
-///         finalization) and exactly one tick is frozen as buffer (spec §3.2);
-///         lifecycle is the standard split (§4.1) untouched.
+///         finalization) and exactly one tick is frozen as buffer (spec §3.2), so
+///         the buyer's contested `D` reaches at most `2P` and the seller bond
+///         mirrors it (up to `2P`); the standard split (§4.1) is untouched.
 ///
 ///         Timing windows and the platform fee are PROTOCOL CONSTANTS
 ///         (`SETTLE_WINDOW`/`STREAM_TIMEOUT`/`DISPUTE_WINDOW`/`PLATFORM_FEE_BPS`
@@ -40,20 +47,20 @@ import "./interfaces.sol";
 ///         Lifecycle:
 ///         1. `fund()`/`fundFromOrderBook()` — buyer escrows SHELL; the buyer
 ///                             note pubkey is recorded (spec §2.3/§3.1.1).
-///         1b.`fundProbeCommission()` — seller posts SELLER_PROBE_COMMISSION.
+///         1b.`fundSellerBond()` — seller posts the `SELLER_BOND` mirror bond (2P).
 ///         2. `open(cipher)` — seller posts the endpoint encrypted to the
-///                             buyer's pubkey, freezes the probe tick, locks the
-///                             buyer note; state = `Probe`.
+///                             buyer's pubkey and freezes the probe tick;
+///                             state = `Probe`. The note is NOT locked.
 ///         3. `advance()`    — seller-driven: after `SETTLE_WINDOW` of buyer
 ///                             silence, accept the probe (Probe→Streaming) or
 ///                             finalize the prepaid tick (Streaming).
 ///         4a.`stop()`       — buyer exit: Probe → burn both; Streaming → §4.1.
-///         4b.`dispute()`    — buyer contests; both notes lock;
+///         4b.`dispute()`    — buyer contests (no note lock);
 ///                             `resolveDisputeTimeout()`/`releaseDispute()`.
 ///         4c.`reclaimOnTimeout()` — seller no-show after `STREAM_TIMEOUT`.
 ///         5. `withdrawShell`/`destroy` — seller pulls finalized SHELL (§3.5).
 contract TokenContract is AiRegistryModifiers {
-    string constant version = "4.0.16";
+    string constant version = "4.0.30";
 
     // Canonical AI SuperRoot account id (workchain 0) — same anchor IOB/PN pin. Used ONLY as the
     // fixed sink for `cleanupUnopened`'s residual-native sweep (so a permissionless caller cannot
@@ -61,6 +68,16 @@ contract TokenContract is AiRegistryModifiers {
     // across versions (`SuperRoot.updateCode` swaps code in place, no rotation), so this is a fixed
     // literal — no genaddr recompute, no pin cycle. LOCAL/MAINNET build: the vanity 0:0c0c… SuperRoot.
     uint256 constant SUPER_ROOT_ADDR = 0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c;
+
+    // Canonical PrivateNote code hash/depth. `postFromNote` proves the note-driven
+    // caller is a genuine PrivateNote (pinned code) for the supplied deposit id. Only
+    // the canonical RootPN can deploy a canonical-code note, and it always bakes its
+    // real InferenceOrderBook code into that note, so a passing caller's supplied
+    // book hash is authoritative — the TC needs no RootPN round-trip. The note does
+    // NOT pin the TC code (RootPN bakes it into the note at deploy), so this pin is
+    // one-way (TC->note) and the build stays cycle-free. Re-pin when PrivateNote is rebuilt.
+    uint256 constant PRIVATE_NOTE_CODE_HASH  = 0x4712999eb88c096fef770755b21d3b6b3fde724967424a928507a5499767e812;
+    uint16  constant PRIVATE_NOTE_CODE_DEPTH = 20;
 
     // Native value attached to THIS contract's cross-dapp messages (register / stream-lock /
     // payout). Tunable; recipients self-fund via `accept`/`ensureBalance`, so this
@@ -70,10 +87,10 @@ contract TokenContract is AiRegistryModifiers {
 
     event ContractDeployed(address self);
     event StreamFunded(address buyer, uint128 deposit);
-    event ProbeCommissionFunded(uint128 amount);
+    event SellerBondFunded(uint128 amount);
     event StreamOpened(address buyer, uint128 pricePerTick);
-    event ProbeAccepted(address buyer, uint128 toSeller, uint128 commissionReturned);
-    event ProbeBurned(address buyer, uint128 burnedProbe, uint128 burnedCommission, uint128 refundToBuyer);
+    event ProbeAccepted(address buyer, uint128 toSeller, uint128 bondReturned);
+    event ProbeBurned(address buyer, uint128 burnedProbe, uint128 burnedBond, uint128 refundToBuyer);
     event TickFinalized(uint128 finalizedOwed, uint128 deposit);
     event StreamStopped(address buyer, uint128 toSeller, uint128 refundToBuyer);
     event StreamDisputed(address buyer, uint64 at);
@@ -87,31 +104,77 @@ contract TokenContract is AiRegistryModifiers {
     address static _rootModelAddress;
     uint64 static _nonce;
 
+    // Canonical InferenceOrderBook code hash/depth, delivered by the seller's
+    // canonical PrivateNote via `postFromNote` (runtime, NOT a pinned constant → no
+    // IOB<->TC cycle). Authenticates the `fundFromOrderBook` caller AND lets the TC
+    // derive the book address to post its own sell offer. 0 until the note posts.
+    uint256 _iobHash;
+    uint16  _iobDepth;
+    // Seller note confirmed this TC is its deal (`postFromNote`, msg.sender ==
+    // _sellerNote). A TC nobody confirmed never gets the book hash → never trades.
+    bool    _noteAuthorized;
+    // A TC is a one-shot deal: at most one LIVE resting sell offer (was enforced by
+    // the IOB `_sellTcInUse` map; now the TC itself is the single source). Cleared
+    // on cancel (`onSellClosed`) so the seller can re-list on the same live TC.
+    bool    _offerPosted;
+    // Seller wind-down intent (`close`): when a live offer must be cancelled first,
+    // the note's cancel fires `onSellClosed`, which then self-destructs (the offer
+    // is provably off the book by then, so no resting offer outlives the TC).
+    // `_closePayout` is where the residual native gas is swept.
+    bool    _closing;
+    address _closePayout;
+
     // Immutable deal config (constructor).
     string  _modelName;
     uint256 _modelHash;       // sha256(_modelName), verified in the ctor — on-chain authoritative id
-    uint128 _tickSize;        // tokens per tick (informational for the buyer)
+    // tokens per tick — FIXED protocol constant (no longer a per-deal param).
+    uint128 constant TICK_SIZE = 1_000_000;
+    // TC-local error (kept out of the shared AiRegistryErrors so an addition here
+    // does not drift the code hash of the other airegistry contracts that import it).
+    uint16 constant ERR_NOT_STREAMING = 338;  // op requires the Streaming state (abandonDispute)
     uint128 _pricePerTick;    // SHELL per tick (P)
     uint128 _maxTicks;        // upper bound on ticks this deal serves
 
     // Deal state.
     address _buyer;           // buyer note address (funder; payouts/locks)
     uint256 _buyerPubkey;     // buyer note pubkey (gateway auth, spec §3.1.1)
+    // Direct (OTC, off-book) fund() is DISABLED by default: the seller must first
+    // sanction a specific buyer note via `authorizeDirectFund`, so only that note can
+    // bind as `_buyer` on this TC. Auth is by the caller BEING the sanctioned note
+    // (address auth) — fund() carries ECC SHELL so it is an internal message and
+    // msg.pubkey() is 0, i.e. signature-pubkey auth is unavailable; the sanctioned
+    // buyer pubkey is recorded here for the §3.1.1 gateway.
+    address _authorizedBuyer;
+    uint256 _authorizedBuyerPubkey;
     address _sellerNote;      // seller note address (dispute lock)
     bytes   _endpointCipher;  // endpoint encrypted to the buyer's pubkey
 
     bool    _funded;
+    // True only when the deal was funded by a real InferenceOrderBook match
+    // (fundFromOrderBook), false for the direct off-book fund() path. Only a
+    // book-matched deal publishes its finalized volume to the reference-price
+    // median: the match went through a posted, price-step-valid ask, so the
+    // reported price is a real market price. Off-book direct-fund deals are
+    // privately negotiated (the seller sanctions their own buyer) and MUST NOT
+    // move the public oracle.
+    bool    _fundedFromBook;
     bool    _opened;
+    // Latch: open() was ever called. cleanupUnopened is a permissionless no-show
+    // recovery for a funded-but-NEVER-opened deal. The latch scopes it to that case
+    // only: after a normal open+close the `!_opened` guard is true again (stop/reclaim
+    // leave _opened=false), and this latch keeps cleanupUnopened from running once the
+    // seller has real `_finalizedOwed` earnings to withdraw.
+    bool    _everOpened;
     bool    _probeAccepted;   // false = Probe (first tick), true = Streaming (§3.1.2)
     bool    _disputed;
 
-    bool    _sellerProbeFunded; // seller posted SELLER_PROBE_COMMISSION
-    uint128 _sellerProbeLocked; // SHELL held as the seller's probe commission
+    bool    _sellerBondFunded; // seller posted the mirror bond (SELLER_BOND = 2P)
+    uint128 _sellerBond;       // SHELL held as the seller's mirror collateral (up to 2P), §4.2
 
     uint128 _deposit;         // SHELL available for future ticks (value + reserved fee)
     uint128 _prepaid;         // SHELL: the delivered, not-yet-finalized tick (value P); 0 in Probe
     uint128 _frozen;          // SHELL: buffer tick in Streaming, or the probe tick in Probe (value P)
-    uint128 _finalizedOwed;   // SHELL finalized to the seller (withdrawable; incl. rebate / returned commission)
+    uint128 _finalizedOwed;   // SHELL finalized to the seller (withdrawable; incl. rebate / returned bond)
     uint128 _feeAccrued;      // SHELL fee charged by-fact on finalized ticks (§5.1)
     uint128 _ticksFinalized;  // count of finalized ticks (n for rebate §5.3)
     bool    _everDisputed;    // a dispute ever opened → no rebate (§5.3)
@@ -125,15 +188,23 @@ contract TokenContract is AiRegistryModifiers {
     constructor(
         string  modelName,
         uint256 modelHash,
-        uint128 tickSize,
         uint128 pricePerTick,
         uint128 maxTicks,
         address sellerNote
     ) {
+        // Deployer authentication: the deal TC is deployed off-chain by the seller as an EXTERNAL
+        // message signed with the seller key (`pubkey == _sellerPubkey` in the stateInit). Gate the
+        // constructor to that key BEFORE accept, so nobody else can occupy this canonical (sellerPubkey,
+        // nonce) address with foreign deal terms (price/model/maxTicks/sellerNote are ctor args, not part
+        // of the address). Without this, a third party could front-run the deploy and the seller's
+        // `postSellOffer` would then rest an offer carrying injected terms in the seller's name.
+        require(msg.pubkey() == _sellerPubkey, ERR_INVALID_SENDER);
         tvm.accept();
-        require(tickSize > 0, ERR_BAD_PARAM);
         require(pricePerTick > 0, ERR_BAD_PARAM);
         require(maxTicks >= 2, ERR_BAD_PARAM);
+        // maxTicks*(price + fee) must fit uint128 so every downstream unit×ticks total (the
+        // deposit bound here and the order-book fill cost) stays overflow-free.
+        require(uint256(maxTicks) * uint256(pricePerTick + _fee(pricePerTick)) <= uint256(type(uint128).max), ERR_OVERFLOW);
         // On-chain authoritative model id: same single-cell sha256 invariant as the order book.
         // Binds this deal contract's modelHash to the verified `producer--model--version` preimage
         // (so an indexer reading the TC alone gets the genuine model name, not a free-text label).
@@ -142,7 +213,6 @@ contract TokenContract is AiRegistryModifiers {
 
         _modelName    = modelName;
         _modelHash    = modelHash;
-        _tickSize     = tickSize;
         _pricePerTick = pricePerTick;
         _maxTicks     = maxTicks;
         _sellerNote   = sellerNote;
@@ -162,6 +232,8 @@ contract TokenContract is AiRegistryModifiers {
         emit ContractDeployed{dest: selfExtern}(address(this));
 
         IRootModelRegistry(_rootModelAddress).registerTokenContract{value: DAPP_MSG_VALUE, flag: 1}(_sellerPubkey, _nonce);
+        // NOTE: the InferenceOrderBook hash is delivered later by the seller's
+        // canonical PrivateNote (`postFromNote`), so a TC nobody confirmed never activates.
     }
 
     function ensureBalance() private pure {
@@ -178,8 +250,16 @@ contract TokenContract is AiRegistryModifiers {
 
     /// @notice Burn SHELL via gosh.burnecc (spec §5.4). uint64-bounded like _settleFees.
     function _burnShell(uint128 amount) private pure {
-        if (amount > 0 && amount <= uint128(type(uint64).max)) {
-            gosh.burnecc(uint64(amount), SHELL_ECC_ID);
+        // gosh.burnecc takes uint64; an amount above uint64.max (an expensive deal's
+        // probe tick / bond) is burned in up to 10 uint64-sized chunks rather
+        // than one truncated call. The 10-chunk bound keeps the burn within the
+        // action/gas limit so the close cannot brick; 10 * uint64.max is far above
+        // any real deal's SHELL, so a genuine burn always completes within it.
+        uint128 cap = uint128(type(uint64).max);
+        for (uint8 i = 0; i < 10 && amount > 0; i++) {
+            uint128 chunk = amount > cap ? cap : amount;
+            gosh.burnecc(uint64(chunk), SHELL_ECC_ID);
+            amount -= chunk;
         }
     }
 
@@ -188,12 +268,14 @@ contract TokenContract is AiRegistryModifiers {
         return uint128(uint256(amount) * uint256(PLATFORM_FEE_BPS) / uint256(BPS_DENOMINATOR));
     }
 
-    /// @notice Seller probe commission (spec §3.1.2/§9.2): a percent of the tick
-    ///         price P (`SELLER_PROBE_COMMISSION_BPS`), on the order of the
-    ///         platform fee on a single tick. Returned to the seller on probe
-    ///         acceptance / no-show; burned with the probe tick on a probe stop.
-    function _probeCommission() private view returns (uint128) {
-        return uint128(uint256(_pricePerTick) * uint256(SELLER_PROBE_COMMISSION_BPS) / uint256(BPS_DENOMINATOR));
+    /// @notice Seller mirror bond (spec §4.2): the seller posts collateral equal to
+    ///         the maximum disputable amount — two ticks (`2P`), mirroring the buyer's
+    ///         at-risk side (probe `D=P`, streaming `D=2P`). Held in this TC until close,
+    ///         returned to the seller on any clean exit / concession / no-show, and burned
+    ///         mark-for-mark against the buyer's burned `D` when a dispute reaches timeout
+    ///         with no concession. The platform fee (§5.1) is separate and not this bond.
+    function _bondAmount() private view returns (uint128) {
+        return 2 * _pricePerTick;
     }
 
     /// @notice Seller rebate (§5.3) for `n` cleanly-finalized ticks at price P:
@@ -218,6 +300,25 @@ contract TokenContract is AiRegistryModifiers {
         if (rebate > 0) { _finalizedOwed += rebate; }             // seller withdraws it
         _burnShell(netBurn);
         _feeAccrued = 0;
+        // Every streaming close (stop / dispute-resolve / abandon / reclaim-served) routes
+        // through here after `_ticksFinalized` is final, so this is the single point that
+        // publishes the deal's finalized volume to the reference-price median.
+        _reportFinalized();
+    }
+
+    /// @notice Publish this deal's CUMULATIVE finalized-tick count to the canonical
+    ///         InferenceOrderBook, which records only the new delta into the reference-price
+    ///         VWAP/median — so a match that is later refunded (never served) contributes no
+    ///         volume, killing the reserved-volume oracle manipulation. Cumulative + book-side
+    ///         delta is exactly-once, so extra calls are harmless; a deal that finalized nothing
+    ///         reports nothing. bounce:false — best-effort, never blocks the close it rides on.
+    function _reportFinalized() private {
+        // Only an order-book-matched deal (`_fundedFromBook`) publishes to the
+        // reference-price median; an off-book direct-fund deal reports nothing.
+        if (_ticksFinalized == 0 || _iobHash == 0 || !_fundedFromBook) { return; }
+        address orderBook = DexLib.computeInferenceOrderBookAddressFromHash(_iobHash, _iobDepth, _modelHash);
+        InferenceOrderBook(orderBook).reportFinalized{value: 1 vmshell, flag: 1, bounce: false}(
+            _sellerPubkey, _nonce, _pricePerTick, _ticksFinalized);
     }
 
     // ========================================================
@@ -229,24 +330,48 @@ contract TokenContract is AiRegistryModifiers {
         // Must cover >= 2 full ticks (probe + at least one streaming tick) and <= maxTicks.
         uint128 unit = _pricePerTick + _fee(_pricePerTick);
         require(paid >= 2 * unit, ERR_INSUFFICIENT_DEPOSIT);
-        require(paid <= _maxTicks * unit, ERR_OVERFLOW);
+        require(uint256(paid) <= uint256(_maxTicks) * uint256(unit), ERR_OVERFLOW);
         _buyer       = buyer;
         _buyerPubkey = buyerPubkey;
         _deposit     = paid;
         _funded      = true;
+        // A match-fill consumes the offer (IOB removed it from the book before this
+        // callback); a direct fund() requires !_offerPosted. Either way there is no
+        // longer a live offer -> clear the latch so destroy()/withdrawShell judge by
+        // the REAL offer state, not the `_funded` proxy. Also blocks re-list.
+        _offerPosted = false;
         _fundedTime  = uint64(block.timestamp);
         emit StreamFunded{dest: address.makeAddrExtern(StreamFundedEmit, bitCntAddress)}(buyer, paid);
     }
 
     /// @notice Buyer sends ECC[2] SHELL to escrow the deal (direct path) and
     ///         records the buyer note pubkey for gateway auth (spec §3.1.1).
-    function fund(uint256 buyerPubkey) public {
+    function fund() public {
         ensureBalance();
         require(!_funded, ERR_ALREADY_FUNDED);
+        // Mutually exclusive with a live offer: a TC resting on the book funds ONLY
+        // via the order-book match — never a direct deposit that would coexist with
+        // the offer, so a TC is sold exactly once.
+        require(!_offerPosted, ERR_OFFER_LIVE);
+        // Only the seller-sanctioned buyer note. Default none -> direct fund()
+        // disabled, all funding flows through fundFromOrderBook.
+        require(_authorizedBuyer != address(0) && msg.sender == _authorizedBuyer, ERR_INVALID_SENDER);
         mapping(uint32 => varuint32) currencies = msg.currencies;
         require(currencies.exists(SHELL_ECC_ID), ERR_NO_SHELL);
         tvm.accept();
-        _recordFunding(msg.sender, buyerPubkey, uint128(currencies[SHELL_ECC_ID]));
+        _recordFunding(msg.sender, _authorizedBuyerPubkey, uint128(currencies[SHELL_ECC_ID]));
+    }
+
+    /// @notice Seller sanctions ONE specific buyer note (address + gateway pubkey) for
+    ///         the direct off-book fund() path. Default: none -> direct fund() is
+    ///         disabled and all funding flows through the order-book match. The address
+    ///         is the auth handle; the pubkey is recorded as `_buyerPubkey` on fund()
+    ///         for the §3.1.1 gateway. Not while already funded.
+    function authorizeDirectFund(address buyerNote, uint256 buyerPubkey) public onlyOwnerPubkey(_sellerPubkey) accept {
+        require(!_funded, ERR_ALREADY_FUNDED);
+        ensureBalance();
+        _authorizedBuyer       = buyerNote;
+        _authorizedBuyerPubkey = buyerPubkey;
     }
 
     /// @notice Order-book handover (spec §2.3): the InferenceOrderBook forwards
@@ -260,46 +385,157 @@ contract TokenContract is AiRegistryModifiers {
         if (!currencies.exists(SHELL_ECC_ID)) { return; }
         tvm.accept();
         uint128 paid = uint128(currencies[SHELL_ECC_ID]);
-        // The book forwards bounce:false, so a revert here would STRAND the buyer's SHELL on this
-        // contract (then be sweepable by the seller). Instead, on any non-fundable fill — already
-        // funded (nonce reuse), under 2 ticks, or over maxTicks — refund the buyer note IN FULL and
-        // do not fund. Same accept-then-refund pattern as the placement-reject fix (#91).
+        // The book forwards bounce:false, so this path never reverts: on any non-fundable fill —
+        // already funded (nonce reuse), under 2 ticks, or over maxTicks — it accepts and refunds
+        // the buyer note IN FULL rather than reverting, so the buyer's SHELL is always returned.
+        // Authenticate the caller as the canonical InferenceOrderBook for this
+        // model (hash delivered by RootPN), so only a real match binds `buyerNote`
+        // as `_buyer`. `_iobHash == 0` = RootPN reply not arrived yet: also a
+        // non-fundable case → refund + retry (same accept-then-refund pattern, so the
+        // buyer's SHELL is never held on a revert).
         uint128 unit = _pricePerTick + _fee(_pricePerTick);
-        if (_funded || paid < 2 * unit || paid > _maxTicks * unit) {
+        if (_iobHash == 0
+            || msg.sender != DexLib.computeInferenceOrderBookAddressFromHash(_iobHash, _iobDepth, _modelHash)
+            || _funded || paid < 2 * unit || uint256(paid) > uint256(_maxTicks) * uint256(unit)) {
             _payShell(buyerNote, paid);
             return;
         }
         _recordFunding(buyerNote, buyerPubkey, paid);
+        _fundedFromBook = true;   // real market fill → eligible to publish finalized volume
+    }
+
+    /// @notice Note-driven, single-call sell-offer post (spec §2.3). The seller's
+    ///         canonical PrivateNote calls this after deriving THIS TC locally; it
+    ///         delivers the canonical InferenceOrderBook code hash/depth (baked into
+    ///         the note by RootPN at deploy), so the TC needs no RootPN round-trip.
+    ///         Auth is dual: `msg.sender == _sellerNote` AND `_sellerNote` is the
+    ///         canonical PrivateNote for the supplied `depositIdentifierHash` (pinned
+    ///         PrivateNote code). Only the canonical RootPN can deploy a canonical-code
+    ///         note, and it always bakes its real book code, so a passing caller's
+    ///         `iobHash` is authoritative — no forged book. Stores the hashes (enabling
+    ///         `fundFromOrderBook`) and, on the first post, places the resting ask
+    ///         itself (`msg.sender == TC` at the book). Re-run after a cancel re-posts.
+    /// @param iobHash Canonical InferenceOrderBook code hash the note holds.
+    /// @param iobDepth Canonical InferenceOrderBook code depth the note holds.
+    /// @param depositIdentifierHash The calling note's deposit-identifier static.
+    /// @param flags Order flags (POST_ONLY / IOC / FOK / MARKET) forwarded to the OB.
+    function postFromNote(uint256 iobHash, uint16 iobDepth, uint256 depositIdentifierHash, uint8 flags) public {
+        require(msg.sender == _sellerNote, ERR_INVALID_SENDER);
+        require(_sellerNote == DexLib.computeCanonicalNoteAddressFromHash(
+            PRIVATE_NOTE_CODE_HASH, PRIVATE_NOTE_CODE_DEPTH, depositIdentifierHash), ERR_BAD_PARAM);
+        tvm.accept();
+        ensureBalance();
+        _noteAuthorized = true;
+        _iobHash  = iobHash;
+        _iobDepth = iobDepth;
+        if (_offerPosted || _funded) { return; }  // already resting / one-shot funded → no re-post
+        _offerPosted = true;
+        address orderBook = DexLib.computeInferenceOrderBookAddressFromHash(_iobHash, _iobDepth, _modelHash);
+        InferenceOrderBook(orderBook).placeSellOffer{value: 1 vmshell, flag: 1, bounce: false}(
+            _pricePerTick, _maxTicks, flags, _sellerPubkey, _nonce, _sellerNote);
+    }
+
+    /// @notice Seller posts THIS deal's resting sell offer to the
+    ///         InferenceOrderBook. Only a note-confirmed, hash-activated TC can
+    ///         post — so an offer on the book always implies a live, seller-owned
+    ///         TC, and a match always forwards the buyer's SHELL to a real deal
+    ///         contract. At most one LIVE offer per TC: a cancel frees the latch
+    ///         (`onSellClosed`) so the seller can re-list on the same TC; a fill
+    ///         locks the TC to its buyer (one-shot `_funded` deal). The TC (not the
+    ///         note) posts, so the IOB no longer needs its per-TC `_sellTcInUse` map.
+    /// @param flags Order flags (POST_ONLY / IOC / FOK / MARKET) forwarded to the OB.
+    function placeSellOffer(uint8 flags) public onlyOwnerPubkey(_sellerPubkey) accept {
+        require(_noteAuthorized, ERR_NOT_INITIALIZED);
+        require(_iobHash != 0, ERR_NOT_INITIALIZED);
+        require(!_offerPosted, ERR_ALREADY_REGISTERED);
+        require(!_funded, ERR_ALREADY_FUNDED);   // a funded TC (one-shot deal) cannot post an offer
+        ensureBalance();
+        _offerPosted = true;
+        address orderBook = DexLib.computeInferenceOrderBookAddressFromHash(_iobHash, _iobDepth, _modelHash);
+        InferenceOrderBook(orderBook).placeSellOffer{value: 1 vmshell, flag: 1, bounce: false}(
+            _pricePerTick, _maxTicks, flags, _sellerPubkey, _nonce, _sellerNote);
+    }
+
+    /// @notice The canonical InferenceOrderBook calls this when this TC's resting
+    ///         sell offer is removed WITHOUT a fill (the seller cancelled it).
+    ///         Clears the `_offerPosted` latch so the seller can post a fresh offer
+    ///         on the SAME live TC without redeploying — a cancel does not destroy
+    ///         the TC. Only clears while unfunded: a filled TC is a committed
+    ///         one-shot deal (`_funded` latch), never re-offered. Guarded to the
+    ///         canonical book (derived from the RootPN-supplied `_iobHash`); the
+    ///         book forwards bounce:false, so a stale/foreign caller is ignored
+    ///         (accept-then-noop, mirroring `fundFromOrderBook`), never reverted.
+    function onSellClosed() public {
+        ensureBalance();
+        if (_iobHash == 0
+            || msg.sender != DexLib.computeInferenceOrderBookAddressFromHash(_iobHash, _iobDepth, _modelHash)) {
+            return;
+        }
+        tvm.accept();
+        if (_funded) { return; }        // a fill won the race → deal is live, keep the TC
+        _offerPosted = false;           // offer is off the book → re-list-able
+        if (_closing) {
+            // Seller flagged wind-down (`close`): the offer is now provably off the
+            // book (the IOB removed it before this callback), so self-destruct is
+            // safe — no resting offer can outlive the TC.
+            emit ContractDestroyed{dest: address.makeAddrExtern(ContractDestroyedEmit, bitCntAddress)}(address(this));
+            selfdestruct(_closePayout);
+        }
+    }
+
+    /// @notice Seller wind-down of an UNFUNDED deal (no buyer yet). If a sell offer
+    ///         is still resting, flags intent (`_closing`) and remembers the payout:
+    ///         the note then cancels the offer (`cancelInferenceOrder`) and the
+    ///         resulting `onSellClosed` self-destructs — the offer is provably off
+    ///         the book by then, so no resting offer outlives the TC. If no offer
+    ///         rests, self-destructs immediately. A FUNDED deal has the buyer's SHELL
+    ///         inside and must close via `stop`/`withdrawShell`.
+    function close(address payoutAddress) public onlyOwnerPubkey(_sellerPubkey) accept {
+        require(!_funded, ERR_ALREADY_FUNDED);   // unfunded ⟹ not opened, not disputed
+        ensureBalance();
+        if (_offerPosted) {
+            _closing     = true;
+            _closePayout = payoutAddress;
+            return;
+        }
+        emit ContractDestroyed{dest: address.makeAddrExtern(ContractDestroyedEmit, bitCntAddress)}(address(this));
+        selfdestruct(payoutAddress);
     }
 
     // ========================================================
-    // 1b. Probe commission — seller posts SELLER_PROBE_COMMISSION (spec §3.1.2)
+    // 1b. Seller bond — seller posts the mirror collateral 2P (spec §4.2)
     // ========================================================
 
-    /// @notice Seller posts the probe commission in SHELL before `open()`.
-    ///         Held in the contract: returned to the seller on probe acceptance
-    ///         or seller no-show, burned with the probe tick on a probe stop.
+    /// @notice Seller posts the mirror bond (`2P`) in SHELL before `open()`.
+    ///         Held in the contract until close: returned to the seller on any clean
+    ///         exit / concession / no-show, and burned mark-for-mark against the buyer's
+    ///         burned `D` on a dispute that reaches timeout with no concession (§4.2).
     ///         Sent as an internal ECC[2] message (open() is external and cannot
     ///         carry value); the buyer's note is never touched.
-    function fundProbeCommission() public {
+    ///         Only the seller's own canonical PrivateNote (`_sellerNote`) may fund the
+    ///         bond — the note IS the seller's identity, so the bond is posted from and
+    ///         returned to that note; an arbitrary external wallet cannot inject a bond
+    ///         and put the deal into a state the seller's note-driven path did not create.
+    function fundSellerBond() public {
         ensureBalance();
+        require(msg.sender == _sellerNote, ERR_INVALID_SENDER);
         require(!_opened, ERR_ALREADY_OPEN);
-        require(!_sellerProbeFunded, ERR_PROBE_ALREADY_FUNDED);
+        require(!_sellerBondFunded, ERR_BOND_ALREADY_FUNDED);
         mapping(uint32 => varuint32) currencies = msg.currencies;
         require(currencies.exists(SHELL_ECC_ID), ERR_NO_SHELL);
         uint128 amount = uint128(currencies[SHELL_ECC_ID]);
-        uint128 need = _probeCommission();
+        uint128 need = _bondAmount();
         require(amount >= need, ERR_INSUFFICIENT_DEPOSIT);
         tvm.accept();
 
-        _sellerProbeLocked = need;
-        _sellerProbeFunded = true;
+        _sellerBond = need;
+        _sellerBondFunded = true;
 
-        // Refund any excess SHELL above the required commission to the sender.
+        // Refund any excess SHELL above the required bond to the sender.
         uint128 excess = amount - need;
         if (excess > 0) { _payShell(msg.sender, excess); }
 
-        emit ProbeCommissionFunded{dest: address.makeAddrExtern(ProbeCommissionFundedEmit, bitCntAddress)}(need);
+        emit SellerBondFunded{dest: address.makeAddrExtern(SellerBondFundedEmit, bitCntAddress)}(need);
     }
 
     // ========================================================
@@ -314,7 +550,7 @@ contract TokenContract is AiRegistryModifiers {
         ensureBalance();
         require(_funded, ERR_NOT_FUNDED);
         require(!_opened, ERR_ALREADY_OPEN);
-        require(_sellerProbeFunded, ERR_PROBE_NOT_FUNDED);
+        require(_sellerBondFunded, ERR_BOND_NOT_FUNDED);
         require(_deposit >= _pricePerTick, ERR_INSUFFICIENT_DEPOSIT);
 
         _endpointCipher = endpointCipher;
@@ -327,8 +563,10 @@ contract TokenContract is AiRegistryModifiers {
         _prepaidTime   = uint64(block.timestamp);
         _lastAdvance   = uint64(block.timestamp);
         _opened        = true;
+        _everOpened    = true;   // permanent latch: scopes cleanupUnopened to the never-opened case
 
-        IStreamNote(_buyer).streamLock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
+        // No note lock (§4.2): the buyer's at-risk SHELL is the deposit held in THIS TC,
+        // not the note, so nothing on the note needs freezing while the stream runs.
 
         emit StreamOpened{dest: address.makeAddrExtern(StreamOpenedEmit, bitCntAddress)}(_buyer, _pricePerTick);
     }
@@ -339,7 +577,7 @@ contract TokenContract is AiRegistryModifiers {
 
     /// @notice Seller-only. After `SETTLE_WINDOW` of buyer silence:
     ///         - in `Probe`: accept the probe (§3.1.2) — finalize the probe tick
-    ///           to the seller, return the commission, charge the fee by-fact,
+    ///           to the seller, return the bond, charge the fee by-fact,
     ///           and enter `Streaming` with the two-tick invariant (§3.2);
     ///         - in `Streaming`: finalize the prepaid tick and roll the invariant
     ///           (silence = consent, §3.3).
@@ -361,22 +599,26 @@ contract TokenContract is AiRegistryModifiers {
             _deposit        -= fee;
             _frozen          = 0;
 
-            // Return the seller's probe commission (no burn — probe accepted).
-            uint128 commission = _sellerProbeLocked;
-            _sellerProbeLocked = 0;
-            _finalizedOwed    += commission;
+            // Seller bond STAYS locked through streaming (§4.2): it now mirrors the
+            // streaming disputable amount (D up to 2P), returned/burned only at close.
 
             _probeAccepted = true;
 
             // Establish the two-tick invariant from the remaining deposit:
             // prepay the next tick forward + freeze a buffer, as the deposit allows.
-            if (_deposit >= _pricePerTick) {
+            // Reserve the prepaid tick's by-fact fee: prepay only when the deposit
+            // covers the tick value PLUS its later finalize fee, so a deposit in
+            // [P, P+fee) does not prepay a tick it can't finalize.
+            if (_deposit >= _pricePerTick + fee) {
                 _prepaid  = _pricePerTick;
                 _deposit -= _pricePerTick;
             } else {
                 _prepaid = 0;
             }
-            if (_deposit >= _pricePerTick + fee) {
+            // Buffer reserves 2*fee: once BOTH ticks are live (_prepaid + _frozen) TWO
+            // by-fact fees are still owed from _deposit, so the buffer guard leaves one
+            // fee per live tick (e.g. paid = 3P+2f freezes the buffer).
+            if (_deposit >= _pricePerTick + 2 * fee) {
                 _frozen   = _pricePerTick;
                 _deposit -= _pricePerTick;
             } else {
@@ -385,11 +627,15 @@ contract TokenContract is AiRegistryModifiers {
             _prepaidTime = uint64(block.timestamp);
             _lastAdvance = uint64(block.timestamp);
 
-            emit ProbeAccepted{dest: address.makeAddrExtern(ProbeAcceptedEmit, bitCntAddress)}(_buyer, _finalizedOwed, commission);
+            emit ProbeAccepted{dest: address.makeAddrExtern(ProbeAcceptedEmit, bitCntAddress)}(_buyer, _finalizedOwed, 0);
             return;
         }
 
         // Streaming: finalize the delivered tick (P → seller, fee by-fact, §5.1).
+        // A stream that exhausted its deposit rolls to _prepaid == 0 (no delivered
+        // tick). Only a live prepaid tick can be finalized, so advance requires
+        // _prepaid > 0 and rejects otherwise (nothing to advance).
+        require(_prepaid > 0, ERR_NO_PREPAID_TICK);
         _finalizedOwed  += _prepaid;
         _feeAccrued     += fee;
         _ticksFinalized += 1;
@@ -398,9 +644,11 @@ contract TokenContract is AiRegistryModifiers {
         _prepaid     = _frozen;
         _prepaidTime = uint64(block.timestamp);
 
-        // Refill the buffer only if the deposit still covers a full tick (value +
-        // its later by-fact fee).
-        if (_deposit >= _pricePerTick + fee) {
+        // Refill the buffer only if the deposit covers the buffer tick's value AND the
+        // by-fact fees still owed by BOTH now-live ticks: the rolled _prepaid (old
+        // buffer) and this refilled _frozen each finalize later, so reserve one fee per
+        // live tick (2*fee total).
+        if (_deposit >= _pricePerTick + 2 * fee) {
             _frozen   = _pricePerTick;
             _deposit -= _pricePerTick;
         } else {
@@ -453,33 +701,37 @@ contract TokenContract is AiRegistryModifiers {
         tvm.accept();
 
         if (!_probeAccepted) {
-            // Stop on the probe (§3.1.2): BURN BOTH the buyer's probe tick and the
-            // seller's commission — nothing to either side. Remaining deposit (no
-            // fee was charged on the probe) refunds the buyer.
-            uint128 burnedProbe      = _frozen;
-            uint128 burnedCommission = _sellerProbeLocked;
-            uint128 refund           = _deposit;
-            _frozen = 0; _sellerProbeLocked = 0; _deposit = 0;
+            // Stop on the probe (§3.1.2/§4.2): burn the buyer's probe tick (P) AND the
+            // mirror P of the seller bond — nothing to either side on the probe tick, so
+            // probe scam revenue stays 0. The rest of the bond returns to the seller;
+            // remaining deposit (no fee on the probe) refunds the buyer.
+            uint128 burnedProbe = _frozen;              // P
+            uint128 bondBurn    = _frozen;              // mirror P
+            if (bondBurn > _sellerBond) { bondBurn = _sellerBond; }
+            uint128 bondBack    = _sellerBond - bondBurn;
+            uint128 refund      = _deposit;
+            _frozen = 0; _sellerBond = 0; _deposit = 0;
             _opened = false;
 
             _burnShell(burnedProbe);
-            _burnShell(burnedCommission);
+            _burnShell(bondBurn);
+            if (bondBack > 0) { _finalizedOwed += bondBack; }   // seller withdraws the unburned bond
 
-            IStreamNote(_buyer).streamUnlock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
             _payShell(_buyer, refund);
 
-            emit ProbeBurned{dest: address.makeAddrExtern(ProbeBurnedEmit, bitCntAddress)}(_buyer, burnedProbe, burnedCommission, refund);
+            emit ProbeBurned{dest: address.makeAddrExtern(ProbeBurnedEmit, bitCntAddress)}(_buyer, burnedProbe, bondBurn, refund);
             return;
         }
 
         // Standard split (§4.1) under the optimistic rule (§3.3) — the shared close window-gates the
-        // current tick (same gate as advance()) and is reused by resolveDisputeTimeout (directive 92).
+        // current tick (same gate as advance()). A plain stop is amicable (no dispute), so the seller
+        // bond is returned in full.
         (uint128 toSeller, uint128 refundB) = _settleStreamingClose();
+        _finalizedOwed += _sellerBond; _sellerBond = 0;   // bond back to the seller
         _opened = false;
 
         _settleFees(true);   // clean amicable close → rebate to seller, burn net (§5.3/§5.4)
 
-        IStreamNote(_buyer).streamUnlock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
         _payShell(_buyer, refundB);
 
         emit StreamStopped{dest: address.makeAddrExtern(StreamStoppedEmit, bitCntAddress)}(_buyer, toSeller, refundB);
@@ -500,14 +752,31 @@ contract TokenContract is AiRegistryModifiers {
         _everDisputed = true;   // a dispute ever opened → seller forfeits rebate (§5.3)
         _disputeTime  = uint64(block.timestamp);
 
-        IStreamNote(_buyer).streamDisputeLock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
-        IStreamNote(_sellerNote).streamDisputeLock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
+        // No note lock (§4.2): both sides' at-risk value is held in THIS TC — the buyer's
+        // disputed deposit `D` and the seller's mirror bond — so neither note is frozen.
+        // The book does not participate; all dispute economics are inside this contract.
 
         emit StreamDisputed{dest: address.makeAddrExtern(StreamDisputedEmit, bitCntAddress)}(_buyer, _disputeTime);
     }
 
+    /// @dev One TC address hosts exactly one funded deal. A fully settled deal
+    ///      carries no remaining claim — the buyer has been refunded and the seller
+    ///      is owed nothing — so the TC is swept rather than left resting at its
+    ///      canonical (sellerPubkey, nonce) address, where `fundFromOrderBook`
+    ///      would refund a later match instead of opening a second deal. While
+    ///      `_finalizedOwed > 0` the TC stays alive and `withdrawShell` performs the
+    ///      equivalent sweep to the seller's chosen recipient. Residual native gas
+    ///      goes to the fixed SuperRoot sink because this path takes no payout
+    ///      address and `_sellerNote` is an unvalidated constructor argument.
+    function _destroyIfSettled() private {
+        if (_funded && !_opened && !_disputed && _finalizedOwed == 0 && !_offerPosted) {
+            emit ContractDestroyed{dest: address.makeAddrExtern(ContractDestroyedEmit, bitCntAddress)}(address(this));
+            selfdestruct(address.makeAddrStd(0, SUPER_ROOT_ADDR));
+        }
+    }
+
     /// @notice Seller concedes. In `Probe`: the probe tick goes back to the buyer
-    ///         and the commission is returned to the seller (a seller concession
+    ///         and the bond is returned to the seller (a seller concession
     ///         is not a buyer stop → no burn, §3.1.2). In `Streaming`: contested
     ///         ticks + deposit refund to the buyer.
     function releaseDispute() public onlyOwnerPubkey(_sellerPubkey) accept {
@@ -515,9 +784,11 @@ contract TokenContract is AiRegistryModifiers {
         require(_disputed, ERR_NOT_DISPUTED);
 
         if (!_probeAccepted) {
-            uint128 commission = _sellerProbeLocked;
-            _sellerProbeLocked = 0;
-            _finalizedOwed    += commission;          // commission returned to seller
+            // Seller concedes on the probe: disputed tick back to the buyer, bond returned
+            // in full to the seller (a concession is not a burn, §4.2).
+            uint128 bondBack = _sellerBond;
+            _sellerBond = 0;
+            _finalizedOwed += bondBack;               // seller withdraws the returned bond
 
             uint128 refund = _frozen + _deposit;      // probe tick back to the buyer
             _frozen = 0; _deposit = 0;
@@ -525,23 +796,26 @@ contract TokenContract is AiRegistryModifiers {
 
             _settleFees(false);   // no fee accrued on the probe; clears state safely
 
-            _unlockBoth();
             _payShell(_buyer, refund);
 
             emit DisputeResolved{dest: address.makeAddrExtern(DisputeResolvedEmit, bitCntAddress)}(0, refund, true);
+            _destroyIfSettled();
             return;
         }
 
+        // Seller concedes in streaming: the disputed sum D refunds to the buyer, bond
+        // returned in full to the seller.
         uint128 refundB = _prepaid + _frozen + _deposit;
         _prepaid = 0; _frozen = 0; _deposit = 0;
+        _finalizedOwed += _sellerBond; _sellerBond = 0;   // bond back to the seller
         _disputed = false; _opened = false;
 
         _settleFees(false);   // disputed → no rebate, burn accrued fees (§5.3)
 
-        _unlockBoth();
         _payShell(_buyer, refundB);
 
         emit DisputeResolved{dest: address.makeAddrExtern(DisputeResolvedEmit, bitCntAddress)}(0, refundB, true);
+        _destroyIfSettled();
     }
 
     /// @notice Anyone, after `DISPUTE_WINDOW`. In `Probe`: reduces to the probe
@@ -554,42 +828,72 @@ contract TokenContract is AiRegistryModifiers {
         tvm.accept();
 
         if (!_probeAccepted) {
-            // Probe rule: burn the probe tick and the commission; remaining
-            // deposit refunds the buyer. No tick finalized, no fee.
-            uint128 burnedProbe      = _frozen;
-            uint128 burnedCommission = _sellerProbeLocked;
-            uint128 refund           = _deposit;
-            _frozen = 0; _sellerProbeLocked = 0; _deposit = 0;
+            // Probe timeout, no concession (§4.2): burn the buyer's probe tick (P) AND the
+            // mirror P of the seller bond; the rest of the bond returns to the seller and
+            // the remaining deposit refunds the buyer. No tick finalized, no fee.
+            uint128 burnedProbe = _frozen;              // P
+            uint128 bondBurn    = _frozen;              // mirror P
+            if (bondBurn > _sellerBond) { bondBurn = _sellerBond; }
+            uint128 bondBack    = _sellerBond - bondBurn;
+            uint128 refund      = _deposit;
+            _frozen = 0; _sellerBond = 0; _deposit = 0;
             _disputed = false; _opened = false;
 
             _burnShell(burnedProbe);
-            _burnShell(burnedCommission);
+            _burnShell(bondBurn);
+            if (bondBack > 0) { _finalizedOwed += bondBack; }
 
-            _unlockBoth();
             _payShell(_buyer, refund);
 
-            emit ProbeBurned{dest: address.makeAddrExtern(ProbeBurnedEmit, bitCntAddress)}(_buyer, burnedProbe, burnedCommission, refund);
+            emit ProbeBurned{dest: address.makeAddrExtern(ProbeBurnedEmit, bitCntAddress)}(_buyer, burnedProbe, bondBurn, refund);
             return;
         }
 
-        // Standard split — the SAME window-gated streaming close as stop() (directive 92): the disputed
-        // tick goes to the seller ONLY if its acceptance window has elapsed by the timeout, else it
-        // refunds to the buyer (no overpay when _settleWindow > DISPUTE_WINDOW). Disputed → no rebate.
-        (uint128 toSeller, uint128 refundB) = _settleStreamingClose();
+        // Streaming timeout, no concession (§4.2): burn the buyer's disputed sum D
+        // (`_prepaid + _frozen`) AND an equal D from the seller bond — the seller gets
+        // NOTHING from the disputed ticks (symmetric mark-for-mark burn). The unburned
+        // bond and the remaining deposit return to their owners. Disputed → no rebate.
+        uint128 D        = _prepaid + _frozen;
+        uint128 bondBurn = D;
+        if (bondBurn > _sellerBond) { bondBurn = _sellerBond; }
+        uint128 bondBack = _sellerBond - bondBurn;
+        uint128 refundB  = _deposit;
+        _prepaid = 0; _frozen = 0; _deposit = 0; _sellerBond = 0;
         _disputed = false; _opened = false;
 
-        _settleFees(false);   // disputed → no rebate, burn net (§5.3)
+        _burnShell(D);
+        _burnShell(bondBurn);
+        if (bondBack > 0) { _finalizedOwed += bondBack; }
 
-        _unlockBoth();
+        _settleFees(false);   // disputed → no rebate, burn accrued fees (§5.3)
+
         _payShell(_buyer, refundB);
 
-        emit DisputeResolved{dest: address.makeAddrExtern(DisputeResolvedEmit, bitCntAddress)}(toSeller, refundB, false);
+        emit DisputeResolved{dest: address.makeAddrExtern(DisputeResolvedEmit, bitCntAddress)}(0, refundB, false);
     }
 
-    function _unlockBoth() private view {
-        IStreamNote(_buyer).streamDisputeUnlock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
-        IStreamNote(_buyer).streamUnlock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
-        IStreamNote(_sellerNote).streamDisputeUnlock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
+    /// @notice Buyer withdraws the dispute (§4.2): settle as the standard split (§4.1) —
+    ///         the window-gated tick to the seller, buffer to the buyer — and return the
+    ///         seller bond in full. The buyer's escape hatch from a dispute they no longer
+    ///         pursue, avoiding the mutual burn of a timeout. Streaming only: a probe
+    ///         dispute has no split and resolves by concession or timeout (else a buyer
+    ///         could dodge the §3.1.2 probe burn by dispute-then-abandon).
+    function abandonDispute() public {
+        ensureBalance();
+        require(_disputed, ERR_NOT_DISPUTED);
+        require(msg.sender == _buyer, ERR_NOT_BUYER);
+        require(_probeAccepted, ERR_NOT_STREAMING);
+        tvm.accept();
+
+        (uint128 toSeller, uint128 refundB) = _settleStreamingClose();
+        _finalizedOwed += _sellerBond; _sellerBond = 0;   // bond returned in full
+        _disputed = false; _opened = false;
+
+        _settleFees(false);   // a dispute ever opened → no rebate (§5.3)
+
+        _payShell(_buyer, refundB);
+
+        emit DisputeResolved{dest: address.makeAddrExtern(DisputeResolvedEmit, bitCntAddress)}(toSeller, refundB, true);
     }
 
     // ========================================================
@@ -606,17 +910,16 @@ contract TokenContract is AiRegistryModifiers {
 
         if (!_probeAccepted) {
             // Seller no-show on the probe (§3.1.2/§3.4): the buyer reclaims the
-            // probe tick in full (pays nothing), the commission is returned to
-            // the seller. NO burn — a no-show is not slashed (§9.1).
-            uint128 commission = _sellerProbeLocked;
-            _sellerProbeLocked = 0;
-            _finalizedOwed    += commission;
+            // probe tick in full (pays nothing), the bond is returned to the seller.
+            // NO burn — a no-show is not slashed (§9.1).
+            uint128 bondBack = _sellerBond;
+            _sellerBond = 0;
+            _finalizedOwed += bondBack;
 
             uint128 refund = _frozen + _deposit;
             _frozen = 0; _deposit = 0;
             _opened = false;
 
-            IStreamNote(_buyer).streamUnlock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
             _payShell(_buyer, refund);
 
             emit StreamReclaimed{dest: address.makeAddrExtern(StreamReclaimedEmit, bitCntAddress)}(_buyer, refund);
@@ -625,19 +928,24 @@ contract TokenContract is AiRegistryModifiers {
 
         // Seller delivered the prepaid tick before vanishing → P + fee finalized;
         // buyer reclaims the buffer + remaining deposit. No rebate (abandoned).
-        uint128 fee = _fee(_pricePerTick);
-        _finalizedOwed  += _prepaid;
-        _feeAccrued     += fee;
-        _ticksFinalized += 1;
-        _deposit        -= fee;
+        // Guard _prepaid>0: only a delivered (prepaid) tick is finalized here; a
+        // stream that exhausted its deposit has none, so it is skipped. The buyer
+        // must still exit on timeout, so this path never reverts.
+        if (_prepaid > 0) {
+            uint128 fee = _fee(_pricePerTick);
+            _finalizedOwed  += _prepaid;
+            _feeAccrued     += fee;
+            _ticksFinalized += 1;
+            _deposit        -= fee;
+        }
 
         uint128 refundB = _frozen + _deposit;
         _prepaid = 0; _frozen = 0; _deposit = 0;
+        _finalizedOwed += _sellerBond; _sellerBond = 0;   // no-show is not slashed → bond returned (§9.1)
         _opened  = false;
 
         _settleFees(false);   // seller abandoned → no rebate, burn net
 
-        IStreamNote(_buyer).streamUnlock{value: DAPP_MSG_VALUE, flag: 1, bounce: false}(address(this));
         _payShell(_buyer, refundB);
 
         emit StreamReclaimed{dest: address.makeAddrExtern(StreamReclaimedEmit, bitCntAddress)}(_buyer, refundB);
@@ -648,26 +956,31 @@ contract TokenContract is AiRegistryModifiers {
     // ========================================================
 
     /// @notice Anyone, after `MATCH_OPEN_TIMEOUT` with no open(): refund the
-    ///         buyer's full deposit and return any posted probe commission to
+    ///         buyer's full deposit and return any posted seller bond to
     ///         the seller (nothing delivered → no fee, no penalty, §2.1), then
     ///         self-destruct the dead deal.
     /// @dev    Permissionless (no-show recovery), so the payout is NOT caller-chosen: the buyer's
-    ///         deposit + seller commission (ECC SHELL) are refunded to their fixed notes FIRST, then
+    ///         deposit + seller bond (ECC SHELL) are refunded to their fixed notes FIRST, then
     ///         the residual native gas is swept to the canonical SuperRoot (a fixed protocol sink),
     ///         never to an arbitrary caller-supplied address.
     function cleanupUnopened() public {
         ensureBalance();
         require(_funded, ERR_NOT_FUNDED);
         require(!_opened, ERR_ALREADY_OPEN);
+        // Never-opened only: after a real open+close the earnings live in
+        // `_finalizedOwed` for withdrawShell, so this permissionless recovery is scoped
+        // to the never-opened case. A funded deal that genuinely never opened has
+        // _everOpened=false.
+        require(!_everOpened, ERR_ALREADY_OPEN);
         require(uint64(block.timestamp) >= _fundedTime + MATCH_OPEN_TIMEOUT, ERR_STREAM_TIMEOUT_OPEN);
         tvm.accept();
 
-        uint128 refund     = _deposit;
-        uint128 commission = _sellerProbeLocked;
-        _deposit = 0; _sellerProbeLocked = 0; _funded = false; _sellerProbeFunded = false;
+        uint128 refund = _deposit;
+        uint128 bondBack = _sellerBond;
+        _deposit = 0; _sellerBond = 0; _funded = false; _sellerBondFunded = false;
 
         _payShell(_buyer, refund);
-        _payShell(_sellerNote, commission);   // return the seller's probe commission
+        _payShell(_sellerNote, bondBack);   // return the seller's bond (no-show, not slashed)
 
         emit ContractDestroyed{dest: address.makeAddrExtern(ContractDestroyedEmit, bitCntAddress)}(address(this));
         selfdestruct(address.makeAddrStd(0, SUPER_ROOT_ADDR));   // residual native → fixed SuperRoot, not caller
@@ -688,21 +1001,38 @@ contract TokenContract is AiRegistryModifiers {
         _payShell(recipient, amount);
 
         emit ShellWithdrawn{dest: address.makeAddrExtern(ShellWithdrawnEmit, bitCntAddress)}(recipient, amount);
+
+        // Auto-cleanup on the funded happy path: a funded deal whose stream has
+        // closed (`!_opened`, buyer already refunded by `stop`) and whose seller
+        // just drained the last of `_finalizedOwed` has nothing left to do → sweep
+        // the residual to the recipient. A funded TC's sell offer was consumed on
+        // the fill (removed from the book), so no resting offer remains and this is
+        // race-free.
+        if (_funded && !_opened && !_disputed && _finalizedOwed == 0 && !_offerPosted) {
+            emit ContractDestroyed{dest: address.makeAddrExtern(ContractDestroyedEmit, bitCntAddress)}(address(this));
+            selfdestruct(recipient);
+        }
     }
 
     function destroy(address payoutAddress) public onlyOwnerPubkey(_sellerPubkey) accept {
         require(!_opened, ERR_STILL_OPEN);
         require(!_disputed, ERR_DISPUTED);
+        // Emergency manual close. Blocked while a LIVE sell offer still rests on the
+        // book, so the TC is never destroyed out from under a resting offer that a
+        // later match could fund. `_offerPosted` tracks the REAL offer state (cleared
+        // on match-fill in _recordFunding), not the `_funded` proxy, so this single
+        // check is exact. Cancel the offer first (via the note, or use `close`).
+        require(!_offerPosted, ERR_OFFER_LIVE);
         // Never selfdestruct over a live buyer deposit: a matched-but-unopened deal
         // (_funded && !_opened) still holds the buyer's escrowed SHELL, which selfdestruct would
-        // sweep to the seller-chosen payoutAddress. Refund the buyer (and return the seller's probe
-        // commission) first, mirroring cleanupUnopened, so the sweep only takes residual native gas.
+        // sweep to the seller-chosen payoutAddress. Refund the buyer (and return the seller's
+        // bond) first, mirroring cleanupUnopened, so the sweep only takes residual native gas.
         if (_funded) {
-            uint128 refund     = _deposit;
-            uint128 commission = _sellerProbeLocked;
-            _deposit = 0; _sellerProbeLocked = 0; _funded = false; _sellerProbeFunded = false;
+            uint128 refund   = _deposit;
+            uint128 bondBack = _sellerBond;
+            _deposit = 0; _sellerBond = 0; _funded = false; _sellerBondFunded = false;
             _payShell(_buyer, refund);
-            _payShell(_sellerNote, commission);
+            _payShell(_sellerNote, bondBack);
         }
         emit ContractDestroyed{dest: address.makeAddrExtern(ContractDestroyedEmit, bitCntAddress)}(address(this));
         selfdestruct(payoutAddress);
@@ -721,10 +1051,18 @@ contract TokenContract is AiRegistryModifiers {
                 _finalizedOwed, _prepaidTime, _lastAdvance, _disputeTime, _fundedTime);
     }
 
-    /// @notice Probe state (spec §3.1.2): whether the seller posted the
-    ///         commission and the SHELL amount currently locked as it.
-    function getProbe() external view returns (bool probeFunded, uint128 probeLocked, uint128 probeCommission) {
-        return (_sellerProbeFunded, _sellerProbeLocked, _probeCommission());
+    /// @notice Offer state: `offerPosted` = the TC has a live resting sell offer on
+    ///         the order book right now; `closing` = a seller wind-down is in progress
+    ///         (the offer is being cancelled before self-destruct). Lets a client read
+    ///         whether this TC is actively selling.
+    function getOffer() external view returns (bool offerPosted, bool closing) {
+        return (_offerPosted, _closing);
+    }
+
+    /// @notice Seller bond state (spec §4.2): whether the seller posted the mirror
+    ///         bond, the SHELL amount currently held as it, and the required bond (2P).
+    function getSellerBond() external view returns (bool bondFunded, uint128 bondHeld, uint128 bondRequired) {
+        return (_sellerBondFunded, _sellerBond, _bondAmount());
     }
 
     function getConfig() external view returns (
@@ -743,7 +1081,7 @@ contract TokenContract is AiRegistryModifiers {
     }
 
     function getDeal() external view returns (uint128 tickSize, uint128 pricePerTick, uint128 maxTicks) {
-        return (_tickSize, _pricePerTick, _maxTicks);
+        return (TICK_SIZE, _pricePerTick, _maxTicks);
     }
 
     function getParties() external view returns (address buyer, address sellerNote) {

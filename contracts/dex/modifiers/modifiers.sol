@@ -215,12 +215,12 @@ abstract contract Modifiers is Errors {
     /// @notice DApp identifier for the PMPRoot ("rootPN") system — RootPN, PrivateNote,
     ///         PMP, and OrderBook all share this dapp_id. Used as `dest_dapp_id` on
     ///         cross-contract message sends targeted at any of these contracts.
-    uint256 constant ROOT_PN_DAPP_ID = 0x0000000000000000000000000000000000000000000000000000000000000000;
+    uint256 constant ROOT_PN_DAPP_ID = 0x0000000000000000000000000000000000000000000000000000000000000004;
 
     /// @notice DApp identifier for the Oracle system — RootOracle, Oracle, and
     ///         OracleEventList all share this dapp_id. Used as `dest_dapp_id` on
     ///         cross-contract message sends targeted at any of these contracts.
-    uint256 constant ORACLE_DAPP_ID = 0x0000000000000000000000000000000000000000000000000000000000000000;
+    uint256 constant ORACLE_DAPP_ID = 0x0000000000000000000000000000000000000000000000000000000000000004;
 
     /// @notice Voting threshold for OracleUnion decisions
     uint32 constant THRESHOLD = 6600; // 66% = 6600

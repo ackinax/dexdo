@@ -16,7 +16,7 @@ interface IInferenceOB {
 contract OracleEventList is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.30";
 
     // ── Range events (numeric outcomes): the price is resolved on-chain from an
     // InferenceOrderBook's weekly median, mapped to a numeric range = outcome.
@@ -51,6 +51,12 @@ contract OracleEventList is Modifiers {
 
     /// @notice Registry of events managed by this OracleEventList.
     mapping(uint256 => EventInfo) public _events;
+
+    /// @notice Active confirmation per canonical PMP: PMP address value => eventId it confirmed.
+    ///         Presence means this exact PMP holds one confirmation for that event, so
+    ///         `confirmEvent`/`cancelEvent` are idempotent per PMP and `onBounce` can find
+    ///         which event to release when a PMP's approveEvent cannot be delivered.
+    mapping(uint256 => uint256) _pmpConfirmed;
 
     /// @notice Emitted when a new event is added to the registry.
     /// @param eventId Deterministic event identifier hash.
@@ -90,12 +96,10 @@ contract OracleEventList is Modifiers {
     ) {
         tvm.accept();
         // `_oracle` is a static field (set via stateInit to the legitimate
-        // Oracle address). Without this check, the old code was
-        //     _oracle = msg.sender;
-        // which an attacker could exploit by race-deploying OEL at the
-        // deterministic address using a stateInit where _oracle == legit
-        // Oracle, letting the constructor overwrite _oracle with the
-        // attacker's own address. Check sender matches static field instead.
+        // Oracle address). Require the sender to match that static field rather
+        // than assigning `_oracle = msg.sender` in the constructor, so `_oracle`
+        // is fixed by the deterministic stateInit and cannot be reassigned by the
+        // deploying message.
         require(msg.sender == _oracle, ERR_INVALID_SENDER);
         // pubkey=0 would hand OEL admin access (addEvent/deleteEvent) to any
         // keyless ext tx — and since PMP.approveEvent propagates this into
@@ -146,9 +150,8 @@ contract OracleEventList is Modifiers {
         require(outcomeCount < 20, ERR_INVALID_PARAMS);
         // Outcome ids must be a dense 0..n-1 range. PMP derives _numOutcomes from the
         // key count and indexes _typedOutcomePools by id, validating outcomeId <
-        // _numOutcomes (PMP.stake/resolve). A sparse/1-based map (e.g. {1,2}) would
-        // otherwise accept bets on a phantom id 0 yet revert resolve on the labeled
-        // outcome with ERR_INVALID_OUTCOME_ID after quorum.
+        // _numOutcomes (PMP.stake/resolve). Requiring a dense 0-based map keeps the
+        // stakeable ids and the resolvable ids identical.
         for (uint32 i = 0; i < outcomeCount; i++) {
             require(outcomeNames.exists(i), ERR_INVALID_PARAMS);
         }
@@ -191,7 +194,7 @@ contract OracleEventList is Modifiers {
         require(deadline >= uint64(block.timestamp) + MIN_RESULT_GAP, ERR_INVALID_PARAMS);
         ensureBalance();
         uint32 n = uint32(bounds.length);
-        require(n >= 1, ERR_INVALID_PARAMS);                         // ≥1 bound → ≥2 outcomes
+        require(n >= 1 && n < 19, ERR_INVALID_PARAMS);               // ≥1 bound → ≥2 outcomes; < 19 bounds → < 20 outcomes, caps the loop BEFORE it runs
         for (uint32 i = 1; i < n; i++) {
             require(bounds[i] > bounds[i - 1], ERR_INVALID_PARAMS);  // strictly increasing
         }
@@ -225,23 +228,41 @@ contract OracleEventList is Modifiers {
         public senderIs(DexLib.computePMPAddressFromHash(_pmpSaltedCodeHash, _pmpSaltedCodeDepth, eventId, oracleListHash, tokenType)) accept
     {
         ensureBalance();
-        _oracle.transfer({value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ORACLE_DAPP_ID});
+        // Do NOT forward the oracle fee yet: on a reject path the oracle never
+        // services the event, so the fee (msg.currencies) must go back to the
+        // PMP (which handles staker refunds), not be gifted to the oracle. Only
+        // the approve branch below pays the oracle.
         if (!_events.exists(eventId)) {
-            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}();
+            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID}();
             return;
         }
         EventInfo eventInfo = _events[eventId];
-        if ((eventInfo.deadline < block.timestamp) || (msg.currencies[CURRENCIES_ID_SHELL] < eventInfo.oracleFee)) {
-            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}();
-        } else {
+        // A range event drives PMP.setTimings(result-start = deadline), which needs the same
+        // MIN_RESULT_GAP lead addRangeEvent enforced at creation. That lead can lapse between
+        // creation and this (later) confirm, so re-check it here — otherwise submitSetTimings
+        // (sent bounce:false below) reverts and silently wedges the PMP (approved, never opens).
+        uint64 minDeadline = _rangeData[eventId].exists
+            ? uint64(block.timestamp) + MIN_RESULT_GAP
+            : uint64(block.timestamp);
+        if ((eventInfo.deadline < minDeadline) || (msg.currencies[CURRENCIES_ID_SHELL] < eventInfo.oracleFee)) {
+            PMP(msg.sender).rejectEvent{value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID}();
+        } else if (!_pmpConfirmed.exists(msg.sender.value)) {
+            // First confirmation from this canonical PMP: pay the oracle, count it once and
+            // record the active confirmation. A repeat confirmEvent from the same PMP is then
+            // a no-op (cannot double-count), and onBounce can release this confirmation if the
+            // approveEvent below cannot be delivered.
+            _oracle.transfer({value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ORACLE_DAPP_ID});
             eventInfo.count += 1;
             _events[eventId] = eventInfo;
+            _pmpConfirmed[msg.sender.value] = eventId;
+            // approveEvent keeps bounce=true (default): if it cannot be delivered its bounce
+            // reaches onBounce, which releases this confirmation's count.
             PMP(msg.sender).approveEvent{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(_oraclePubkey, eventInfo.outcomeNames, eventInfo.describe, eventInfo.eventName, eventInfo.trustAddr);
-            // Range event: this OEL is the single oracle, so it also sets the PMP
-            // timing (result-start = deadline). Sent after approveEvent so the
-            // trust-addr oracle is already registered (quorum-of-1 → applies).
+            // Range event: this OEL is the single oracle, so it also sets the PMP timing
+            // (result-start = deadline). Sent bounce:false so a submitSetTimings failure does
+            // not reach onBounce and wrongly release the already-delivered approveEvent's count.
             if (_rangeData[eventId].exists) {
-                PMP(msg.sender).submitSetTimings{value: 0.1 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(eventInfo.deadline);
+                PMP(msg.sender).submitSetTimings{value: 0.1 vmshell, flag: 1, bounce: false, dest_dapp_id: ROOT_PN_DAPP_ID}(eventInfo.deadline);
             }
             address addrExtern = address.makeAddrExtern(ORACLE_EVENT_CONFIRMED, bitCntAddress);
             emit EventConfirmed{dest: addrExtern}(eventId, msg.sender);
@@ -260,14 +281,17 @@ contract OracleEventList is Modifiers {
         return n;
     }
 
-    /// @notice Resolve a RANGE event — callable by ANYONE after the deadline
-    ///         (spec §6: on-chain event). Pulls the OB weekly median async; the
-    ///         mapping + PMP resolve happen in onWeeklyMedian.
-    function resolveRange(uint256 eventId, uint256 oracleListHash, uint32 tokenType) public {
+    /// @notice Resolve a RANGE event — callable by the oracle owner after the
+    ///         deadline, once at least one PMP has confirmed the event. Pulls the
+    ///         OB weekly median async; the mapping + PMP resolve happen in
+    ///         onWeeklyMedian.
+    function resolveRange(uint256 eventId, uint256 oracleListHash, uint32 tokenType)
+        external onlyOwnerPubkey(_oraclePubkey) accept
+    {
         require(_rangeData[eventId].exists, ERR_NOT_RANGE_EVENT);
         require(_events.exists(eventId), ERR_NOT_RANGE_EVENT);
         require(_events[eventId].deadline <= block.timestamp, ERR_INVALID_PARAMS);
-        tvm.accept();
+        require(_events[eventId].count > 0, ERR_INVALID_PARAMS);
         ensureBalance();
         IInferenceOB(_rangeData[eventId].ob).requestWeeklyMedian{value: 1 vmshell, flag: 1, bounce: false}(
             eventId, oracleListHash, tokenType);
@@ -283,7 +307,10 @@ contract OracleEventList is Modifiers {
         ensureBalance();
         uint32 outcomeId = _priceToOutcome(eventId, price);
         address pmp = DexLib.computePMPAddressFromHash(_pmpSaltedCodeHash, _pmpSaltedCodeDepth, eventId, oracleListHash, tokenType);
-        PMP(pmp).submitResolve{value: 0.2 vmshell, flag: 1, dest_dapp_id: ROOT_PN_DAPP_ID}(outcomeId);
+        // bounce:false so a rejected resolution (PMP state/time guards) cannot bounce back into
+        // onBounce and be mistaken for a failed approveEvent, which would wrongly release this
+        // PMP's active confirmation. Only approveEvent drives the onBounce count self-heal.
+        PMP(pmp).submitResolve{value: 0.2 vmshell, flag: 1, bounce: false, dest_dapp_id: ROOT_PN_DAPP_ID}(outcomeId);
     }
 
     /// @notice Range-event data (bounds + bound OB) for off-chain inspection.
@@ -300,9 +327,38 @@ contract OracleEventList is Modifiers {
         public senderIs(DexLib.computePMPAddressFromHash(_pmpSaltedCodeHash, _pmpSaltedCodeDepth, eventId, oracleListHash, tokenType)) accept
     {
         ensureBalance();
-        EventInfo eventInfo = _events[eventId];
-        eventInfo.count -= 1;
-        _events[eventId] = eventInfo;
+        // Release only the confirmation this exact PMP holds, and only once. A repeat cancel,
+        // or a cancel that races with the approveEvent bounce already released by onBounce,
+        // finds no active confirmation and is a no-op — so the count can neither underflow nor
+        // drop a different PMP's confirmation.
+        if (_pmpConfirmed.exists(msg.sender.value)) {
+            delete _pmpConfirmed[msg.sender.value];
+            EventInfo eventInfo = _events[eventId];
+            if (eventInfo.count > 0) {
+                eventInfo.count -= 1;
+                _events[eventId] = eventInfo;
+            }
+        }
+    }
+
+    /// @notice When a confirming PMP's approveEvent cannot be delivered (the PMP self-destructed
+    ///         before or while confirming, or rejected the confirmation after being cancelled),
+    ///         its bounce returns here. Release the confirmation that PMP held so the event's
+    ///         count is not left leaked and the event can later be deleted. Idempotent with
+    ///         cancelEvent: whichever runs first clears the active flag, the other is a no-op.
+    onBounce(TvmSlice body) external {
+        body;
+        tvm.accept();
+        ensureBalance();
+        if (_pmpConfirmed.exists(msg.sender.value)) {
+            uint256 eventId = _pmpConfirmed[msg.sender.value];
+            delete _pmpConfirmed[msg.sender.value];
+            EventInfo eventInfo = _events[eventId];
+            if (eventInfo.count > 0) {
+                eventInfo.count -= 1;
+                _events[eventId] = eventInfo;
+            }
+        }
     }
 
     /// @notice Deletes an event when there are no active confirmations or deadline is expired.
@@ -312,8 +368,11 @@ contract OracleEventList is Modifiers {
         EventInfo eventInfo = _events[eventId];
         if ((eventInfo.count == 0) && (eventInfo.deadline < block.timestamp)) {
             delete _events[eventId];
+            // Clear the range sidecar too: a later addEvent reusing the same params yields the same
+            // eventId hash, and a stale _rangeData.exists would wrongly drive the range flow.
+            if (_rangeData.exists(eventId)) { delete _rangeData[eventId]; }
         }
-    } 
+    }
     
     /// @notice Returns contract version
     /// @return value0 Contract semantic version.
