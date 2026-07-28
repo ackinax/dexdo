@@ -5,7 +5,7 @@
 
 when:
   - event: push
-    branch: [dev, main]
+    branch: [dev, main, feature/adjust-deployment]   # TEMP: testing deploy on this branch
   - event: pull_request
     branch: [dev, main]
   - event: tag
@@ -19,7 +19,7 @@ variables:
           from_secret: DOCKER_GOSH_SH_PASSWORD
   # Step-level triggers: everything except tags, vs tags only.
   - not_tag: &not_tag
-      - { event: push, branch: [dev, main] }
+      - { event: push, branch: [dev, main, feature/adjust-deployment] }   # TEMP: testing branch
       - { event: pull_request, branch: [dev, main] }
   - is_tag: &is_tag
       - { event: tag }
