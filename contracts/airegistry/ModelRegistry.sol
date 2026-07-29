@@ -1,0 +1,182 @@
+pragma gosh-solidity >=0.76.1;
+pragma AbiHeader expire;
+pragma AbiHeader pubkey;
+
+// The book type is imported ONLY so `abi.encodeStateInit` reproduces the exact
+// InferenceOrderBook init-data layout for address derivation. Together with the
+// pinned code hash/depth below this PINS the registry to a specific
+// InferenceOrderBook version — the derived address is valid only for books
+// deployed by that SAME version (the init-data cell is sensitive to the book's
+// full variable layout, not just its `_modelHash` static — verified on-chain).
+// The pin is cascade-updated (like NOTE_CODE_HASH) on every book layout/version
+// bump: bump IOB_CODE_HASH + IOB_CODE_DEPTH and `updateCode`. Nothing else to do —
+// the address is derived on read, so a pin change is picked up automatically.
+import "./InferenceOrderBook.sol";
+
+/// @title Canonical Model Registry
+/// @notice Owner-curated set of canonical model names. A name is either present
+///         (registered) or not — `mapping(nameHash => bool)`. The order book
+///         address is DERIVED on read from `sha256(name)` + the pinned book code
+///         hash/depth (mirroring DexLib.computeInferenceOrderBookAddress); it is
+///         NOT stored, so an IOB pin bump needs no re-cache.
+/// @dev    Owner == the account's key (`tvm.pubkey()`), set in the zerostate to
+///         the SuperRoot key. Only the owner may mutate or `updateCode`.
+contract ModelRegistry {
+
+    /// @notice Contract semantic version (kept in lockstep with the airegistry stack).
+    string constant version = "4.0.30";
+
+    // ── pinned InferenceOrderBook code (cascade-updated on version bump) ──
+    /// @dev InferenceOrderBook 4.0.20 (tickSize=1M) code hash + depth. One model ⇒ one book.
+    uint256 constant IOB_CODE_HASH  = 0x85561ec2f7d972799cbcf807817855fb2164103c67bde54ffcdce2eda66ee8cd;
+    uint16  constant IOB_CODE_DEPTH = 36;
+
+    /// @notice Self-top-up floor (mirrors the airegistry stack).
+    uint64 constant MIN_BALANCE = 100 vmshell;
+
+    // ── errors ────────────────────────────────────────────────
+    uint16 constant ERR_NOT_OWNER  = 100; // caller is not the owner key
+    uint16 constant ERR_NO_PUBKEY  = 101; // deployed without a pubkey
+    uint16 constant ERR_NOT_MODEL  = 102; // model is not registered
+    uint16 constant ERR_NAME_TOO_LONG = 103; // model name > 127 bytes (see MODEL_NAME_MAX)
+
+    // A canonical model name MUST fit one cell (<=127 bytes), the same bound the
+    // InferenceOrderBook / TokenContract constructors enforce. The book address is
+    // derived from `sha256(name)`, and `sha256`/SHA256U hashes only the FIRST cell —
+    // so a longer name is truncated to its first 127 bytes for the id while its entry
+    // key here is `tvm.hash(bytes(name))` over the FULL name. Without this bound two
+    // distinct long names sharing the first 127 bytes would be two registry entries
+    // but resolve to ONE order book (merged liquidity/oracle). Enforcing the bound on
+    // every write keeps both hashes injective over the name space → one entry ↔ one book.
+    uint16 constant MODEL_NAME_MAX = 127;
+
+    /// @notice nameHash => registered.  nameHash = tvm.hash(bytes(name)).
+    mapping(uint256 => bool) _models;
+
+    /// @notice Live cardinality of `_models`, maintained incrementally on every insert/remove so
+    ///         `count()` is O(1). A full-map scan would blow the get-method gas budget at the
+    ///         production scale (~8558+ entries).
+    uint32 _count;
+
+    /// @dev Only the owner key may mutate. `accept` so the owner pays gas.
+    modifier onlyOwner() {
+        require(msg.pubkey() == tvm.pubkey(), ERR_NOT_OWNER);
+        tvm.accept();
+        _;
+    }
+
+    constructor() {
+        require(tvm.pubkey() != 0, ERR_NO_PUBKEY);
+        tvm.accept();
+    }
+
+    /// @dev Keep the account funded for its own gas/outgoing messages.
+    function ensureBalance() private pure {
+        if (address(this).balance > MIN_BALANCE) { return; }
+        gosh.mintshellq(MIN_BALANCE);
+    }
+
+    function _key(string name) private pure returns (uint256) {
+        return tvm.hash(bytes(name));
+    }
+
+    /// @dev Derive the book address from the pinned code hash/depth + model hash.
+    ///      Builds the init-data cell via `contr: InferenceOrderBook` (empty
+    ///      code) then hashes the StateInit from (codeHash, dataHash, depths) —
+    ///      identical to DexLib's hash-based derivations.
+    function _orderBook(uint256 modelHash) private pure returns (address) {
+        TvmCell dummy;
+        TvmCell si = abi.encodeStateInit({
+            contr: InferenceOrderBook,
+            varInit: { _modelHash: modelHash },
+            code: dummy
+        });
+        TvmSlice s = si.toSlice();
+        s.skip(5);       // StateInit header: split_depth/special/code?/data?/library?
+        s.loadRef();     // skip the (empty) code ref
+        TvmCell data = s.loadRef();
+        return address.makeAddrStd(
+            0, abi.stateInitHash(IOB_CODE_HASH, tvm.hash(data), IOB_CODE_DEPTH, data.depth())
+        );
+    }
+
+    // ── mutators (owner only) ─────────────────────────────────
+
+    /// @notice Register a single canonical model name.
+    function setModel(string canonicalName) public onlyOwner {
+        ensureBalance();
+        if (!canonicalName.empty()) {
+            require(canonicalName.byteLength() <= MODEL_NAME_MAX, ERR_NAME_TOO_LONG);
+            uint256 k = _key(canonicalName);
+            if (!_models[k]) { _models[k] = true; _count++; }   // count only NEW keys → incremental
+        }
+    }
+
+    /// @notice Register many canonical names in one call (bulk seed, e.g. 100 at
+    ///         a time) — merged into the existing set. Empty strings are skipped.
+    function setModels(string[] names) public onlyOwner {
+        ensureBalance();
+        for (uint32 i = 0; i < names.length; i++) {
+            // Skip empty AND over-long (>127) names rather than revert the whole batch —
+            // an over-long name would alias another entry's order book (see MODEL_NAME_MAX).
+            if (!names[i].empty() && names[i].byteLength() <= MODEL_NAME_MAX) {
+                uint256 k = _key(names[i]);
+                if (!_models[k]) { _models[k] = true; _count++; }
+            }
+        }
+    }
+
+    /// @notice Unregister a canonical model name.
+    function removeModel(string canonicalName) public onlyOwner {
+        ensureBalance();
+        uint256 k = _key(canonicalName);
+        if (_models[k]) { delete _models[k]; _count--; }
+    }
+
+    /// @notice Upgrade this contract's code in place (owner-gated). The fixed
+    ///         address is preserved. `onCodeUpgrade` WIPES the whole model set —
+    ///         a clean slate on upgrade.
+    function updateCode(TvmCell newcode) public onlyOwner {
+        ensureBalance();
+        tvm.commit();
+        tvm.setcode(newcode);
+        tvm.setCurrentCode(newcode);
+        onCodeUpgrade();
+    }
+
+    /// @dev Runs once, right after the code swap. Wipes all registered models
+    ///     (single source of truth is re-seeded fresh after an upgrade).
+    function onCodeUpgrade() private {
+        delete _models;
+        _count = 0;
+    }
+
+    // ── getters ───────────────────────────────────────────────
+
+    /// @notice Order book address of a REGISTERED model (reverts `ERR_NOT_MODEL`
+    ///         if the name is not registered). Derived on the fly — no cache.
+    function orderBookOf(string canonicalName) public view returns (address) {
+        require(_models[_key(canonicalName)], ERR_NOT_MODEL);
+        return _orderBook(sha256(canonicalName));
+    }
+
+    /// @notice Whether a name is registered.
+    function has(string canonicalName) external view returns (bool) {
+        return _models[_key(canonicalName)];
+    }
+
+    /// @notice sha256(canonicalName) — the on-chain authoritative model id.
+    function modelHashOf(string canonicalName) external pure returns (uint256) {
+        return sha256(canonicalName);
+    }
+
+    /// @notice Number of registered models.
+    function count() external view returns (uint32) {
+        return _count;   // O(1) — no full-map scan (the set is unbounded at ~8558+ entries)
+    }
+
+    /// @notice The pinned book code hash + depth used for derivation.
+    function inferenceOrderBookCode() external pure returns (uint256 codeHash, uint16 codeDepth) {
+        return (IOB_CODE_HASH, IOB_CODE_DEPTH);
+    }
+}

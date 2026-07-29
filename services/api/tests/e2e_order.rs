@@ -82,10 +82,11 @@ async fn buy_limit_gtc_against_shellnet() {
     // (`--test-threads 1`) regardless — every test routes through the same
     // shellnet root singletons (`RootOracle` / `RootPn`), which a distinct
     // PN per slot does not deconflict (see tests/fixtures/README.md). With
-    // no parallelism the PN `_busy` lock never contends, so one funded note
-    // covers the whole suite.
+    // no parallelism the PN `_busy` lock never contends within a binary.
     let pn_pool = TestPnPool::load();
-    let trader = pn_pool.first().clone();
+    // Test isolation: each e2e binary takes its own note from the pool — a stream/
+    // dispute lock left on a shared note gates split/merge (ERR_STREAM_LOCKED).
+    let trader = pn_pool.notes[4 % pn_pool.notes.len()].clone();
     let market =
         deploy_ephemeral_market(vec![network_endpoint()], &trader, DeployOptions::default())
             .await

@@ -7,12 +7,24 @@ import "./PrivateNote.sol";
 import "./Nullifier.sol";
 import "./Oracle.sol";
 import "./libraries/DexLib.sol";
+import "../airegistry/TokenContract.sol";
 
 /// @notice Root contract responsible for deploying PrivateNote contracts
 contract RootPN is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.30";
+
+    // Canonical SuperRoot account id + RootModel/TokenContract code hashes. Baked
+    // into every PrivateNote at deploy (`deployPrivateNote`) so the note derives the
+    // canonical RootModel / deal TC locally and posts its offer in a single call.
+    // RootPN is not pinned by anyone, so pinning these here is cycle-free
+    // (cascade-updated together with the note's baked copies).
+    uint256 constant SUPER_ROOT_ADDR           = 0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c;
+    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xd5a43621a3873cd436aad52b172d769cd1735dacf20dccfd52daa8fab2ddd35c;
+    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 12;
+    uint256 constant ROOT_MODEL_CODE_HASH      = 0x88eab99d8b9f0d194a6400c04f1978465e4c59c8abe7df929145affbb9422f5a;
+    uint16  constant ROOT_MODEL_CODE_DEPTH     = 8;
 
     /// @notice Stored code of PrivateNote contract
     TvmCell _privateNoteCode;
@@ -142,9 +154,13 @@ contract RootPN is Modifiers {
     /// @param amount — Amount withdrawn
     event ProtocolFeeWithdrawn(address to, uint256 dapp_id, uint32 tokenType, uint128 amount);
 
-    /// @notice Root constructor
+    /// @notice Root constructor — intentionally unreachable.
+    /// @dev This root is only ever brought up via the stub + `updateCode`
+    ///      bootstrap, which installs the code and `_ownerPubkey` through
+    ///      `onCodeUpgrade` and does not run this constructor. A direct deploy is
+    ///      not a supported path, so it is rejected outright.
     constructor() {
-        tvm.accept();
+        require(false, ERR_NOT_ALLOWED_CONSTRUCTOR);
     }
 
     /// @notice Ensures minimal native balance for root operations
@@ -207,14 +223,11 @@ contract RootPN is Modifiers {
     ) public view {
         tvm.accept();
         ensureBalance();
-        // Frontrun defense: `depositIdentifierHash` (recipient) is NOT in the
-        // zk proof's public inputs, so the proof alone doesn't bind the
-        // destination. Without a signature gate, an attacker could replay a
-        // pending user's proof with their own `depositIdentifierHash` and
-        // reroute the SHELL-fee ECC into a PN they control. Require the caller
-        // to sign the ext message with the destination PN's ephemeral key.
-        // (This restricts third-party SHELL top-ups; use case is typically
-        // self-funding, and the owner holds this key.)
+        // `depositIdentifierHash` (recipient) is NOT in the zk proof's public inputs,
+        // so the proof alone doesn't bind the destination. The caller must sign the
+        // ext message with the destination PN's ephemeral key, which binds the proof
+        // to a recipient the signer controls. (This restricts third-party SHELL
+        // top-ups; use case is typically self-funding, and the owner holds this key.)
         require(msg.pubkey() == recipientEphemeralPubkey, ERR_INVALID_SENDER);
         require(recipientEphemeralPubkey != 0, ERR_INVALID_PARAMS);
 
@@ -223,26 +236,24 @@ contract RootPN is Modifiers {
             ERR_INVALID_HISTORY_PROOF
         );
 
-        // Bind `value` to the proof's nominal: an attacker cannot mint
-        // arbitrary balance from a tiny voucher.
+        // Bind `value` to the proof's nominal, so the minted balance always equals
+        // the voucher's committed nominal.
         require(_u64ToFr(value) == voucherNominalFr, ERR_INVALID_ZKPROOF);
-        // Only SHELL_FEE vouchers may be spent here. A SHELL voucher (type 2)
-        // would otherwise let an attacker route a regular voucher's nominal
-        // into a PN they don't own.
+        // Only SHELL_FEE vouchers may be spent here, so this path spends exactly the
+        // SHELL_FEE token type and not a regular (type 2) SHELL voucher.
         require(_u32ToFr(CURRENCIES_ID_SHELL_FEE) == tokenTypeFr, ERR_INVALID_ZKPROOF);
 
         // Instance 0 = nullifierHash (the source voucher's dih). The proof
         // attests ownership of the SHELL_FEE voucher whose dih is
         // nullifierHash. `depositIdentifierHash` (recipient) is NOT in
-        // the proof — to prevent an attacker from replaying a pending tx
-        // with a different recipient we rely on:
+        // the proof; the recipient is bound two independent ways:
         //   a) instance 4 = recipientEphemeralPubkey: the voucher was
         //      generated with a commit to this exact pubkey (see
-        //      generateVoucher). Attacker's swap of recipientEphemeralPubkey
+        //      generateVoucher), so changing recipientEphemeralPubkey
         //      breaks zk verification.
         //   b) msg.pubkey() == recipientEphemeralPubkey gate above:
-        //      belt-and-suspenders so a replay by an unrelated key also
-        //      fails at signature check.
+        //      belt-and-suspenders so a mismatched key also fails at the
+        //      signature check.
         bytes pubInputs;
         pubInputs.append(bytes(bytes32(nullifierHash)));
         pubInputs.append(bytes(bytes32(finalLayerHistoricalHashRoot)));
@@ -315,33 +326,38 @@ contract RootPN is Modifiers {
             ERR_INVALID_HISTORY_PROOF
         );
 
-        // Bind user's `value` and `tokenType` to the proof's pubInputs so
-        // a 100-shell voucher proof cannot be replayed as e.g. a 1M-NACKL
-        // deposit (BUG #6 — money minting from a stale/cheap voucher).
+        // Bind user's `value` and `tokenType` to the proof's pubInputs so the
+        // minted deposit always equals the voucher's committed nominal and token
+        // type (a 100-shell voucher proof cannot mint a 1M-NACKL deposit).
         require(_u64ToFr(value) == voucherNominalFr, ERR_INVALID_ZKPROOF);
         require(_u32ToFr(tokenType) == tokenTypeFr, ERR_INVALID_ZKPROOF);
-        // BUG #7 footgun: eph=0 means msg.pubkey()==0 passes onlyOwnerPubkey on
-        // every PN method — any keyless tx can drain the PN. Reject up front.
+        // Require a non-zero ephemeral key: eph=0 would make msg.pubkey()==0 pass
+        // onlyOwnerPubkey on every PN method, so a zero key is rejected up front.
         require(ephemeralPubkey != 0, ERR_INVALID_PARAMS);
-        // BUG #9: SHELL_FEE (300) is the gas-only token used by
-        // sendEccShellToPrivateNote. A PN whose main ledger holds SHELL_FEE
-        // creates a phantom asset (RootPN doesn't custody type-300 ECC, only
-        // type-2), so trading flows would silently break. Reject deployment
-        // for the fee-only token.
+        // Bind the message signer to the ephemeral key (mirrors
+        // sendEccShellToPrivateNote). The proof only commits ephemeralPubkey as a
+        // single field element via _u256ToFr, which is not injective over 256 bits
+        // (~5 congruent siblings share one Fr), so the zk check alone does NOT pin
+        // the full key: a third party could replay the proof with a congruent
+        // sibling and deploy the note at the same (dih-derived) address under a key
+        // nobody holds, permanently locking the deposit. Requiring the signer to
+        // hold the ephemeral secret closes this — at the cost of third-party deploy.
+        require(msg.pubkey() == ephemeralPubkey, ERR_INVALID_SENDER);
+        // SHELL_FEE (300) is the gas-only token used by sendEccShellToPrivateNote.
+        // RootPN custodies only type-2 ECC, not type-300, so a PN's main ledger
+        // must not hold SHELL_FEE; deployment for the fee-only token is rejected.
         require(tokenType != CURRENCIES_ID_SHELL_FEE, ERR_INVALID_PARAMS);
 
-        // Frontrun defense — bind ephemeralPubkey to the proof. The halo2
-        // circuit emits ephemeralPubkey as instance 4; any mismatch between
-        // the caller-supplied value and the one baked into the proof aborts
-        // zkhalo2verify. Attacker cannot substitute their own pubkey without
-        // re-running the prover against a secret they don't own.
+        // Bind ephemeralPubkey to the proof as instance 4. NOTE: _u256ToFr reduces
+        // mod FR_MODULUS, so this pins only the Fr projection of the key, not its
+        // full 256 bits — the msg.pubkey() gate above is what binds the exact key.
         //
         // CIRCUIT/PROVER CONTRACT:
         //   pubInputs[0] = depositIdentifierHash
         //   pubInputs[1] = finalLayerHistoricalHashRoot
         //   pubInputs[2] = voucherNominalFr
         //   pubInputs[3] = tokenTypeFr
-        //   pubInputs[4] = ephemeralPubkey (raw uint256 big-endian 32 bytes)
+        //   pubInputs[4] = ephemeralPubkey (Fr, _u256ToFr of the raw uint256)
         // The halo2 prover MUST expose the same 5-field instance vector.
         bytes pubInputs;
         pubInputs.append(bytes(bytes32(depositIdentifierHash)));
@@ -358,7 +374,8 @@ contract RootPN is Modifiers {
             value: 50 vmshell,
             flag: 1
         }(value, ephemeralPubkey, tokenType, _pmpCode, _orderBookCode, _inferenceOrderBookCode,
-          tvm.hash(_oracleCode), _oracleCode.depth(), tvm.hash(_oracleEventListCode), _oracleEventListCode.depth());
+          tvm.hash(_oracleCode), _oracleCode.depth(), tvm.hash(_oracleEventListCode), _oracleEventListCode.depth(),
+          TOKEN_CONTRACT_CODE_HASH, TOKEN_CONTRACT_CODE_DEPTH, ROOT_MODEL_CODE_HASH, ROOT_MODEL_CODE_DEPTH);
     }
 
     /// @notice Records deployment of a PrivateNote contract
@@ -401,6 +418,12 @@ contract RootPN is Modifiers {
         ensureBalance();
         _inferenceOrderBookCode = inferenceOrderBookCode;
     }
+
+    // The InferenceOrderBook code hash is no longer requested from RootPN at runtime.
+    // RootPN bakes the book code (`_inferenceOrderBookCode`) AND the TokenContract /
+    // RootModel code hashes into every note at deploy (see `deployPrivateNote`); the
+    // seller's canonical PrivateNote derives the deal TC locally and hands it the book
+    // hash directly via `TokenContract.postFromNote` — a single seller call, no round-trip.
 
     /// @notice Owner-only setter for the PrivateNote code. Kept out of `onCodeUpgrade` so the upgrade
     ///         message stays small — the PrivateNote code is the largest in the bundle and a full
@@ -482,11 +505,10 @@ contract RootPN is Modifiers {
 	}
 
     /// @notice Withdraws tokens to a specified wallet.
-    /// @dev The inner `transfer` flag is hard-coded to 1. Allowing a
-    ///      caller-supplied flag here would let any PN owner pass TVM flags
-    ///      128 (CARRY_ALL_BALANCE) or 32 (DELETE_IF_EMPTY) — draining or
-    ///      destroying this RootPN. Since RootPN custodies every PN's ECC,
-    ///      that single tx would steal or brick the entire DEX.
+    /// @dev The inner `transfer` flag is hard-coded to 1. A caller-supplied flag
+    ///      could pass TVM flags 128 (CARRY_ALL_BALANCE) or 32 (DELETE_IF_EMPTY),
+    ///      which would move or clear RootPN's whole balance. RootPN custodies
+    ///      every PN's ECC, so the flag is fixed to 1 to keep that custody intact.
     /// @param amounts Per-token-type amounts to withdraw (the note's full balance)
     /// @param walletAddr Destination wallet address
     /// @param initialDataHash Initial data hash for verification
@@ -507,8 +529,8 @@ contract RootPN is Modifiers {
         for ((uint32 tt, uint128 amt) : amounts) {
             if (amt > 0 && (address(this).currencies[tt] < amt || _deployedValues[tt] < amt)) {
                 // Bounce the note's attached PHYSICAL currency (its inference SHELL pool,
-                // drained on withdraw) back to it along with the revert — it must not
-                // strand in RootPN when the custody withdraw is refused.
+                // drained on withdraw) back to it along with the revert, so it returns to
+                // the note when the custody withdraw is refused.
                 PrivateNote(msg.sender).revertWithdraw{value: 0.1 vmshell, flag: 1, currencies: msg.currencies, dest_dapp_id: ROOT_PN_DAPP_ID}(
                     amounts
                 );
@@ -551,7 +573,7 @@ contract RootPN is Modifiers {
     /// @param amount Accumulated protocol fee amount.
     function collectProtocolFee(uint256 eventId, uint256 oracleListHash, uint32 tokenType, uint128 amount)
         public
-        senderIs(DexLib.computeOrderBookAddress(_privateNoteCode, _orderBookCode, eventId, oracleListHash, tokenType))
+        senderIs(DexLib.computeOrderBookAddressFromPmpCode(_privateNoteCode, _pmpCode, _orderBookCode, eventId, oracleListHash, tokenType))
         accept
     {
         ensureBalance();

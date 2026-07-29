@@ -90,10 +90,12 @@ async fn buy_full_set_against_shellnet() {
         return;
     };
 
-    // Shared single note — the suite is single-threaded (see
-    // tests/fixtures/README.md), so the PN `_busy` lock never contends.
+    // The suite is single-threaded (see tests/fixtures/README.md), so the PN
+    // `_busy` lock never contends within a binary.
     let pn_pool = TestPnPool::load();
-    let trader = pn_pool.first().clone();
+    // Test isolation: each e2e binary takes its own note from the pool — a stream/
+    // dispute lock left on a shared note gates split/merge (ERR_STREAM_LOCKED).
+    let trader = pn_pool.notes[1 % pn_pool.notes.len()].clone();
 
     // `deploy_ephemeral_market` ends with its own splitFullSet, so by
     // the time this returns the market is in TRADING and the trader-PN

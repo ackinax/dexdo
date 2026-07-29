@@ -72,14 +72,6 @@ impl AsyncGuardedMut<Account> for TokenContract {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-/// Parameters for `TokenContract.fund`.
-pub struct ParamsOfFund {
-    /// `uint256`, decimal or hex string.
-    pub buyer_pubkey: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 /// Parameters for `TokenContract.fundFromOrderBook` (callback from the order
 /// book on a match; sender must be the order book).
 pub struct ParamsOfFundFromOrderBook {
@@ -116,6 +108,19 @@ pub struct ParamsOfDestroy {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Result of `TokenContract.getOffer`.
+///
+/// The whole sell-offer chain (note → `postFromNote` → book) is `bounce:false`,
+/// so this latch is the only readable evidence of where an offer got to:
+/// `offer_posted` is set the moment the TC forwards to the book and cleared
+/// again by `onSellClosed` when the book refuses to rest it.
+pub struct ResultOfGetOffer {
+    pub offer_posted: bool,
+    pub closing: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// Result of `TokenContract.getState`.
 pub struct ResultOfGetState {
     pub funded: bool,
@@ -140,13 +145,14 @@ pub struct ResultOfGetState {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Result of `TokenContract.getProbe`.
-pub struct ResultOfGetProbe {
-    pub probe_funded: bool,
+/// Result of `TokenContract.getSellerBond` — the seller's mirror bond, the only
+/// seller collateral held against the deal (spec §4.2).
+pub struct ResultOfGetSellerBond {
+    pub bond_funded: bool,
     #[serde(deserialize_with = "deserialize_u128")]
-    pub probe_locked: u128,
+    pub bond_held: u128,
     #[serde(deserialize_with = "deserialize_u128")]
-    pub probe_commission: u128,
+    pub bond_required: u128,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,13 +268,11 @@ impl TokenContract {
     /// # Direct fund (buyer pays the deposit straight to the deal)
     ///
     /// Original contract method: `fund`
-    pub async fn fund(
-        &self,
-        params: ParamsOfFund,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set =
-            CallSet { function_name: "fund".to_string(), header: None, input: Some(json!(params)) };
+    ///
+    /// Takes no arguments: the buyer must first be bound to the deal via
+    /// `authorizeDirectFund`, and the deposit rides on the message value.
+    pub async fn fund(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
+        let call_set = CallSet { function_name: "fund".to_string(), header: None, input: None };
         self.send_message(Some(call_set), None, signer).await
     }
 
@@ -288,12 +292,12 @@ impl TokenContract {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Seller posts the probe commission (ECC[2] SHELL)
+    /// # Seller posts the mirror bond (ECC[2] SHELL)
     ///
-    /// Original contract method: `fundProbeCommission`
-    pub async fn fund_probe_commission(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
+    /// Original contract method: `fundSellerBond`
+    pub async fn fund_seller_bond(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
         let call_set =
-            CallSet { function_name: "fundProbeCommission".to_string(), header: None, input: None };
+            CallSet { function_name: "fundSellerBond".to_string(), header: None, input: None };
         self.send_message(Some(call_set), None, signer).await
     }
 
@@ -414,9 +418,14 @@ impl TokenContract {
         self.call_get_method::<ResultOfGetState>("getState").await
     }
 
-    /// Original contract method: `getProbe`.
-    pub async fn get_probe(&self) -> KitResult<ResultOfGetProbe> {
-        self.call_get_method::<ResultOfGetProbe>("getProbe").await
+    /// Original contract method: `getSellerBond`.
+    pub async fn get_seller_bond(&self) -> KitResult<ResultOfGetSellerBond> {
+        self.call_get_method::<ResultOfGetSellerBond>("getSellerBond").await
+    }
+
+    /// Original contract method: `getOffer`.
+    pub async fn get_offer(&self) -> KitResult<ResultOfGetOffer> {
+        self.call_get_method::<ResultOfGetOffer>("getOffer").await
     }
 
     /// Original contract method: `getConfig`.

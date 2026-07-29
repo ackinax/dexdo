@@ -8,7 +8,6 @@
 			"inputs": [
 				{"name":"modelName","type":"string"},
 				{"name":"modelHash","type":"uint256"},
-				{"name":"tickSize","type":"uint128"},
 				{"name":"pricePerTick","type":"uint128"},
 				{"name":"maxTicks","type":"uint128"},
 				{"name":"sellerNote","type":"address"}
@@ -19,6 +18,14 @@
 		{
 			"name": "fund",
 			"inputs": [
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "authorizeDirectFund",
+			"inputs": [
+				{"name":"buyerNote","type":"address"},
 				{"name":"buyerPubkey","type":"uint256"}
 			],
 			"outputs": [
@@ -34,7 +41,41 @@
 			]
 		},
 		{
-			"name": "fundProbeCommission",
+			"name": "postFromNote",
+			"inputs": [
+				{"name":"iobHash","type":"uint256"},
+				{"name":"iobDepth","type":"uint16"},
+				{"name":"depositIdentifierHash","type":"uint256"},
+				{"name":"flags","type":"uint8"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "placeSellOffer",
+			"inputs": [
+				{"name":"flags","type":"uint8"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "onSellClosed",
+			"inputs": [
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "close",
+			"inputs": [
+				{"name":"payoutAddress","type":"address"}
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "fundSellerBond",
 			"inputs": [
 			],
 			"outputs": [
@@ -78,6 +119,13 @@
 		},
 		{
 			"name": "resolveDisputeTimeout",
+			"inputs": [
+			],
+			"outputs": [
+			]
+		},
+		{
+			"name": "abandonDispute",
 			"inputs": [
 			],
 			"outputs": [
@@ -134,13 +182,22 @@
 			]
 		},
 		{
-			"name": "getProbe",
+			"name": "getOffer",
 			"inputs": [
 			],
 			"outputs": [
-				{"name":"probeFunded","type":"bool"},
-				{"name":"probeLocked","type":"uint128"},
-				{"name":"probeCommission","type":"uint128"}
+				{"name":"offerPosted","type":"bool"},
+				{"name":"closing","type":"bool"}
+			]
+		},
+		{
+			"name": "getSellerBond",
+			"inputs": [
+			],
+			"outputs": [
+				{"name":"bondFunded","type":"bool"},
+				{"name":"bondHeld","type":"uint128"},
+				{"name":"bondRequired","type":"uint128"}
 			]
 		},
 		{
@@ -264,7 +321,7 @@
 			]
 		},
 		{
-			"name": "ProbeCommissionFunded",
+			"name": "SellerBondFunded",
 			"inputs": [
 				{"name":"amount","type":"uint128"}
 			],
@@ -285,7 +342,7 @@
 			"inputs": [
 				{"name":"buyer","type":"address"},
 				{"name":"toSeller","type":"uint128"},
-				{"name":"commissionReturned","type":"uint128"}
+				{"name":"bondReturned","type":"uint128"}
 			],
 			"outputs": [
 			]
@@ -295,7 +352,7 @@
 			"inputs": [
 				{"name":"buyer","type":"address"},
 				{"name":"burnedProbe","type":"uint128"},
-				{"name":"burnedCommission","type":"uint128"},
+				{"name":"burnedBond","type":"uint128"},
 				{"name":"refundToBuyer","type":"uint128"}
 			],
 			"outputs": [
@@ -373,21 +430,30 @@
 		{"init":true,"name":"_sellerPubkey","type":"uint256"},
 		{"init":true,"name":"_rootModelAddress","type":"address"},
 		{"init":true,"name":"_nonce","type":"uint64"},
+		{"init":false,"name":"_iobHash","type":"uint256"},
+		{"init":false,"name":"_iobDepth","type":"uint16"},
+		{"init":false,"name":"_noteAuthorized","type":"bool"},
+		{"init":false,"name":"_offerPosted","type":"bool"},
+		{"init":false,"name":"_closing","type":"bool"},
+		{"init":false,"name":"_closePayout","type":"address"},
 		{"init":false,"name":"_modelName","type":"string"},
 		{"init":false,"name":"_modelHash","type":"uint256"},
-		{"init":false,"name":"_tickSize","type":"uint128"},
 		{"init":false,"name":"_pricePerTick","type":"uint128"},
 		{"init":false,"name":"_maxTicks","type":"uint128"},
 		{"init":false,"name":"_buyer","type":"address"},
 		{"init":false,"name":"_buyerPubkey","type":"uint256"},
+		{"init":false,"name":"_authorizedBuyer","type":"address"},
+		{"init":false,"name":"_authorizedBuyerPubkey","type":"uint256"},
 		{"init":false,"name":"_sellerNote","type":"address"},
 		{"init":false,"name":"_endpointCipher","type":"bytes"},
 		{"init":false,"name":"_funded","type":"bool"},
+		{"init":false,"name":"_fundedFromBook","type":"bool"},
 		{"init":false,"name":"_opened","type":"bool"},
+		{"init":false,"name":"_everOpened","type":"bool"},
 		{"init":false,"name":"_probeAccepted","type":"bool"},
 		{"init":false,"name":"_disputed","type":"bool"},
-		{"init":false,"name":"_sellerProbeFunded","type":"bool"},
-		{"init":false,"name":"_sellerProbeLocked","type":"uint128"},
+		{"init":false,"name":"_sellerBondFunded","type":"bool"},
+		{"init":false,"name":"_sellerBond","type":"uint128"},
 		{"init":false,"name":"_deposit","type":"uint128"},
 		{"init":false,"name":"_prepaid","type":"uint128"},
 		{"init":false,"name":"_frozen","type":"uint128"},

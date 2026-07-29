@@ -188,6 +188,16 @@ abstract contract Errors {
 
     uint16 constant ERR_NOTIONAL_OVERFLOW = 168;
 
+    /// @notice deployPMP: this note already holds a stake record for the event
+    ///         (a prior deployPMP already succeeded). Blocks a re-deploy that
+    ///         would overwrite the committed stake and re-debit the balance.
+    uint16 constant ERR_STAKE_EXISTS = 169;
+
+    /// @notice A root (RootPN / RootOracle) may only be brought up via the
+    ///         stub + `updateCode` bootstrap; deploying it with its own
+    ///         constructor is not a supported path and is rejected outright.
+    uint16 constant ERR_NOT_ALLOWED_CONSTRUCTOR = 170;
+
     // ===== Replay protection =====
 
     /// @notice External message hash already processed within its expireAt window.
@@ -213,11 +223,8 @@ abstract contract Errors {
     ///         prevent stale-stake races.
     uint16 constant ERR_NORM_REFUND_PENDING = 404;
 
-    /// @notice An inference-market stream/dispute lock is held; withdraw / split
-    ///         / merge are gated until the deal releases it (spec §4.3).
-    uint16 constant ERR_STREAM_LOCKED = 405;
-    /// @notice The `tokenContract` passed to `postSellOffer` is not a canonical
-    ///         TokenContract derived from the pinned code + the seller note's key
-    ///         (an attacker could otherwise route the buyer's SHELL to a fake).
+    /// @notice `placeSellOffer` caller is not the canonical TokenContract for
+    ///         `(sellerPubkey, nonce)` derived from the pinned code + the seller's
+    ///         key, so only a canonical TC can post an offer.
     uint16 constant ERR_BAD_TOKEN_CONTRACT = 406;
 }
