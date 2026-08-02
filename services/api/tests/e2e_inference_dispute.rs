@@ -68,6 +68,11 @@ const POLL_TICKS: u32 = 45;
 // also constrained to whole multiples of `PRICE_STEP` (1e9), which makes 2 SHELL
 // the cheapest price that keeps the window open past the timeout: W = 1200s.
 const PRICE_PER_TICK: u128 = 2_000_000_000;
+// A SELL offer commits no collateral at offer time, so the note makes its
+// lifetime mandatory and caps it: `1 <= ttl <= MAX_SELL_TTL` (3600s). A zero
+// is NOT good-till-cancel — `postSellOffer` reverts ERR_SELL_DEADLINE_TOO_LONG
+// (405), and the book rejects a zero deadline on an ask too.
+const SELL_TTL: u64 = 3600;
 const DEAL_TICKS: u128 = 4;
 // >= ticks * (price + 2.5% fee) = 4 * 2.05e9 = 8.2e9.
 const BUY_ESCROW: u128 = 10_000_000_000;
@@ -344,9 +349,13 @@ async fn setup_deal(
     .await
     .map_err(|e| format!("deploy TokenContract: {e:?}"))?;
 
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
-        .await
-        .map_err(|e| format!("postSellOffer: {e:?}"))?;
+    dex.post_sell_offer(
+        &note.address,
+        ParamsOfPostSellOffer { flags: 0, nonce, ttl: SELL_TTL },
+        signer(),
+    )
+    .await
+    .map_err(|e| format!("postSellOffer: {e:?}"))?;
     wait_sell_offer_rested(dex, ob, &tc, POLL_TICKS, POLL_TICK).await?;
 
     dex.place_inference_buy(

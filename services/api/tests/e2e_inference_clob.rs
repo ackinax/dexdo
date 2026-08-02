@@ -44,6 +44,11 @@ const POLL_TICKS: u32 = 45;
 // 1e9); the book rejects sub-SHELL dust with ERR_BAD_PARAM before assigning an
 // order id, so a too-small price reads as "the order never rested".
 const PRICE_PER_TICK: u128 = 1_000_000_000;
+// A SELL offer commits no collateral at offer time, so the note makes its
+// lifetime mandatory and caps it: `1 <= ttl <= MAX_SELL_TTL` (3600s). A zero
+// is NOT good-till-cancel — `postSellOffer` reverts ERR_SELL_DEADLINE_TOO_LONG
+// (405), and the book rejects a zero deadline on an ask too.
+const SELL_TTL: u64 = 3600;
 /// `ERR_NO_LIQUIDITY` in `contracts/airegistry/InferenceOrderBook.sol` — what
 /// `getWeeklyMedianPrice` raises while the book has recorded no finalized ticks.
 const ERR_NO_LIQUIDITY: u32 = 334;
@@ -132,9 +137,13 @@ async fn inference_partial_fill_leaves_remainder() {
     eprintln!("[e2e_clob] order_book={ob} token_contract={tc}");
 
     // 2-tick SELL offer rests.
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
-        .await
-        .expect("postSellOffer");
+    dex.post_sell_offer(
+        &note.address,
+        ParamsOfPostSellOffer { flags: 0, nonce, ttl: SELL_TTL },
+        signer(),
+    )
+    .await
+    .expect("postSellOffer");
     // Assert the precondition instead of falling through: with no resting ask the
     // buy below has nothing to cross, and the real cause resurfaces much later as a
     // misleading "match never funded" / ERR_NO_LIQUIDITY out of getWeeklyMedianPrice.
@@ -245,14 +254,17 @@ async fn inference_subscription_place_and_read() {
     const FLAG_AON: u8 = 0x20;
     const FLAG_SUBSCRIPTION: u8 = 0x40;
 
-    // escrow must be >= ticks * (price + platform fee); 8 * (1e9 + 2.5%) = 8.2e9.
+    // A subscription's escrow must cover the full tick cost AND a `2P` bond on top
+    // — the TC sets the bond aside and derives the ticks from what is left, so it
+    // is never taken out of the volume. 8 * (1e9 + 2.5%) + 2 * 1e9 = 10.2e9; pay
+    // 11e9 for margin. `ticks` must also divide into SUB_WEEKS (4) whole weeks.
     dex.place_inference_buy(
         &note.address,
         ParamsOfPlaceInferenceBuy {
             model_hash: model_hash.clone(),
             max_price_per_tick: PRICE_PER_TICK,
             ticks: 8,
-            escrow: 10_000_000_000,
+            escrow: 11_000_000_000,
             flags: FLAG_SUBSCRIPTION | FLAG_AON,
             deadline: 0,
         },
@@ -325,9 +337,13 @@ async fn inference_match_emits_filled_event() {
     .await
     .expect("deploy TokenContract");
 
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
-        .await
-        .expect("postSellOffer");
+    dex.post_sell_offer(
+        &note.address,
+        ParamsOfPostSellOffer { flags: 0, nonce, ttl: SELL_TTL },
+        signer(),
+    )
+    .await
+    .expect("postSellOffer");
     // Same precondition as above: a missing ask surfaces much later as a
     // misleading "match never funded" / ERR_NO_LIQUIDITY.
     if let Err(diag) = wait_sell_offer_rested(&dex, &ob, &tc, POLL_TICKS, POLL_TICK).await {

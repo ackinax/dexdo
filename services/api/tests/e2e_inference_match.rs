@@ -52,6 +52,11 @@ const POLL_TICKS: u32 = 45; // 90s budget per wait.
 // 1e9); the book rejects sub-SHELL dust with ERR_BAD_PARAM before assigning an
 // order id, so a too-small price reads as "the order never rested".
 const PRICE_PER_TICK: u128 = 1_000_000_000;
+// A SELL offer commits no collateral at offer time, so the note makes its
+// lifetime mandatory and caps it: `1 <= ttl <= MAX_SELL_TTL` (3600s). A zero
+// is NOT good-till-cancel — `postSellOffer` reverts ERR_SELL_DEADLINE_TOO_LONG
+// (405), and the book rejects a zero deadline on an ask too.
+const SELL_TTL: u64 = 3600;
 const OFFER_TICKS: u128 = 2;
 
 fn unique_suffix() -> u128 {
@@ -130,9 +135,13 @@ async fn inference_offer_matches_buy_and_funds_token_contract() {
     eprintln!("[e2e_match] token_contract={tc}");
 
     // 3. Seller posts a SELL offer backed by the TokenContract.
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
-        .await
-        .expect("postSellOffer accepted");
+    dex.post_sell_offer(
+        &note.address,
+        ParamsOfPostSellOffer { flags: 0, nonce, ttl: SELL_TTL },
+        signer(),
+    )
+    .await
+    .expect("postSellOffer accepted");
 
     // Wait until the offer rests in the book.
     if let Err(diag) = wait_sell_offer_rested(&dex, &ob, &tc, POLL_TICKS, POLL_TICK).await {

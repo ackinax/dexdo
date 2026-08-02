@@ -51,6 +51,11 @@ const POLL_TICKS: u32 = 45;
 // A limit price must be a positive whole multiple of `PRICE_STEP` (1 SHELL =
 // 1e9), so 1 SHELL is the cheapest deal this test can open.
 const PRICE_PER_TICK: u128 = 1_000_000_000;
+// A SELL offer commits no collateral at offer time, so the note makes its
+// lifetime mandatory and caps it: `1 <= ttl <= MAX_SELL_TTL` (3600s). A zero
+// is NOT good-till-cancel — `postSellOffer` reverts ERR_SELL_DEADLINE_TOO_LONG
+// (405), and the book rejects a zero deadline on an ask too.
+const SELL_TTL: u64 = 3600;
 const DEAL_TICKS: u128 = 4;
 // Seller mirror bond = `TokenContract._bondAmount()` = 2P, plus a small margin.
 const SELLER_BOND: u128 = 2 * PRICE_PER_TICK + PRICE_PER_TICK / 100;
@@ -130,9 +135,13 @@ async fn inference_stream_open_accept_probe_stop_against_shellnet() {
     eprintln!("[e2e_stream] order_book={ob} token_contract={tc}");
 
     // 3. Offer ↔ buy ⇒ handover funds the TokenContract.
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
-        .await
-        .expect("postSellOffer accepted");
+    dex.post_sell_offer(
+        &note.address,
+        ParamsOfPostSellOffer { flags: 0, nonce, ttl: SELL_TTL },
+        signer(),
+    )
+    .await
+    .expect("postSellOffer accepted");
     if let Err(diag) = wait_sell_offer_rested(&dex, &ob, &tc, POLL_TICKS, POLL_TICK).await {
         failures.push(diag);
         finish(&dex, &note.address, &model_hash, &keys, failures).await;

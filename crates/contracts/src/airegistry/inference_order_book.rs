@@ -89,8 +89,10 @@ pub struct ParamsOfPlaceSellOffer {
     /// The seller's note, recorded as the offer's owner so a fill can settle
     /// back to it.
     pub owner_note: String,
-    /// Time-in-force deadline (`0` = good-till-cancel). A resting offer past its
-    /// deadline is retired by `expireOrder`, which emits `InferenceOrderExpired`.
+    /// Absolute deadline, set by the note from its `ttl`. Unlike a BUY's, an ask's
+    /// deadline is mandatory — a zero would rest as good-till-cancel and the book
+    /// rejects it as malformed. A resting offer past it is retired by
+    /// `expireOrder`, which emits `InferenceOrderExpired`.
     pub deadline: u64,
 }
 

@@ -467,8 +467,11 @@ pub struct ParamsOfPostSellOffer {
     pub flags: u8,
     /// Deal nonce the `TokenContract` address is derived from.
     pub nonce: u64,
-    /// Seconds the offer may rest before `expireOrder` may retire it (`0` =
-    /// good-till-cancel). The book stores it as an absolute deadline.
+    /// Mandatory offer lifetime in seconds, `1 <= ttl <= MAX_SELL_TTL` (3600).
+    /// A SELL commits no collateral at offer time, so its lifetime is required
+    /// rather than optional: zero is rejected with `ERR_SELL_DEADLINE_TOO_LONG`,
+    /// not read as good-till-cancel. The note turns it into an absolute deadline
+    /// anchored at the call.
     pub ttl: u64,
 }
 
