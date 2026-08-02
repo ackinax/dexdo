@@ -223,6 +223,12 @@ abstract contract Errors {
     ///         prevent stale-stake races.
     uint16 constant ERR_NORM_REFUND_PENDING = 404;
 
+    /// @notice `postSellOffer` ttl is 0 or exceeds `MAX_SELL_TTL` (1 hour). A SELL
+    ///         offer commits no collateral at offer time, so its lifetime is
+    ///         mandatory and capped (spec §2.1.1). The note rejects an out-of-range
+    ///         ttl up front, before it can reach the book.
+    uint16 constant ERR_SELL_DEADLINE_TOO_LONG = 405;
+
     /// @notice `placeSellOffer` caller is not the canonical TokenContract for
     ///         `(sellerPubkey, nonce)` derived from the pinned code + the seller's
     ///         key, so only a canonical TC can post an offer.

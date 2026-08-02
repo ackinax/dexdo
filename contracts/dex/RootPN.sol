@@ -13,17 +13,17 @@ import "../airegistry/TokenContract.sol";
 contract RootPN is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.30";
+    string constant version = "4.0.32";
 
-    // Canonical SuperRoot account id + RootModel/TokenContract code hashes. Baked
-    // into every PrivateNote at deploy (`deployPrivateNote`) so the note derives the
-    // canonical RootModel / deal TC locally and posts its offer in a single call.
-    // RootPN is not pinned by anyone, so pinning these here is cycle-free
+    // RootModel/TokenContract code hashes. Baked into every PrivateNote at deploy
+    // (`deployPrivateNote`) so the note derives the canonical RootModel / deal TC
+    // locally and posts its offer in a single call. The SuperRoot account id the
+    // note pairs these with is its own constant — RootPN never derives an address
+    // itself. RootPN is not pinned by anyone, so pinning these here is cycle-free
     // (cascade-updated together with the note's baked copies).
-    uint256 constant SUPER_ROOT_ADDR           = 0x0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c;
-    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xd5a43621a3873cd436aad52b172d769cd1735dacf20dccfd52daa8fab2ddd35c;
-    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 12;
-    uint256 constant ROOT_MODEL_CODE_HASH      = 0x88eab99d8b9f0d194a6400c04f1978465e4c59c8abe7df929145affbb9422f5a;
+    uint256 constant TOKEN_CONTRACT_CODE_HASH  = 0xb866fde2d1a021d357b7fb75d7dd7dd39b125e101c3cfa32045a8a6f9e9ab8c0;
+    uint16  constant TOKEN_CONTRACT_CODE_DEPTH = 18;
+    uint256 constant ROOT_MODEL_CODE_HASH      = 0x8f14a5df64341d261dfd00ff996bf90ba750f78baa3104fba1a72279a6afb6ff;
     uint16  constant ROOT_MODEL_CODE_DEPTH     = 8;
 
     /// @notice Stored code of PrivateNote contract
@@ -408,6 +408,11 @@ contract RootPN is Modifiers {
         // setInferenceOrderBookCode — keeps this upgrade cell small enough to POST
         // to the shellnet BM gateway (a 7-code cell overflows the JSON-body limit).
         (_pmpCode, _privateNoteCode, _nullifierCode, _oracleCode, _oracleEventListCode, _orderBookCode, _ownerPubkey) = abi.decode(cell, (TvmCell, TvmCell, TvmCell, TvmCell, TvmCell, TvmCell, uint256));
+        // `onlyOwnerPubkey(k)` is `require(msg.pubkey() == k)`, so a zero key admits every
+        // unsigned message and this contract's own `updateCode` stops being owner-gated. The key
+        // arrives in the migration cell, which is where it has to be rejected — the constructor
+        // does not run on an account upgraded from a stub.
+        require(_ownerPubkey != 0, ERR_INVALID_PARAMS);
     }
 
     /// @notice Owner-only setter for the InferenceOrderBook code (§8 inference
@@ -527,7 +532,14 @@ contract RootPN is Modifiers {
         // whole withdraw on the PN side (atomic: nothing is transferred). A
         // plain require would leave the PN's `_balance` permanently low.
         for ((uint32 tt, uint128 amt) : amounts) {
-            if (amt > 0 && (address(this).currencies[tt] < amt || _deployedValues[tt] < amt)) {
+            // Measure the custodial reserve WITHOUT whatever the note attached to this very
+            // message. That pool is not custody — it is the note's own physical currency, passed
+            // straight through to the destination as a separate term below — so counting it as
+            // reserve would clear a withdraw against currency that is merely in transit.
+            uint128 attached = msg.currencies.exists(tt) ? uint128(msg.currencies[tt]) : 0;
+            uint128 reserve  = uint128(address(this).currencies[tt]);
+            reserve = reserve > attached ? reserve - attached : 0;
+            if (amt > 0 && (reserve < amt || _deployedValues[tt] < amt)) {
                 // Bounce the note's attached PHYSICAL currency (its inference SHELL pool,
                 // drained on withdraw) back to it along with the revert, so it returns to
                 // the note when the custody withdraw is refused.

@@ -18,7 +18,6 @@ import "../airegistry/TokenContract.sol";
 interface IInferenceDeal {
     function stop() external;
     function dispute() external;
-    function reclaimOnTimeout() external;
     function cleanupUnopened() external;
     function fundSellerBond() external;
 }
@@ -27,7 +26,26 @@ interface IInferenceDeal {
 contract PrivateNote is Modifiers, ReplayProtection {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.30";
+    string constant version = "4.0.32";
+
+    /// @notice Max lifetime (seconds) of a resting SELL offer (spec §2.1.1). A SELL commits NO
+    ///         collateral at offer time (the seller bond is funded only after a match), so an ask
+    ///         left on the book is a free option; a mandatory, bounded expiry caps that exposure.
+    ///         Enforced HERE because the note is the seller's trusted entry and the ONLY path to
+    ///         the book — the TC posts the offer for this note, and there is no direct seller-key
+    ///         post path. The note hands the book an already-anchored ABSOLUTE deadline, so the
+    ///         book neither re-validates the bound (its clock has moved on) nor re-anchors it.
+    uint64 constant MAX_SELL_TTL = 3600;   // 1 hour
+
+    /// @notice Mirrors of the book's order-flag bits and physical bounds, needed to validate an
+    ///         order HERE before it is submitted. They are contract-local constants in
+    ///         `InferenceOrderBook` / `AiRegistryModifiers` and not reachable across contracts, so
+    ///         they are restated — keep in sync with the book if a bit is ever renumbered.
+    uint8   constant FLAG_MARKET         = 0x04;
+    uint8   constant FLAG_AON            = 0x20;
+    uint8   constant FLAG_SUBSCRIPTION   = 0x40;
+    uint8   constant SUB_WEEKS           = 4;         // a subscription is always one month
+    uint128 constant SUB_TICKS_PER_WEEK  = 10_080;    // week / MIN_SECONDS_PER_TICK (60s per tick)
 
     /// @notice Canonical-deal derivation anchors (note-funded model). The TokenContract
     ///         and RootModel code hashes/depths are NOT pinned constants here — they are
@@ -81,7 +99,7 @@ contract PrivateNote is Modifiers, ReplayProtection {
     /// @notice InferenceOrderBook code (§8) baked at deploy by RootPN. The note
     ///         deploys/derives the canonical book from THIS code — never from a
     ///         caller-supplied code or a raw address — so it cannot be tricked
-    ///         into a forged book / wrong build. (Kept in data, not as a code
+    ///         to the canonical book of the matching build. (Kept in data, not as a code
     ///         constant, so the note↔OB pin stays one-way: OB pins the note's
     ///         NOTE_CODE_HASH; pinning the OB hash in the note's CODE would make
     ///         the two hashes mutually recursive and the build never converge.)
@@ -377,8 +395,14 @@ contract PrivateNote is Modifiers, ReplayProtection {
 
     /// @notice Changes the owner public key
     /// @param newPubkey New public key
-    function changeOwner(uint256 newPubkey) public accept saveMsg {
-        require(msg.pubkey() == _ephemeralPubkey, ERR_INVALID_SENDER);
+    /// @dev Authenticated by the MODIFIER, not in the body, so the check runs BEFORE `accept`.
+    ///      Modifiers execute in declaration order: with `accept` first, the note paid the compute
+    ///      for every external message that reached this entry point and only then discovered the
+    ///      sender was a stranger. The self-funding floor does not cover that case — `ensureBalance`
+    ///      sat after the check, so on exactly the path being abused it was never reached, and a
+    ///      revert would have undone it anyway while the gas stayed spent. Every other owner-gated
+    ///      method here already reads `onlyOwnerPubkey(_ephemeralPubkey) accept`; this one did not.
+    function changeOwner(uint256 newPubkey) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
         // Refuse to demote ownership to pubkey=0 — every onlyOwnerPubkey-gated
         // PN method would then accept msg.pubkey()==0, i.e. any unsigned tx.
         require(newPubkey != 0, ERR_INVALID_PARAMS);
@@ -410,15 +434,23 @@ contract PrivateNote is Modifiers, ReplayProtection {
     ///         track the stream; the seller gets it symmetrically (their own TC).
     event InferenceFilledConfirmed(address orderBook, address tokenContract, uint128 orderId, uint128 ticks, uint256 clearingPrice, bool isBuy);
 
-    function onInferencePlaced(uint256 modelHash, address tokenContract, uint128 orderId, bool isBuy, uint256 price, uint128 ticks) public accept {
+    /// @dev Authenticated BEFORE `tvm.accept()`. These mirrors are the note's only inbound entry
+    ///      points that anyone can address, and accepting first would make the note pay the compute
+    ///      for every message sent to them, whoever sent it — the note is the owner's wallet and
+    ///      identity, and without native balance it cannot send anything at all. Same ordering as
+    ///      `TokenContract.fundFromOrderBook`, for the same reason.
+    function onInferencePlaced(uint256 modelHash, address tokenContract, uint128 orderId, bool isBuy, uint256 price, uint128 ticks) public view {
         require(msg.sender == DexLib.computeInferenceOrderBookAddress(_inferenceOrderBookCode, modelHash), ERR_INVALID_SENDER);
+        tvm.accept();
         ensureBalance();
         emit InferenceOrderPlacedConfirmed{dest: address.makeAddrExtern(PRIVATENOTE_INFERENCE_PLACED, bitCntAddress)}(
             msg.sender, tokenContract, orderId, isBuy, price, ticks);
     }
 
-    function onInferenceFilled(uint256 modelHash, address tokenContract, uint128 orderId, uint128 ticks, uint256 clearingPrice, bool isBuy) public accept {
+    /// @dev Authenticated before `tvm.accept()` — see `onInferencePlaced`.
+    function onInferenceFilled(uint256 modelHash, address tokenContract, uint128 orderId, uint128 ticks, uint256 clearingPrice, bool isBuy) public view {
         require(msg.sender == DexLib.computeInferenceOrderBookAddress(_inferenceOrderBookCode, modelHash), ERR_INVALID_SENDER);
+        tvm.accept();
         ensureBalance();
         emit InferenceFilledConfirmed{dest: address.makeAddrExtern(PRIVATENOTE_INFERENCE_FILLED, bitCntAddress)}(
             msg.sender, tokenContract, orderId, ticks, clearingPrice, isBuy);
@@ -429,7 +461,7 @@ contract PrivateNote is Modifiers, ReplayProtection {
 
     /// @notice Deploy an InferenceOrderBook from this note. The OB code is the
     ///         one baked into this note at deploy (`_inferenceOrderBookCode`) —
-    ///         NOT caller-supplied — so a note can never plant a forged/wrong
+    ///         NOT caller-supplied — so the address a note carries is always the canonical
     ///         build. The address derives from that code + the model
     ///         (spec §8), so a given model maps to exactly one book.
     ///         Permissionless: any note holder may (re)deploy the canonical book
@@ -460,29 +492,35 @@ contract PrivateNote is Modifiers, ReplayProtection {
     // methods forward that physical SHELL, so the note itself is the market
     // participant (no external multisig). SHELL id: CURRENCIES_ID_SHELL == 2.
 
-    /// @notice Post a SELL offer to the canonical book for the model from
-    ///         this note, attaching the platform fee in SHELL (spec §2.1). The
-    ///         fee becomes irrevocable on match (no-show penalty); this note is
-    ///         recorded as the sellerNote (fee refund target on cancel).
-    ///         The OB address is derived from the baked
-    ///         `_inferenceOrderBookCode` + model — never a raw address —
-    ///         so SHELL/fee flows cannot be routed to a forged book.
     /// @notice Seller places its resting sell offer in ONE call. Derives the canonical
     ///         per-deal TC for `(this note's ephemeral pubkey, nonce)` from the baked TC
     ///         code hash, then hands it the canonical InferenceOrderBook code hash/depth
     ///         (`_inferenceOrderBookCode`, baked by RootPN) + this note's deposit id +
     ///         order `flags`. The TC verifies the caller is a canonical PrivateNote (its
     ///         pinned note-code hash) and posts its own ask (`msg.sender == TC` at the
-    ///         book), so a forged book/TC is impossible and no RootPN round-trip is needed.
+    ///         book), so the derived book/TC is canonical and no RootPN round-trip is needed.
     ///         Order params (price/ticks) live in the TC (constructor). Re-run after a
     ///         cancel to re-list; the TC self-guards double-posts.
     /// @param flags Order flags (POST_ONLY / IOC / FOK / MARKET) forwarded to the book.
     /// @param nonce Deal nonce identifying the seller's per-deal TC.
-    function postSellOffer(uint8 flags, uint64 nonce) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
+    /// @param ttl Mandatory offer lifetime in seconds, `1 <= ttl <= MAX_SELL_TTL` (spec §2.1.1).
+    ///        `ttl == 0` (GTC) is rejected: a SELL commits no collateral, so it MUST auto-expire.
+    ///        Validated here and converted to an ABSOLUTE deadline anchored NOW, so any time spent
+    ///        reaching the book counts against the offer's life and never extends it past the
+    ///        seller's intent. Out of range → revert `ERR_SELL_DEADLINE_TOO_LONG`.
+    function postSellOffer(uint8 flags, uint64 nonce, uint64 ttl) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
         ensureBalance();
         require(!_hasWithdrawn, ERR_INVALID_STATE);
+        require(ttl != 0 && ttl <= MAX_SELL_TTL, ERR_SELL_DEADLINE_TOO_LONG);
+        // Same shape rule the buy side enforces at submission: a SUBSCRIPTION is one deal against
+        // ONE counterparty for the WHOLE volume, so the flag implies AON. Checked here as well as
+        // in the book because the note is the seller's trusted entry and the only path to it —
+        // a malformed offer should not spend a queue slot or a bounce round-trip to be refused,
+        // and the flags travel from here to `postFromNote` and on to the book untouched.
+        require((flags & FLAG_SUBSCRIPTION) == 0 || (flags & FLAG_AON) != 0, ERR_INVALID_PARAMS);
+        uint64 deadline = uint64(block.timestamp) + ttl;   // absolute, anchored at the seller's call
         TokenContract(_tokenContractAddr(_ephemeralPubkey, nonce)).postFromNote{value: 1 vmshell, flag: 1, bounce: false}(
-            tvm.hash(_inferenceOrderBookCode), _inferenceOrderBookCode.depth(), _depositIdentifierHash, flags);
+            tvm.hash(_inferenceOrderBookCode), _inferenceOrderBookCode.depth(), _depositIdentifierHash, flags, deadline);
     }
 
     /// @notice Send a BUY order from this note with SHELL escrow (spec §2.3).
@@ -497,11 +535,38 @@ contract PrivateNote is Modifiers, ReplayProtection {
         uint8   flags,
         uint64  deadline
     ) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
-        // §8 limit buy on inference: budget = escrow (held in the OB), ceiling =
-        // maxPricePerTick, TIF = deadline (0 = GTC), flags = IOC/FOK/MARKET/POST_ONLY.
+        // Limit buy on inference: budget = escrow (held in the OB), ceiling = maxPricePerTick,
+        // TIF = deadline (0 = GTC), flags = IOC/FOK/MARKET/POST_ONLY/AON/TEE/SUBSCRIPTION.
         // Owner/buyer = this note (OB uses msg.sender).
+        //
+        // A SUBSCRIPTION is placed through THIS call, not a separate one: set FLAG_SUBSCRIPTION
+        // (which requires FLAG_AON — one seller, the whole volume). The term is always one month,
+        // so the order carries no duration; `ticks` only has to divide evenly into its weeks.
         ensureBalance();
         require(!_hasWithdrawn, ERR_INVALID_STATE);
+        // Validate the subscription shape HERE, at submission, not only in the book: the note is the
+        // buyer's trusted entry and the only path to the book, so a malformed order should never
+        // consume a placement slot or a bounce round-trip. The book re-checks the same invariants —
+        // it holds the money and must not depend on a caller for them — but a genuine order never
+        // reaches that check in a bad shape.
+        bool isSub = (flags & FLAG_SUBSCRIPTION) != 0;
+        require(!isSub || (flags & FLAG_AON) != 0, ERR_INVALID_PARAMS);
+        require(!isSub || ticks % uint128(SUB_WEEKS) == 0, ERR_INVALID_PARAMS);
+        // Physical ceiling: nothing produces more than one tick per minute, so a subscription may
+        // not buy more volume than its own month could ever deliver.
+        require(!isSub || ticks <= uint128(SUB_WEEKS) * SUB_TICKS_PER_WEEK, ERR_INVALID_PARAMS);
+        // A subscription posts the buyer's own `2P` beside its escrow — the deal contract holds it
+        // apart from the money the weeks are drawn from, so a dispute costs the same in the last
+        // week of the term as in the first, and it comes back whole when none is raised. Sized at
+        // the limit price, since the deal clears at or below it. A market order cannot carry one:
+        // its price exists only once it clears, which is after the escrow is already committed.
+        require(!isSub || (flags & FLAG_MARKET) == 0, ERR_INVALID_PARAMS);
+        // Fee-free lower bound. The book applies the exact one — it holds the money and cannot
+        // depend on a caller for it — and the platform fee lives on that side of the split, so the
+        // book's requirement is strictly the stronger of the two. This only catches, at submission,
+        // an escrow that could not possibly cover volume plus bond.
+        require(!isSub || uint256(escrow) >= uint256(ticks) * uint256(maxPricePerTick)
+            + 2 * uint256(maxPricePerTick), ERR_INVALID_PARAMS);
         mapping(uint32 => varuint32) ecc;
         ecc[CURRENCIES_ID_SHELL] = varuint32(escrow);
         // §3.1.1: forward this note's pubkey so the OB can record it in the deal
@@ -516,28 +581,10 @@ contract PrivateNote is Modifiers, ReplayProtection {
             maxPricePerTick, ticks, flags, deadline, _ephemeralPubkey);
     }
 
-    /// @notice Place a §8 subscription (semantic order) from this note: budget
-    ///         (escrow) throttled into weekly cycles; unused cycle budget is returned
-    ///         to the buyer. `autoRenew` is a client hint (renewal = re-place, §8.2).
-    function placeInferenceSubscription(
-        uint256 modelHash,
-        uint128 maxPricePerTick,
-        uint128 ticks,
-        uint8   flags,
-        uint128 escrow,
-        bool    autoRenew
-    ) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
-        ensureBalance();
-        require(!_hasWithdrawn, ERR_INVALID_STATE);
-        mapping(uint32 => varuint32) ecc;
-        ecc[CURRENCIES_ID_SHELL] = varuint32(escrow);
-        // §3.1.1: forward this note's pubkey (gateway auth, recorded in the deal).
-        address orderBook = DexLib.computeInferenceOrderBookAddress(_inferenceOrderBookCode, modelHash);
-        // bounce:true — escrow returns to this note if the book rejects the placement.
-        // `flags` carries the subscription's TEE requirement (0 or FLAG_TEE); the book validates it.
-        InferenceOrderBook(orderBook).placeSubscription{value: 2 vmshell, flag: 1, bounce: true, currencies: ecc}(
-            maxPricePerTick, ticks, flags, autoRenew, _ephemeralPubkey);
-    }
+    // The legacy §8 subscription entry point (resting weekly-cycle bid) was removed with the
+    // single-seller redesign: a subscription is now an ORDINARY buy order carrying FLAG_AON plus
+    // the SUBSCRIPTION deal-flag, placed through `placeInferenceBuy` — no separate call, no
+    // separate registry, no separate deal contract.
 
     /// @notice Cancel one resting inference order owned by this note (refunds any
     ///         held BUY escrow back to this note).
@@ -546,7 +593,9 @@ contract PrivateNote is Modifiers, ReplayProtection {
     {
         ensureBalance();
         address orderBook = DexLib.computeInferenceOrderBookAddress(_inferenceOrderBookCode, modelHash);
-        InferenceOrderBook(orderBook).cancelOrder{value: 1 vmshell, flag: 1, bounce: false}(orderId);
+        // bounce:true — the book address is derived from the model hash and the book for a given
+        // model may simply not have been deployed yet.
+        InferenceOrderBook(orderBook).cancelOrder{value: 1 vmshell, flag: 1, bounce: true}(orderId);
     }
 
     /// @notice Cancel all resting inference orders owned by this note.
@@ -555,46 +604,49 @@ contract PrivateNote is Modifiers, ReplayProtection {
     {
         ensureBalance();
         address orderBook = DexLib.computeInferenceOrderBookAddress(_inferenceOrderBookCode, modelHash);
-        InferenceOrderBook(orderBook).cancelAllOrders{value: 1 vmshell, flag: 1, bounce: false}();
+        InferenceOrderBook(orderBook).cancelAllOrders{value: 1 vmshell, flag: 1, bounce: true}();
     }
 
     /// @notice Buyer note stops the stream — amicable exit (spec §4.1). Max loss
     ///         is the two in-flight ticks; refund returns to this note.
     function streamStop(address tokenContract) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
         ensureBalance();
-        IInferenceDeal(tokenContract).stop{value: 1 vmshell, flag: 1, bounce: false}();
+        // bounce:true — `tokenContract` is supplied by the caller, so a wrong address would
+        // otherwise make this a silent no-op.
+        IInferenceDeal(tokenContract).stop{value: 1 vmshell, flag: 1, bounce: true}();
     }
 
-    /// @notice Buyer note disputes the current ≤2 ticks (spec §4.2). Locks both
-    ///         this note and the seller note until resolved/timed out.
+    /// @notice Buyer note disputes the current ≤2 ticks (spec §4.2). Neither note is locked by
+    ///         this — no note is locked by a deal at all (§4.3). Every stake a dispute can reach
+    ///         lives in the TokenContract: the buyer's escrow and bond, the seller's mirror bond.
+    ///         A note is an identity, so one note runs as many deals at once as its owner cares to
+    ///         open, and a dispute on one of them leaves the rest untouched.
     function streamDispute(address tokenContract) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
         ensureBalance();
-        IInferenceDeal(tokenContract).dispute{value: 1 vmshell, flag: 1, bounce: false}();
+        // bounce:true — same caller-supplied address, and here a silent no-op costs the buyer his
+        // contest window: he would believe the dispute was filed while it never arrived.
+        IInferenceDeal(tokenContract).dispute{value: 1 vmshell, flag: 1, bounce: true}();
     }
 
-    /// @notice Buyer note reclaims the frozen tick after the seller goes silent
-    ///         for STREAM_TIMEOUT (spec §3.4 / §3.1.2). On the probe tick the
-    ///         buyer pays nothing; the seller's seller bond is returned.
-    function streamReclaim(address tokenContract) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
-        ensureBalance();
-        IInferenceDeal(tokenContract).reclaimOnTimeout{value: 1 vmshell, flag: 1, bounce: false}();
-    }
+    // `streamReclaim` was removed together with the deal's `reclaimOnTimeout`: there is no longer
+    // a prepaid/frozen tick to unwind. A seller who goes silent simply never gets his last claim
+    // promoted, so the buyer's ordinary `streamStop` settles what is trusted and refunds the rest.
 
     /// @notice Buyer note recovers a funded-but-never-opened deal: after
     ///         `MATCH_OPEN_TIMEOUT` from funding with no `open()`, the seller is a
     ///         no-show — `cleanupUnopened` refunds the full deposit and returns the
     ///         seller's seller bond (nothing delivered → no fee/penalty, §2.1).
-    ///         Distinct from `streamReclaim` (opened-then-abandoned). The TC gates the
+    ///         The TC gates the
     ///         timer; the deposit/bond (ECC) refund to their fixed notes and the residual native
     ///         gas is swept to the canonical SuperRoot — no caller-chosen payout.
     function streamCleanup(address tokenContract) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
         ensureBalance();
-        IInferenceDeal(tokenContract).cleanupUnopened{value: 1 vmshell, flag: 1, bounce: false}();
+        IInferenceDeal(tokenContract).cleanupUnopened{value: 1 vmshell, flag: 1, bounce: true}();
     }
 
     /// @notice Deterministic RootModel address for `ownerPubkey` from the RootPN-baked code hash/depth
     ///         + the canonical SuperRoot. Delegates to DexLib so the note and RootPN derive identically.
-    function _rootModelAddr(uint256 ownerPubkey) private returns (address) {
+    function _rootModelAddr(uint256 ownerPubkey) private view returns (address) {
         return DexLib.computeRootModelAddressFromHash(
             _rootModelCodeHash, _rootModelCodeDepth, address.makeAddrStd(0, SUPER_ROOT_ADDR), ownerPubkey);
     }
@@ -602,7 +654,7 @@ contract PrivateNote is Modifiers, ReplayProtection {
     /// @notice Deterministic per-deal TokenContract address from the RootPN-baked code hash/depth + the
     ///         seller's statics (sellerPubkey, real RootModel, nonce). Single source of truth in DexLib
     ///         (shared with the IOB's placeSellOffer check) — the ONLY address the note-funded helpers ever pay.
-    function _tokenContractAddr(uint256 sellerPubkey, uint64 nonce) private returns (address) {
+    function _tokenContractAddr(uint256 sellerPubkey, uint64 nonce) private view returns (address) {
         (, address tokenContract) = DexLib.computeCanonicalTokenContractAddress(
             _rootModelCodeHash, _rootModelCodeDepth,
             _tokenContractCodeHash, _tokenContractCodeDepth,
@@ -649,7 +701,12 @@ contract PrivateNote is Modifiers, ReplayProtection {
         ensureBalance();
         mapping(uint32 => varuint32) ecc;
         ecc[CURRENCIES_ID_SHELL] = varuint32(amount);
-        IInferenceDeal(_tokenContractAddr(_ephemeralPubkey, nonce)).fundSellerBond{value: 2 vmshell, flag: 1, bounce: false, currencies: ecc}();
+        // bounce:true — the address is DERIVED, not looked up: a mistyped nonce, a call before the
+        // deal contract is deployed, or one after it self-destructed all address an account that
+        // may not exist, and the message carries the bond. It also covers a live TC refusing the
+        // call (wrong amount, already bonded): either way the SHELL comes back to this note instead
+        // of settling on an account with no way to return it.
+        IInferenceDeal(_tokenContractAddr(_ephemeralPubkey, nonce)).fundSellerBond{value: 2 vmshell, flag: 1, bounce: true, currencies: ecc}();
     }
 
     /// @notice Deploys a new PMP contract for a prediction market event.
@@ -862,14 +919,29 @@ contract PrivateNote is Modifiers, ReplayProtection {
         // re-enables split/merge, even when the record is gone.
         if (_stakes.exists(hash)) {
             StakeInfo stake = _stakes[hash];
+            uint128 applied = 0;
             for (uint32 k = 0; k < uint32(refundAmounts.length) && k < uint32(stake.amount.length); k++) {
                 uint128 r = refundAmounts[k];
                 if (r == 0) continue;
-                require(stake.amount[k] >= r, ERR_LOW_VALUE);
+                // `r` is `cleanPool[k] % min(_initialStakes)`, so it is strictly
+                // below every component of the accepted initial stake and the
+                // holding covers it. Clamped rather than required: the
+                // acknowledgement at the tail has to leave in every case, and a
+                // revert here would take it with it — leaving `_normRefundPending`
+                // set on the PMP with nothing left able to clear it.
+                if (r > stake.amount[k]) { r = stake.amount[k]; }
                 stake.amount[k] -= r;
+                applied += r;
             }
             _stakes[hash] = stake;
-            _balance[tokenType] += refundTotal;
+            // ONE normalization point for the refund. Two figures reach this callback and either
+            // can be the smaller: `refundTotal`, which the PMP may itself have clamped to its
+            // remaining unclaimed balance without rewriting the per-outcome array, and `applied`,
+            // the tokens this note actually gave up. Crediting `refundTotal` outright would pay
+            // collateral for tokens still held; crediting `applied` outright would pay more than
+            // the PMP removed from its own ledger. The lower of the two is the only figure both
+            // sides agree on, so the stake decrements and the balance credit can never diverge.
+            _balance[tokenType] += applied < refundTotal ? applied : refundTotal;
         }
         // Tell PMP we processed the refund so it can clear `_normRefundPending`
         // and re-enable split/merge. Sent as a follow-up internal so this
@@ -1411,6 +1483,7 @@ contract PrivateNote is Modifiers, ReplayProtection {
     /// @notice Generates a free coupon for the specified token type
     /// @param tokenType Token type for which to generate coupon
     /// @dev Can only generate coupon when:
+    ///      - the token type has a coupon nominal (`getCouponValue > 0`)
     ///      - all token balances < minStakeValue (i.e. too small to stake)
     ///      - debt == 0
     ///      - No withdrawals from this wallet have been performed.
@@ -1418,6 +1491,12 @@ contract PrivateNote is Modifiers, ReplayProtection {
     ///      - No coupon currently exists.
     function generateCoupon(uint32 tokenType) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
         ensureBalance();
+        // Only the three configured token types carry a nominal. Without this
+        // gate an unsupported type would set `_couponsTokenType` while leaving
+        // `_couponsValue` at zero, so the call does nothing and the coupon
+        // slot still reads as free.
+        uint128 nominal = getCouponValue(tokenType);
+        require(nominal > 0, ERR_INVALID_TOKEN_TYPE);
         require(_debt == 0, ERR_HAS_DEBT);
         require(!_hasWithdrawn, ERR_INVALID_STATE);
         require(!_hasTransferred, ERR_INVALID_STATE);
@@ -1442,7 +1521,7 @@ contract PrivateNote is Modifiers, ReplayProtection {
         // explicit counter is the canonical "no orders open" check.
         require(_openOrderCount == 0, ERR_OPEN_ORDERS_EXIST);
         require(_couponsValue == 0, ERR_COUPON_ALREADY_EXISTS);
-        _couponsValue = getCouponValue(tokenType);
+        _couponsValue = nominal;
         _couponsTokenType = tokenType;
 
         uint128 baseDebt = _couponsValue * 5 / 100;
@@ -1689,6 +1768,17 @@ contract PrivateNote is Modifiers, ReplayProtection {
     function discardCoupon() public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
         ensureBalance();
         require(_couponsValue > 0, ERR_NO_COUPON_AVAILABLE);
+        // Only an UNTOUCHED coupon may be discarded: the outstanding value has to still equal the
+        // nominal its type is issued at. Staking spends `_couponsValue` down, so anything below
+        // the nominal means the coupon has been put to work and the debt it created is owed.
+        require(_couponsValue == getCouponValue(_couponsTokenType), ERR_INVALID_STATE);
+        // Discarding an unused coupon takes its debt with it. The debt exists because the coupon
+        // does; leaving it behind would strand the note, since `_debt == 0` gates almost every
+        // path including the only exit. Subtracted rather than zeroed so debt from any other
+        // source is untouched — an unused coupon can only account for its own 5%.
+        uint128 baseDebt = _couponsValue * 5 / 100;
+        _debt = _debt > baseDebt ? _debt - baseDebt : 0;
+        if (_debt == 0) { _debtTokenType = 0; }
         _couponsValue = 0;
         _couponsTokenType = 0;
     }
@@ -1696,7 +1786,7 @@ contract PrivateNote is Modifiers, ReplayProtection {
     /// @notice Withdraws tokens to a specified wallet.
     /// @dev Inner action flag is hard-coded to 1 inside RootPN — accepting a
     ///      caller-supplied flag opens TVM flag 128 (CARRY_ALL_BALANCE) and 32
-    ///      (DELETE_IF_EMPTY) abuse paths that drain or destroy RootPN.
+    ///      (DELETE_IF_EMPTY) paths that would otherwise reach RootPN's own balance.
     /// @param destWalletAddr Destination wallet address
     /// @param dapp_id DApp id forwarded to RootPN.withdrawTokens (surfaced in the TokensWithdrawn event).
     function withdrawTokens(address destWalletAddr, uint256 dapp_id) public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg {
@@ -1731,6 +1821,33 @@ contract PrivateNote is Modifiers, ReplayProtection {
         delete _balance;
         _hasWithdrawn = true;
 	}
+
+    /// @notice Sweep physical ECC[2] that reached the note AFTER it was withdrawn.
+    ///
+    /// @dev    `withdrawTokens` runs once and empties the note, but inference SHELL can still
+    ///         arrive afterwards: an inference order cancelled out of the book refunds to the owner
+    ///         note, a deal contract refunds the buyer's deposit or returns the seller's bond to the
+    ///         note that posted it, and none of those paths ask whether the note has been withdrawn
+    ///         — nor should they, since the money is owed either way. Without this the SHELL would
+    ///         sit on a note that can never withdraw again.
+    ///
+    ///         Deliberately narrow. It moves ONLY physical ECC[2] and never touches `_balance`,
+    ///         which `withdrawTokens` already released and which stays empty. The withdrawn note
+    ///         cannot take on new obligations either — `placeInferenceBuy`, `postSellOffer` and
+    ///         `deployInferenceOrderBook` all refuse once `_hasWithdrawn` — so this only ever
+    ///         collects the tail of commitments made before the withdrawal.
+    function sweepShell(address destWalletAddr, uint256 dapp_id)
+        public onlyOwnerPubkey(_ephemeralPubkey) accept saveMsg
+    {
+        ensureBalance();
+        require(_hasWithdrawn, ERR_INVALID_STATE);
+        uint128 physShell = uint128(address(this).currencies[CURRENCIES_ID_SHELL]);
+        require(physShell > 0, ERR_NON_ZERO_BALANCE);
+        mapping(uint32 => varuint32) physCc;
+        physCc[CURRENCIES_ID_SHELL] = varuint32(physShell);
+        destWalletAddr.transfer({value: 0.1 vmshell, bounce: false, flag: 1,
+                                 currencies: physCc, dest_dapp_id: dapp_id});
+    }
 
     /// @notice Reverts a withdraw operation (called by Vault)
     /// @param amounts Per-token-type amounts to restore to the note balance
@@ -2248,8 +2365,19 @@ contract PrivateNote is Modifiers, ReplayProtection {
             uint256 hash = tvm.hash(data);
             if (_stakes.exists(hash)) {
                 StakeInfo stake = _stakes[hash];
-                stake.amount[outcomeId] += amount;
-                _stakes[hash] = stake;
+                // Length-checked for the same reason the branch is guarded by `exists` at all,
+                // one level finer. `setStake` creates a record with EMPTY arrays and they are
+                // sized only when the stake is accepted, so a record recreated after a
+                // `deleteStake` can be shorter than an index carried by a cancellation for an
+                // order placed against the previous one. This handler is the only one of the
+                // three without `numOutcomes` in its signature, so it cannot grow the array the
+                // way `onOrderRejected` and `onOrderFilled` do — and it must not throw: the
+                // counters above have already been decremented in this same transaction, and
+                // reverting would leave them pointing at an order the book has removed.
+                if (outcomeId < uint32(stake.amount.length)) {
+                    stake.amount[outcomeId] += amount;
+                    _stakes[hash] = stake;
+                }
             }
         }
 
@@ -2646,13 +2774,6 @@ contract PrivateNote is Modifiers, ReplayProtection {
             _busyOpNonce = 0;
         }
     }
-
-    /// @notice Helper to return empty optional for event emission
-    function _resolvedOutcomeNone() private pure returns (optional(uint32)) {
-        optional(uint32) none;
-        return none;
-    }
-
 
     /// @notice Returns the salted PMP contract code
     /// @return pmpCode The salted PMP contract code as TvmCell

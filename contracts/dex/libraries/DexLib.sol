@@ -190,7 +190,7 @@ library DexLib {
     // No code salt: the book binds to the note family via NOTE_CODE_HASH pinned
     // in the InferenceOrderBook code itself, and the deploy is gated in its ctor
     // (deployer must be a genuine note). The address is just (book code + §8
-    // statics): same (model, tick) ⇒ same address ⇒ one book.
+    // statics), and the static set is the model alone ⇒ one book per model.
 
     /// @notice InferenceOrderBook StateInit: book code + the §8 static set
     ///         (model). One book per model.
