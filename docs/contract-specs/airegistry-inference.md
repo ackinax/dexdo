@@ -56,8 +56,8 @@ read-model: `inference_deals` (one row per TokenContract / deal) and
 (`sellerTC` + `buyerNote` + the SELL leg's note); per-tick rows and the
 `finalized_ticks` aggregate comes from `TickFinalized` (per-tick `finalized_owed` is stored on each `inference_ticks` row — it is the contract's cumulative `_finalizedOwed`, not a per-tick delta);
 `close_kind` + `clean_settlement` + `settled_at_chain` from the stream-close
-events: `StreamStopped` sets `clean_settlement = true`; `DisputeResolved` and
-`StreamReclaimed` set it to `false`; `ContractDestroyed` (`'DESTROYED'`) and
+events: `StreamStopped` sets `clean_settlement = true`; `DisputeResolved` sets it to
+`false` (`StreamReclaimed` did too until v4.0.32 retired its emitter); `ContractDestroyed` (`'DESTROYED'`) and
 `ProbeBurned` (`'PROBE_BURNED'` — a buyer stop before probe-accept, or the
 dispute-burn path; both terminal) set only `close_kind` and `settled_at_chain`,
 leaving `clean_settlement` unchanged (remains `NULL` if no prior close event set
@@ -94,8 +94,8 @@ through `dodex_chain::Dex` (no DB, no HTTP — there are no inference handlers):
 | --- | --- |
 | `e2e_inference` | Note deploys the book, places a resting BUY with SHELL escrow, cancels it. |
 | `e2e_inference_match` | External `TokenContract` deploy + a SELL offer crossed by a BUY ⇒ the match funds the `TokenContract` (handover). |
-| `e2e_inference_clob` | Three flows: a partial fill (2-tick offer crossed by a 4-tick limit buy, 2 ticks rest) + `getBestBidAsk`/`getWeeklyMedianPrice`; a subscription (`placeInferenceSubscription` + `getSubscription`); and a match's `Filled` event confirmed by its routing id. |
-| `e2e_inference_stream` | Full deal lifecycle: match → seller bond → `open` → wait the 180s settle window → `advance` (probe accepted) → `streamStop`. Slow (~4 min). |
+| `e2e_inference_clob` | Three flows: a partial fill (2-tick offer crossed by a 4-tick limit buy, 2 ticks rest) + `getBestBidAsk`/`getWeeklyMedianPrice`; a subscription (a buy carrying `FLAG_SUBSCRIPTION | FLAG_AON`, read back via `getOrder`); and a match's `Filled` event confirmed by its routing id. |
+| `e2e_inference_stream` | Full deal lifecycle: match → seller bond → `open` → wait the 180s probe window → `acceptProbe` → `streamStop`. Slow (~4 min). |
 
 They share the seed-note pool (`tests/fixtures/seed_notes.json` /
 `E2E_SEED_NOTES`) like the other e2e tests; the note must additionally hold
@@ -133,10 +133,10 @@ struct's field names against the ABI event inputs.
   constructor.
 - **Continuation queue** (`processHead`) — needs `> MAX_MATCHES_PER_CALL`
   matches in one buy; depends on the deployed contract's constant.
-- **Subscription roll** (`pokeSubscription`) — needs a weekly cycle to roll
-  over; the closing cycle's unspent budget refunds to the buyer.
-- **Longer probe variants** — probe burn, seller no-show reclaim, dispute
-  timeout, each waiting a 600s on-chain window.
+- **Subscription settlement** (`TokenContract.settleWeek`) — needs a week
+  boundary to cross; pays the whole week regardless of consumption.
+- **Longer probe variants** — probe burn, seller walk-out (`sellerStop`),
+  dispute timeout, each waiting a 600s on-chain window.
 - **Typed ext-out event payload decode** — blocked on the deployment skew noted
   above (shellnet book `code_hash` ≠ this repo's), not a wrapper issue; events
   are asserted by routing id meanwhile.

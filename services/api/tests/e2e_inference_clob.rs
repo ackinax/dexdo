@@ -36,7 +36,6 @@ use dodex_contracts::dex::private_note::ParamsOfCancelAllInferenceOrders;
 use dodex_contracts::dex::private_note::ParamsOfDeployInferenceOrderBook;
 use dodex_contracts::dex::private_note::ParamsOfInferenceOrderBook;
 use dodex_contracts::dex::private_note::ParamsOfPlaceInferenceBuy;
-use dodex_contracts::dex::private_note::ParamsOfPlaceInferenceSubscription;
 use dodex_contracts::dex::private_note::ParamsOfPostSellOffer;
 
 const POLL_TICK: Duration = Duration::from_secs(2);
@@ -133,7 +132,7 @@ async fn inference_partial_fill_leaves_remainder() {
     eprintln!("[e2e_clob] order_book={ob} token_contract={tc}");
 
     // 2-tick SELL offer rests.
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
         .await
         .expect("postSellOffer");
     // Assert the precondition instead of falling through: with no resting ask the
@@ -239,25 +238,31 @@ async fn inference_subscription_place_and_read() {
     let (ob, model_hash) = deploy_book(&dex, &note.address, &model_name, signer()).await;
     eprintln!("[e2e_clob] subscription order_book={ob}");
 
+    // A subscription has no entry point of its own since v4.0.32: it is an
+    // ordinary buy carrying FLAG_SUBSCRIPTION, and always AON — one buyer against
+    // one seller for the whole term. The book stores the pair in the order's
+    // flags and hands them to the TokenContract on match.
+    const FLAG_AON: u8 = 0x20;
+    const FLAG_SUBSCRIPTION: u8 = 0x40;
+
     // escrow must be >= ticks * (price + platform fee); 8 * (1e9 + 2.5%) = 8.2e9.
-    dex.place_inference_subscription(
+    dex.place_inference_buy(
         &note.address,
-        ParamsOfPlaceInferenceSubscription {
+        ParamsOfPlaceInferenceBuy {
             model_hash: model_hash.clone(),
             max_price_per_tick: PRICE_PER_TICK,
             ticks: 8,
-            // Rests as a standing bid — no taker/post-only bits.
-            flags: 0,
             escrow: 10_000_000_000,
-            auto_renew: true,
+            flags: FLAG_SUBSCRIPTION | FLAG_AON,
+            deadline: 0,
         },
         signer(),
     )
     .await
-    .expect("placeInferenceSubscription");
+    .expect("placeInferenceBuy(subscription)");
 
-    // The subscription gets an order id from the book's counter; scan the low
-    // ids until it surfaces (a fresh book starts at 1).
+    // The order gets an id from the book's counter; scan the low ids until the
+    // resting subscription surfaces (a fresh book starts at 1).
     let mut seen = false;
     for _ in 0..POLL_TICKS {
         tokio::time::sleep(POLL_TICK).await;
@@ -268,28 +273,29 @@ async fn inference_subscription_place_and_read() {
             );
         }
         for id in 1..=5u128 {
-            let Ok(sub) = dex.inference_get_subscription(&ob, id).await else { continue };
-            if sub.exists {
-                eprintln!(
-                    "[e2e_clob] subscription id={id}: autoRenew={} cycleBudget={} curCycle={}",
-                    sub.auto_renew, sub.cycle_budget, sub.cur_cycle
-                );
-                if !sub.auto_renew {
-                    failures.push("subscription autoRenew should be true".to_string());
-                }
-                if sub.cycle_budget == 0 {
-                    failures.push("subscription cycleBudget should be > 0".to_string());
-                }
-                seen = true;
-                break;
+            let Ok(order) = dex.inference_get_order(&ob, id).await else { continue };
+            if order.amount == 0 || order.flags & FLAG_SUBSCRIPTION == 0 {
+                continue;
             }
+            eprintln!(
+                "[e2e_clob] subscription id={id}: flags=0x{:02x} amount={} isBuy={}",
+                order.flags, order.amount, order.is_buy
+            );
+            if order.flags & FLAG_AON == 0 {
+                failures.push("a subscription must also carry FLAG_AON".to_string());
+            }
+            if !order.is_buy {
+                failures.push("a subscription must rest as a buy".to_string());
+            }
+            seen = true;
+            break;
         }
         if seen {
             break;
         }
     }
     if !seen {
-        failures.push("subscription never surfaced via getSubscription".to_string());
+        failures.push("subscription never surfaced as a resting flagged buy".to_string());
     }
 
     cleanup(&dex, &note.address, &model_hash, &keys).await;
@@ -319,7 +325,7 @@ async fn inference_match_emits_filled_event() {
     .await
     .expect("deploy TokenContract");
 
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
         .await
         .expect("postSellOffer");
     // Same precondition as above: a missing ask surfaces much later as a

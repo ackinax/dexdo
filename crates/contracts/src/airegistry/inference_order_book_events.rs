@@ -13,11 +13,14 @@ use ackinacki_kit::contracts::KitResult;
 use serde::Deserialize;
 
 /// External event ids are defined in `airegistry/modifiers/modifiers.sol`
-/// (dedicated 1000+ range). Each event is emitted to its own
-/// `address.makeAddrExtern(<id>, 256)`, so the destination id alone
-/// identifies the event. The ABI event names differ from the `*Emit` constant
+/// (dedicated 1000+ range). The ABI event names differ from the `*Emit` constant
 /// names — these ids are taken from the actual `emit ... makeAddrExtern(<const>)`
 /// sites in `InferenceOrderBook.sol`.
+///
+/// This enum names the DESTINATION, not the event. Since v4.0.32 the two are no
+/// longer 1:1: `InferenceOrderRejected` shares `OfferCancelRejectedEmit` (1009)
+/// with `InferenceOrderCancelRejected`. On a shared id the body's own event name
+/// is the discriminator — see `from_event`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u128)]
 /// External events emitted by `InferenceOrderBook`.
@@ -27,12 +30,13 @@ pub enum InferenceOrderBookEvent {
     Refunded = 1002,
     Filled = 1003,
     Executed = 1004,
-    SubscriptionPlaced = 1005,
-    // 1006 (CycleForfeitedEmit) and 1007 (ForfeitClaimedEmit) remain reserved in
-    // `modifiers.sol`, but the contract no longer declares or emits the matching
-    // events, so there is nothing to decode into.
+    // 1005-1007 were the weekly-cycle subscription ids. A subscription is an
+    // ordinary order now (`FLAG_SUBSCRIPTION` on the placement), so it reports
+    // through OrderPlaced / Filled / OrderCancelled and the ids are retired.
     InferenceOrderBookDeployed = 1008,
+    /// Also carries `InferenceOrderRejected` — resolve by the body's event name.
     OrderCancelRejected = 1009,
+    OrderExpired = 1010,
 }
 
 impl TryFrom<String> for InferenceOrderBookEvent {
@@ -54,9 +58,9 @@ impl TryFrom<String> for InferenceOrderBookEvent {
             1002 => Ok(InferenceOrderBookEvent::Refunded),
             1003 => Ok(InferenceOrderBookEvent::Filled),
             1004 => Ok(InferenceOrderBookEvent::Executed),
-            1005 => Ok(InferenceOrderBookEvent::SubscriptionPlaced),
             1008 => Ok(InferenceOrderBookEvent::InferenceOrderBookDeployed),
             1009 => Ok(InferenceOrderBookEvent::OrderCancelRejected),
+            1010 => Ok(InferenceOrderBookEvent::OrderExpired),
             _ => Err(KitError::new(
                 KitModule::Event,
                 KitErrorCode::UnknownEvent,
@@ -105,10 +109,16 @@ pub enum DecodedInferenceOrderBookEvent {
         kind: InferenceOrderBookEvent,
         data: ExecutedData,
     },
-    SubscriptionPlaced {
+    OrderExpired {
         event: Event,
         kind: InferenceOrderBookEvent,
-        data: SubscriptionPlacedData,
+        data: OrderExpiredData,
+    },
+    /// Shares destination 1009 with [`Self::OrderCancelRejected`].
+    OrderRejected {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: OrderRejectedData,
     },
     InferenceOrderBookDeployed {
         event: Event,
@@ -150,9 +160,9 @@ impl FromEvent for DecodedInferenceOrderBookEvent {
                 let data = decode_or_err::<ExecutedData>(event, contract)?;
                 Ok(DecodedInferenceOrderBookEvent::Executed { event: event.clone(), kind, data })
             }
-            InferenceOrderBookEvent::SubscriptionPlaced => {
-                let data = decode_or_err::<SubscriptionPlacedData>(event, contract)?;
-                Ok(DecodedInferenceOrderBookEvent::SubscriptionPlaced {
+            InferenceOrderBookEvent::OrderExpired => {
+                let data = decode_or_err::<OrderExpiredData>(event, contract)?;
+                Ok(DecodedInferenceOrderBookEvent::OrderExpired {
                     event: event.clone(),
                     kind,
                     data,
@@ -166,13 +176,27 @@ impl FromEvent for DecodedInferenceOrderBookEvent {
                     data,
                 })
             }
+            // Two events share this destination, so the id cannot pick the
+            // payload: decode the body's own event name first and branch on it.
+            // Decoding as the wrong one would not merely mislabel — the field sets
+            // do not overlap, so it would fail outright.
             InferenceOrderBookEvent::OrderCancelRejected => {
-                let data = decode_or_err::<OrderCancelRejectedData>(event, contract)?;
-                Ok(DecodedInferenceOrderBookEvent::OrderCancelRejected {
-                    event: event.clone(),
-                    kind,
-                    data,
-                })
+                let name = contract.decode_message_body(&event.body)?.name;
+                if name == "InferenceOrderRejected" {
+                    let data = decode_or_err::<OrderRejectedData>(event, contract)?;
+                    Ok(DecodedInferenceOrderBookEvent::OrderRejected {
+                        event: event.clone(),
+                        kind,
+                        data,
+                    })
+                } else {
+                    let data = decode_or_err::<OrderCancelRejectedData>(event, contract)?;
+                    Ok(DecodedInferenceOrderBookEvent::OrderCancelRejected {
+                        event: event.clone(),
+                        kind,
+                        data,
+                    })
+                }
             }
         }
     }
@@ -240,8 +264,12 @@ pub struct OrderCancelledData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Payload of `InferenceOrderBookEvent::Refunded`.
+/// Payload of `InferenceOrderBookEvent::Refunded`. Carries an `order_id` since
+/// v4.0.32 — but a refund is not by itself a close (an IOC leftover refunds while
+/// its filled part stands), so it names the order rather than retiring it.
 pub struct RefundedData {
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub order_id: u128,
     pub note: String,
     #[serde(deserialize_with = "deserialize_u128")]
     pub amount: u128,
@@ -281,21 +309,31 @@ pub struct ExecutedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Payload of `InferenceOrderBookEvent::SubscriptionPlaced`.
-pub struct SubscriptionPlacedData {
+/// Payload of `InferenceOrderBookEvent::OrderExpired`. The order passed its
+/// deadline and was retired by `expireOrder`; the escrow it held is returned by a
+/// separate `InferenceRefunded` naming the same `order_id`.
+pub struct OrderExpiredData {
     #[serde(deserialize_with = "deserialize_u128")]
     pub order_id: u128,
-    pub buyer_note: String,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub max_price: u128,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub ticks: u128,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub cycle_budget: u128,
-    pub auto_renew: bool,
-    /// Flag mask the subscription was placed with; see [`OrderPlacedData::flags`].
+    pub is_buy: bool,
+    pub note: String,
+    /// Zero address on a BUY — only a SELL names a deal contract.
+    pub token_contract: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Payload of a submission refused before it became an order, emitted to
+/// `OfferCancelRejectedEmit` (1009) alongside [`OrderCancelRejectedData`]. It has
+/// no order id because no order was ever created; `refund` is what went back to
+/// the note.
+pub struct OrderRejectedData {
     #[serde(deserialize_with = "deserialize_u8")]
-    pub flags: u8,
+    pub reason: u8,
+    pub note: String,
+    pub token_contract: String,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub refund: u128,
 }
 
 #[derive(Debug, Clone, Deserialize)]

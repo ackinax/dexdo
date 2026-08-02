@@ -40,13 +40,20 @@ pub async fn project_token_contract_event(
         "TickFinalized" => apply_tick_finalized(tx, event, node).await,
         "StreamStopped" => apply_close(tx, node, "STOPPED", true).await,
         "DisputeResolved" => apply_close(tx, node, "DISPUTE_RESOLVED", false).await,
-        "StreamReclaimed" => apply_close(tx, node, "RECLAIMED", false).await,
         "ContractDestroyed" => apply_terminal_close(tx, node, "DESTROYED").await,
         "StreamDisputed" => apply_disputed(tx, node).await,
         "ProbeBurned" => apply_terminal_close(tx, node, "PROBE_BURNED").await,
         // Seller bond / probe accept / withdrawal carry no deal-level state the
         // SETTLEMENT read-model needs; the skeleton seed already recorded the deal.
-        "SellerBondFunded" | "ProbeAccepted" | "ShellWithdrawn" => Ok(ProjectionOutcome::Applied),
+        //
+        // `TicksClaimed` reports the claim pipeline mid-flight: `trusted` is what has
+        // already gone final and `claimed` is the newest still-contestable claim. Only
+        // the final half is money owed, and `TickFinalized` already carries that into
+        // inference_ticks — so a claim adds nothing the read model can be trusted to
+        // serve. Store it the day a caller needs to see pending claims.
+        "SellerBondFunded" | "ProbeAccepted" | "ShellWithdrawn" | "TicksClaimed" => {
+            Ok(ProjectionOutcome::Applied)
+        }
         _ => Ok(ProjectionOutcome::Unknown),
     }
 }

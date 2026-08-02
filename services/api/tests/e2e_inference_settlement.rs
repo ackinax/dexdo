@@ -56,9 +56,10 @@ const PRICE_PER_TICK: u128 = 1_000_000_000;
 const DEAL_TICKS: u128 = 4;
 // Seller mirror bond = `TokenContract._bondAmount()` = 2P, plus a small margin.
 const SELLER_BOND: u128 = 2 * PRICE_PER_TICK + PRICE_PER_TICK / 100;
-// The probe-acceptance window is per-deal and price-scaled: W = clamp(P*600/1e9,
-// 180, 3600), so at the minimum 1-SHELL price it is 600s, not the 180s floor.
-const PROBE_WAIT: Duration = Duration::from_secs(615);
+// Probe acceptance is gated by the fixed PROBE_WINDOW (180s). v4.0.32 removed
+// the price-scaled advance window this used to wait out, so the wait no longer
+// depends on the tick price — just the window plus a margin.
+const PROBE_WAIT: Duration = Duration::from_secs(195);
 
 fn unique_suffix() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
@@ -127,7 +128,7 @@ async fn inference_settlement_immediate_stop_does_not_pay_streaming_tick() {
     eprintln!("[e2e_settle] order_book={ob} token_contract={tc}");
 
     // 3. Offer ↔ buy ⇒ handover funds the TokenContract.
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
         .await
         .expect("postSellOffer accepted");
     if let Err(diag) = wait_sell_offer_rested(&dex, &ob, &tc, POLL_TICKS, POLL_TICK).await {
@@ -183,38 +184,37 @@ async fn inference_settlement_immediate_stop_does_not_pay_streaming_tick() {
         return;
     }
 
-    // 6. Wait out the probe window, then accept the probe (sets the streaming tick prepaid).
+    // 6. Wait out the probe window, then accept the probe (credits it and opens the claim pipeline).
     eprintln!("[e2e_settle] sleeping {}s for the probe window…", PROBE_WAIT.as_secs());
     tokio::time::sleep(PROBE_WAIT).await;
-    dex.token_contract_advance(&tc, signer()).await.expect("TokenContract.advance accepted");
+    dex.token_contract_accept_probe(&tc, signer())
+        .await
+        .expect("TokenContract.acceptProbe accepted");
     if !wait_state(&dex, &tc, |s| s.probe_accepted, "probe to be accepted").await {
-        failures.push("advance did not accept the probe within budget".to_string());
+        failures.push("acceptProbe did not accept the probe within budget".to_string());
         finish(&dex, &note.address, &model_hash, &keys, failures).await;
         return;
     }
-    let after_advance = dex.token_contract_get_state(&tc).await.expect("getState after advance");
+    let after_probe = dex.token_contract_get_state(&tc).await.expect("getState after acceptProbe");
     // `ticksFinalized`, not the `finalizedOwed` delta, is what says whether the
     // seller was paid for a tick: a plain stop also credits `finalizedOwed` with
     // the full returned seller bond (2P) and the clean-close rebate, which together
     // exceed a tick and would read as a payout that never happened.
     let ticks_before =
-        dex.token_contract_get_fees(&tc).await.expect("getFees after advance").ticks_finalized;
+        dex.token_contract_get_fees(&tc).await.expect("getFees after acceptProbe").ticks_finalized;
     eprintln!(
         "[e2e_settle] probe accepted: ticksFinalized(W0)={ticks_before} \
-         finalizedOwed={} prepaid={} frozen={}",
-        after_advance.finalized_owed, after_advance.prepaid, after_advance.frozen
+         finalizedOwed={} tokensFinal={} tokensPending={}",
+        after_probe.finalized_owed, after_probe.tokens_final, after_probe.tokens_pending
     );
     if ticks_before != 1 {
         failures.push(format!(
             "probe acceptance should finalize exactly the probe tick: ticksFinalized={ticks_before}, want 1"
         ));
     }
-    if after_advance.prepaid != PRICE_PER_TICK {
-        failures.push(format!(
-            "streaming tick not prepaid after advance: prepaid={} want={PRICE_PER_TICK}",
-            after_advance.prepaid
-        ));
-    }
+    // The old model prepaid the next tick at probe-accept; v4.0.32 does not —
+    // further output must be asserted with `claimTokens` and promoted by
+    // `finalize`, so there is no prepaid balance to check here.
 
     // 7. IMMEDIATE stop — the streaming tick's window is still open ⇒ the seller
     //    must NOT be paid it, so no second tick is finalized.

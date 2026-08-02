@@ -24,11 +24,13 @@ pub enum TokenContractEvent {
     ShellWithdrawn = 710,
     StreamFunded = 720,
     StreamOpened = 721,
+    /// Also carries `TicksClaimed` — resolve by the body's event name.
     TickFinalized = 722,
     StreamStopped = 723,
     StreamDisputed = 724,
     DisputeResolved = 725,
-    StreamReclaimed = 726,
+    // 726 was StreamReclaimedEmit. v4.0.32 dropped the id and both emit sites;
+    // `StreamReclaimed` survives in the ABI with nothing to emit it.
     SellerBondFunded = 727,
     ProbeAccepted = 728,
     ProbeBurned = 729,
@@ -58,7 +60,6 @@ impl TryFrom<String> for TokenContractEvent {
             723 => Ok(TokenContractEvent::StreamStopped),
             724 => Ok(TokenContractEvent::StreamDisputed),
             725 => Ok(TokenContractEvent::DisputeResolved),
-            726 => Ok(TokenContractEvent::StreamReclaimed),
             727 => Ok(TokenContractEvent::SellerBondFunded),
             728 => Ok(TokenContractEvent::ProbeAccepted),
             729 => Ok(TokenContractEvent::ProbeBurned),
@@ -83,7 +84,9 @@ impl TokenContractEvent {
     }
 }
 
-/// Typed decoded `TokenContract` external event.
+/// Typed decoded `TokenContract` external event. One variant per event, which is
+/// finer-grained than [`TokenContractEvent`]: `TickFinalized` and `TicksClaimed`
+/// arrive on the same destination and are told apart by the body's event name.
 pub enum DecodedTokenContractEvent {
     ContractDeployed { event: Event, kind: TokenContractEvent, data: ContractDeployedData },
     StreamFunded { event: Event, kind: TokenContractEvent, data: StreamFundedData },
@@ -95,7 +98,7 @@ pub enum DecodedTokenContractEvent {
     StreamStopped { event: Event, kind: TokenContractEvent, data: StreamStoppedData },
     StreamDisputed { event: Event, kind: TokenContractEvent, data: StreamDisputedData },
     DisputeResolved { event: Event, kind: TokenContractEvent, data: DisputeResolvedData },
-    StreamReclaimed { event: Event, kind: TokenContractEvent, data: StreamReclaimedData },
+    TicksClaimed { event: Event, kind: TokenContractEvent, data: TicksClaimedData },
     ShellWithdrawn { event: Event, kind: TokenContractEvent, data: ShellWithdrawnData },
     ContractDestroyed { event: Event, kind: TokenContractEvent, data: ContractDestroyedData },
 }
@@ -128,9 +131,21 @@ impl FromEvent for DecodedTokenContractEvent {
                 let data = decode_or_err::<ProbeBurnedData>(event, contract)?;
                 Ok(DecodedTokenContractEvent::ProbeBurned { event: event.clone(), kind, data })
             }
+            // Two events share this destination, so the id cannot pick the
+            // payload: decode the body's own event name first and branch on it.
             TokenContractEvent::TickFinalized => {
-                let data = decode_or_err::<TickFinalizedData>(event, contract)?;
-                Ok(DecodedTokenContractEvent::TickFinalized { event: event.clone(), kind, data })
+                let name = contract.decode_message_body(&event.body)?.name;
+                if name == "TicksClaimed" {
+                    let data = decode_or_err::<TicksClaimedData>(event, contract)?;
+                    Ok(DecodedTokenContractEvent::TicksClaimed { event: event.clone(), kind, data })
+                } else {
+                    let data = decode_or_err::<TickFinalizedData>(event, contract)?;
+                    Ok(DecodedTokenContractEvent::TickFinalized {
+                        event: event.clone(),
+                        kind,
+                        data,
+                    })
+                }
             }
             TokenContractEvent::StreamStopped => {
                 let data = decode_or_err::<StreamStoppedData>(event, contract)?;
@@ -143,10 +158,6 @@ impl FromEvent for DecodedTokenContractEvent {
             TokenContractEvent::DisputeResolved => {
                 let data = decode_or_err::<DisputeResolvedData>(event, contract)?;
                 Ok(DecodedTokenContractEvent::DisputeResolved { event: event.clone(), kind, data })
-            }
-            TokenContractEvent::StreamReclaimed => {
-                let data = decode_or_err::<StreamReclaimedData>(event, contract)?;
-                Ok(DecodedTokenContractEvent::StreamReclaimed { event: event.clone(), kind, data })
             }
             TokenContractEvent::ShellWithdrawn => {
                 let data = decode_or_err::<ShellWithdrawnData>(event, contract)?;
@@ -279,11 +290,15 @@ pub struct DisputeResolvedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Payload of `TokenContractEvent::StreamReclaimed`.
-pub struct StreamReclaimedData {
-    pub buyer: String,
+/// Payload of a seller claim, emitted to `TickFinalizedEmit` (722) alongside
+/// [`TickFinalizedData`]. Reports the claim pipeline mid-flight: `trusted` is the
+/// cumulative total already promoted to final, `claimed` the newest claim still
+/// inside its contest window. Only `trusted` is money owed.
+pub struct TicksClaimedData {
     #[serde(deserialize_with = "deserialize_u128")]
-    pub refund_to_buyer: u128,
+    pub trusted: u128,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub claimed: u128,
 }
 
 #[derive(Debug, Clone, Deserialize)]

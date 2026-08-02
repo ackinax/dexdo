@@ -227,10 +227,14 @@ async fn dispute_resolved_marks_close_kind_and_not_clean() {
     assert!(settled.is_some(), "settled_at_chain must be set on DisputeResolved");
 }
 
+/// `TicksClaimed` reports a claim that is still contestable, so it deliberately
+/// writes nothing — only `TickFinalized` moves money into the read model. Pin the
+/// no-op: the event must be accepted (never `Unknown`, which would mark it
+/// processed with a "no handler" warning) and must not create a deal row.
 #[tokio::test]
-async fn stream_reclaimed_marks_close_kind_and_not_clean() {
+async fn ticks_claimed_is_accepted_without_touching_the_deal() {
     let Some(pool) = setup().await else { return };
-    let tc = "0:tc_reclaimed";
+    let tc = "0:tc_ticks_claimed";
     sqlx::query("delete from inference_deals where token_contract_address=$1")
         .bind(tc)
         .execute(&pool)
@@ -240,19 +244,18 @@ async fn stream_reclaimed_marks_close_kind_and_not_clean() {
     let mut tx = pool.begin().await.unwrap();
     let outcome = project(
         &mut tx,
-        &ev("StreamReclaimed", serde_json::json!({"buyer":"0:b","refundToBuyer":"100"})),
-        &node(tc, "co-sr-1"),
+        &ev("TicksClaimed", serde_json::json!({"trusted":"3","claimed":"5"})),
+        &node(tc, "co-tcl-1"),
     )
     .await;
     assert_eq!(outcome, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
 
-    let (kind, clean, settled): (Option<String>, Option<bool>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
-        "select close_kind, clean_settlement, settled_at_chain from inference_deals where token_contract_address=$1")
+    let (finalized, settled): (i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "select finalized_ticks, settled_at_chain from inference_deals where token_contract_address=$1")
         .bind(tc).fetch_one(&pool).await.unwrap();
-    assert_eq!(kind.as_deref(), Some("RECLAIMED"));
-    assert_eq!(clean, Some(false));
-    assert!(settled.is_some(), "settled_at_chain must be set on StreamReclaimed");
+    assert_eq!(finalized, 0, "a pending claim must not count as a finalized tick");
+    assert!(settled.is_none(), "a claim is not a settlement");
 }
 
 #[tokio::test]
@@ -422,7 +425,8 @@ async fn token_contract_event_seeds_skeleton_then_filled_enriches() {
                     "ticks": "10",
                     "note": "0:seller",
                     "tokenContract": tc,
-                    "deadline": "0"
+                    "deadline": "0",
+                    "flags": "0"
                 }),
             ),
             &node(ob, "co-op-sell"),
@@ -443,7 +447,8 @@ async fn token_contract_event_seeds_skeleton_then_filled_enriches() {
                     "ticks": "10",
                     "note": "0:buyer",
                     "tokenContract": tc,
-                    "deadline": "0"
+                    "deadline": "0",
+                    "flags": "0"
                 }),
             ),
             &node(ob, "co-op-buy"),

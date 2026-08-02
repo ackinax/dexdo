@@ -51,14 +51,27 @@ pub async fn project_inference_event(
         event.event_type.strip_prefix("InferenceOrderBook.").unwrap_or(event.event_type.as_str());
     match suffix {
         "InferenceOrderPlaced" => apply_inference_order_placed(tx, event, node).await,
-        "InferenceSubscriptionPlaced" => apply_inference_subscription_placed(tx, event, node).await,
-        "InferenceOrderCancelled" => apply_inference_order_cancelled(tx, event, node).await,
+        "InferenceOrderCancelled" => {
+            apply_inference_order_closed(tx, event, node, "InferenceOrderCancelled").await
+        }
+        // An expiry removes the order from the book exactly like a cancel does, and
+        // the read model has no separate terminal state for it, so both land on
+        // CANCELLED. The event path is authoritative where the phantom sweep is only
+        // provisional: it closes the row at the chain's own moment instead of
+        // whenever the next sweep happens to probe the book.
+        "InferenceOrderExpired" => {
+            apply_inference_order_closed(tx, event, node, "InferenceOrderExpired").await
+        }
         "InferenceFilled" => apply_inference_filled(tx, event, node).await,
         // Observability-only. `InferenceOrderCancelRejected` fires from `_doCancel`
         // when the cancel matched no resting order or came from a foreign owner —
         // by construction the book did not change, so there is no row to touch.
+        // `InferenceOrderRejected` is the same shape one step earlier: the submission
+        // was refused before it ever became an order, so it has no id and no row (the
+        // refund it carries is a note-side balance move, not book state).
         "InferenceExecuted"
         | "InferenceRefunded"
+        | "InferenceOrderRejected"
         | "InferenceOrderCancelRejected"
         | "InferenceOrderBookDeployed" => Ok(ProjectionOutcome::Applied),
         _ => Ok(ProjectionOutcome::Unknown),
@@ -85,10 +98,16 @@ async fn seed_market_skeleton(
     Ok(())
 }
 
-// Shared resting-order upsert for OrderPlaced (is_subscription=false) and
-// SubscriptionPlaced (is_subscription=true). Same still-fresh conflict guard as
-// projectors::apply_order_placed: a replay onto a closed or partially-filled-OPEN
-// row is a no-op, so it never resets amount_remaining and corrupts depth.
+/// `InferenceOrderPlaced.flags` bit marking the order as a subscription
+/// (`FLAG_SUBSCRIPTION` in InferenceOrderBook.sol). A subscription used to be its
+/// own event; it is now an ordinary order carrying this bit, so the flag is the
+/// only thing that still distinguishes one.
+const FLAG_SUBSCRIPTION: u64 = 0x40;
+
+// Shared resting-order upsert for the placement path. Same still-fresh conflict
+// guard as projectors::apply_order_placed: a replay onto a closed or
+// partially-filled-OPEN row is a no-op, so it never resets amount_remaining and
+// corrupts depth.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_resting_order(
     tx: &mut Transaction<'_, Postgres>,
@@ -119,8 +138,8 @@ async fn upsert_resting_order(
                    amount_remaining = excluded.amount_remaining,
                    is_subscription = excluded.is_subscription,
                    note_address = excluded.note_address,
-                   -- NULL-preserving: a replayed SubscriptionPlaced carries no deadline,
-                   -- and neither may erase a value the reconciler recovered from chain.
+                   -- NULL-preserving: a BUY placement carries no tokenContract, and
+                   -- neither may erase a value the reconciler recovered from chain.
                    token_contract = coalesce(excluded.token_contract, inference_orders.token_contract),
                    deadline = coalesce(excluded.deadline, inference_orders.deadline),
                    status = 'OPEN',
@@ -181,6 +200,13 @@ async fn apply_inference_order_placed(
         non_zero_address(Some(field_str(&event.value, "tokenContract")?));
     let deadline: Option<String> =
         non_zero_uint(Some(uint_field_to_decimal(&event.value, "deadline")?));
+    // `flags` is mandatory in the ABI. Decode it strictly rather than defaulting a
+    // missing field to 0: a silent 0 would mark every subscription as an ordinary
+    // order, and nothing downstream would ever notice the flag went dark.
+    let flags: u64 = uint_field_to_decimal(&event.value, "flags")?
+        .parse()
+        .context("OrderPlaced: flags not an integer")?;
+    let is_subscription = flags & FLAG_SUBSCRIPTION != 0;
     let chain_order = node_chain_order(node, "InferenceOrderPlaced")?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
     upsert_resting_order(
@@ -190,45 +216,10 @@ async fn apply_inference_order_placed(
         is_buy,
         &price,
         &ticks,
-        false,
+        is_subscription,
         note,
         token_contract,
         deadline.as_deref(),
-        &chain_order,
-        chain_seconds,
-    )
-    .await?;
-    Ok(ProjectionOutcome::Applied)
-}
-
-async fn apply_inference_subscription_placed(
-    tx: &mut Transaction<'_, Postgres>,
-    event: &DecodedEvent,
-    node: &EventNode,
-) -> anyhow::Result<ProjectionOutcome> {
-    let ob = node.src.as_deref().context("SubscriptionPlaced: src missing")?;
-    let order_id = uint_field_to_decimal(&event.value, "orderId")?;
-    let price = uint_field_to_decimal(&event.value, "maxPrice")?;
-    let ticks = uint_field_to_decimal(&event.value, "ticks")?;
-    // `buyerNote` is mandatory in the ABI and the endpoint filters exactly on it; a NULL
-    // would hide the subscription from every `note=X` listing forever.
-    let note = Some(field_str(&event.value, "buyerNote")?);
-    let chain_order = node_chain_order(node, "InferenceSubscriptionPlaced")?;
-    let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
-    // InferenceSubscriptionPlaced carries no tokenContract (a subscription is a bid) and
-    // no deadline, though the chain stores one. The reconciler's getter probe is the only
-    // source for a subscription row's deadline.
-    upsert_resting_order(
-        tx,
-        ob,
-        &order_id,
-        true,
-        &price,
-        &ticks,
-        true,
-        note,
-        None,
-        None,
         &chain_order,
         chain_seconds,
     )
@@ -470,9 +461,9 @@ pub enum ExpiredOrphanOutcome {
     /// A `Filled` orphan with neither leg present (both `OrderPlaced` dropped):
     /// nothing to decrement.
     FilledNoLegPresent,
-    /// An `OrderCancelled` orphan: the order to cancel was never placed (its
-    /// `OrderPlaced` was dropped), so the authoritative cancel is lost. If a late
-    /// placement re-opens the order the phantom sweep reconciles it.
+    /// An `OrderCancelled` / `OrderExpired` orphan: the order to close was never
+    /// placed (its `OrderPlaced` was dropped), so the authoritative close is lost.
+    /// If a late placement re-opens the order the phantom sweep reconciles it.
     CancelLost,
     /// Any other inference event past cutoff with no resting row to repair.
     Nothing,
@@ -509,7 +500,7 @@ pub async fn repair_expired_inference_orphan(
             link_deal_from_filled(tx, &f).await?;
             outcome
         }
-        "InferenceOrderCancelled" => ExpiredOrphanOutcome::CancelLost,
+        "InferenceOrderCancelled" | "InferenceOrderExpired" => ExpiredOrphanOutcome::CancelLost,
         _ => ExpiredOrphanOutcome::Nothing,
     };
 
@@ -524,7 +515,7 @@ pub async fn repair_expired_inference_orphan(
         ),
         ExpiredOrphanOutcome::CancelLost => warn!(
             msg_id = %node.msg_id, event_type = %event.event_type,
-            "inference OrderCancelled orphan past cutoff: authoritative cancel lost (its OrderPlaced was dropped); the phantom sweep reconciles it if a late placement re-opens the order"
+            "inference order-close orphan past cutoff: authoritative close lost (its OrderPlaced was dropped); the phantom sweep reconciles it if a late placement re-opens the order"
         ),
         ExpiredOrphanOutcome::Nothing => warn!(
             msg_id = %node.msg_id, event_type = %event.event_type,
@@ -534,14 +525,19 @@ pub async fn repair_expired_inference_orphan(
     Ok(outcome)
 }
 
-async fn apply_inference_order_cancelled(
+/// Shared close path for the two events that retire a resting order without
+/// filling it — `InferenceOrderCancelled` and `InferenceOrderExpired`. Both carry
+/// `orderId` and both land the row on CANCELLED; `event_name` only names the
+/// caller in error context.
+async fn apply_inference_order_closed(
     tx: &mut Transaction<'_, Postgres>,
     event: &DecodedEvent,
     node: &EventNode,
+    event_name: &str,
 ) -> anyhow::Result<ProjectionOutcome> {
-    let ob = node.src.as_deref().context("OrderCancelled: src missing")?;
+    let ob = node.src.as_deref().with_context(|| format!("{event_name}: src missing"))?;
     let order_id = uint_field_to_decimal(&event.value, "orderId")?;
-    let chain_order = node_chain_order(node, "InferenceOrderCancelled")?;
+    let chain_order = node_chain_order(node, event_name)?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
     // CTE locks the row; the UPDATE always matches it (so RETURNING distinguishes
     // present-from-absent), the CASE keeps a FILLED row terminal. swept_at -> NULL
@@ -563,7 +559,7 @@ async fn apply_inference_order_cancelled(
             returning prior.status"#,
     )
     .bind(ob).bind(&order_id).bind(&chain_order).bind(chain_seconds)
-    .fetch_optional(&mut **tx).await.context("inference OrderCancelled update")?;
+    .fetch_optional(&mut **tx).await.with_context(|| format!("inference {event_name} update"))?;
 
     match prior {
         None => Ok(ProjectionOutcome::Deferred), // parent OrderPlaced not seen yet

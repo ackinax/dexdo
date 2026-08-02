@@ -467,6 +467,9 @@ pub struct ParamsOfPostSellOffer {
     pub flags: u8,
     /// Deal nonce the `TokenContract` address is derived from.
     pub nonce: u64,
+    /// Seconds the offer may rest before `expireOrder` may retire it (`0` =
+    /// good-till-cancel). The book stores it as an absolute deadline.
+    pub ttl: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -502,21 +505,6 @@ pub struct ParamsOfPlaceInferenceBuy {
     pub flags: u8,
     /// Time-in-force deadline (`0` = good-till-cancel).
     pub deadline: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-/// Parameters for `PrivateNote.placeInferenceSubscription`.
-pub struct ParamsOfPlaceInferenceSubscription {
-    /// `uint256` model hash, decimal/hex string — identifies the book.
-    pub model_hash: String,
-    pub max_price_per_tick: u128,
-    pub ticks: u128,
-    /// Same flag mask a limit buy takes (`IOC`/`FOK`/`MARKET`/`POST_ONLY`); a
-    /// subscription rests as a standing bid, so 0 is the ordinary value.
-    pub flags: u8,
-    pub escrow: u128,
-    pub auto_renew: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1262,24 +1250,6 @@ impl PrivateNote {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Place a subscription (semantic order)
-    ///
-    /// Original contract method: `placeInferenceSubscription`
-    ///
-    /// Should be signed with PrivateNote owner keys.
-    pub async fn place_inference_subscription(
-        &self,
-        params: ParamsOfPlaceInferenceSubscription,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "placeInferenceSubscription".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     /// # Cancel one resting inference order owned by this note
     ///
     /// Original contract method: `cancelInferenceOrder`
@@ -1346,24 +1316,6 @@ impl PrivateNote {
     ) -> KitResult<ResultOfSendMessage> {
         let call_set = CallSet {
             function_name: "streamDispute".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// # Buyer note reclaims a probe tick after the stream timeout (no-show)
-    ///
-    /// Original contract method: `streamReclaim`
-    ///
-    /// Should be signed with PrivateNote owner keys.
-    pub async fn stream_reclaim(
-        &self,
-        params: ParamsOfStreamDeal,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "streamReclaim".to_string(),
             header: None,
             input: Some(json!(params)),
         };
@@ -1487,7 +1439,7 @@ mod inference_abi_tests {
             abi_input_names("getInferenceOrderBookAddress")
         );
         assert_eq!(
-            keys(&ParamsOfPostSellOffer { flags: 0, nonce: 0 }),
+            keys(&ParamsOfPostSellOffer { flags: 0, nonce: 0, ttl: 0 }),
             abi_input_names("postSellOffer")
         );
         assert_eq!(
@@ -1500,17 +1452,6 @@ mod inference_abi_tests {
                 deadline: 0,
             }),
             abi_input_names("placeInferenceBuy")
-        );
-        assert_eq!(
-            keys(&ParamsOfPlaceInferenceSubscription {
-                model_hash: "1".into(),
-                max_price_per_tick: 1,
-                ticks: 1,
-                flags: 0,
-                escrow: 1,
-                auto_renew: true,
-            }),
-            abi_input_names("placeInferenceSubscription")
         );
         assert_eq!(
             keys(&ParamsOfCancelInferenceOrder { model_hash: "1".into(), order_id: 1 }),
@@ -1528,10 +1469,6 @@ mod inference_abi_tests {
             keys(&ParamsOfStreamDeal { token_contract: "0:1".into() }),
             abi_input_names("streamStop")
         );
-        assert_eq!(
-            keys(&ParamsOfStreamDeal { token_contract: "0:1".into() }),
-            abi_input_names("streamReclaim")
-        );
         // The four note-side stream/dispute lock callbacks are gone: the seller's
         // per-deal mirror bond in TokenContract is the only collateral, so the
         // note is never locked by a deal. Pin their absence so a reintroduction
@@ -1545,12 +1482,17 @@ mod inference_abi_tests {
                 .map(|f| f["name"].as_str().expect("function name").to_string())
                 .collect()
         };
+        // `placeInferenceSubscription` and `streamReclaim` went the same way in
+        // v4.0.32: a subscription is an ordinary buy carrying FLAG_SUBSCRIPTION,
+        // and the reclaim path was folded into the claim pipeline.
         for func in [
             "streamLock",
             "streamUnlock",
             "streamDisputeLock",
             "streamDisputeUnlock",
             "getStreamLocks",
+            "placeInferenceSubscription",
+            "streamReclaim",
         ] {
             assert!(!names.contains(func), "{func} is back in the ABI but has no wrapper");
         }

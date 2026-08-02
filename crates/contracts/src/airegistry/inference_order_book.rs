@@ -89,6 +89,9 @@ pub struct ParamsOfPlaceSellOffer {
     /// The seller's note, recorded as the offer's owner so a fill can settle
     /// back to it.
     pub owner_note: String,
+    /// Time-in-force deadline (`0` = good-till-cancel). A resting offer past its
+    /// deadline is retired by `expireOrder`, which emits `InferenceOrderExpired`.
+    pub deadline: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,22 +109,7 @@ pub struct ParamsOfPlaceBuyOrder {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-/// Parameters for `InferenceOrderBook.placeSubscription`.
-pub struct ParamsOfPlaceSubscription {
-    pub max_price_per_tick: u128,
-    pub ticks: u128,
-    /// Same flag mask a limit buy takes (`IOC`/`FOK`/`MARKET`/`POST_ONLY`); a
-    /// subscription rests as a standing bid, so 0 is the ordinary value.
-    pub flags: u8,
-    pub auto_renew: bool,
-    /// `uint256`, decimal or hex string.
-    pub buyer_pubkey: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-/// Parameters for the order-id-keyed methods `cancelOrder`, `pokeSubscription`
-/// and the `getOrder` / `getSubscription` getters.
+/// Parameters for the order-id-keyed methods `cancelOrder` and `expireOrder`.
 pub struct ParamsOfOrderId {
     pub order_id: u128,
 }
@@ -211,22 +199,6 @@ pub struct ResultOfGetQueueSize {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Result of `InferenceOrderBook.getSubscription`.
-pub struct ResultOfGetSubscription {
-    pub exists: bool,
-    #[serde(deserialize_with = "deserialize_u64")]
-    pub period_start: u64,
-    #[serde(deserialize_with = "deserialize_u8")]
-    pub cur_cycle: u8,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub cycle_budget: u128,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub cycle_spent: u128,
-    pub auto_renew: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 /// Result of `InferenceOrderBook.getParams`.
 pub struct ResultOfGetParams {
     /// `uint256` represented as returned by ABI.
@@ -294,36 +266,6 @@ impl InferenceOrderBook {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// Original contract method: `placeSubscription` (weekly semantic order,
-    /// spec §8).
-    pub async fn place_subscription(
-        &self,
-        params: ParamsOfPlaceSubscription,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "placeSubscription".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// Original contract method: `pokeSubscription`. Rolls a subscription onto
-    /// its next cycle / forfeits the unspent budget of the closing cycle.
-    pub async fn poke_subscription(
-        &self,
-        params: ParamsOfOrderId,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "pokeSubscription".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     /// Original contract method: `cancelOrder`. Cancels one resting order and
     /// refunds its remaining escrow.
     pub async fn cancel_order(
@@ -333,6 +275,23 @@ impl InferenceOrderBook {
     ) -> KitResult<ResultOfSendMessage> {
         let call_set = CallSet {
             function_name: "cancelOrder".to_string(),
+            header: None,
+            input: Some(json!(params)),
+        };
+        self.send_message(Some(call_set), None, signer).await
+    }
+
+    /// Original contract method: `expireOrder`. Permissionless: retires a resting
+    /// order whose deadline has passed, refunds its escrow and emits
+    /// `InferenceOrderExpired` so the order is observably gone rather than merely
+    /// unmatched.
+    pub async fn expire_order(
+        &self,
+        params: ParamsOfOrderId,
+        signer: Signer,
+    ) -> KitResult<ResultOfSendMessage> {
+        let call_set = CallSet {
+            function_name: "expireOrder".to_string(),
             header: None,
             input: Some(json!(params)),
         };
@@ -387,18 +346,6 @@ impl InferenceOrderBook {
     /// Original contract method: `getQueueSize`.
     pub async fn get_queue_size(&self) -> KitResult<ResultOfGetQueueSize> {
         self.call_get_method::<ResultOfGetQueueSize>("getQueueSize").await
-    }
-
-    /// Original contract method: `getSubscription`.
-    pub async fn get_subscription(
-        &self,
-        params: ParamsOfOrderId,
-    ) -> KitResult<ResultOfGetSubscription> {
-        self.call_get_method_with::<ResultOfGetSubscription, ParamsOfOrderId>(
-            "getSubscription",
-            params,
-        )
-        .await
     }
 
     /// Original contract method: `getParams`.

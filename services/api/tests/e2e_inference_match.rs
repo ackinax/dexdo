@@ -130,7 +130,7 @@ async fn inference_offer_matches_buy_and_funds_token_contract() {
     eprintln!("[e2e_match] token_contract={tc}");
 
     // 3. Seller posts a SELL offer backed by the TokenContract.
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
         .await
         .expect("postSellOffer accepted");
 

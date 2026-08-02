@@ -4,6 +4,7 @@ use ackinacki_kit::contracts::account::Account;
 use ackinacki_kit::contracts::deserialize::deserialize_u128;
 use ackinacki_kit::contracts::deserialize::deserialize_u16;
 use ackinacki_kit::contracts::deserialize::deserialize_u64;
+use ackinacki_kit::contracts::deserialize::deserialize_u8;
 use ackinacki_kit::contracts::error::KitModule;
 use ackinacki_kit::contracts::traits::AccountAccessor;
 use ackinacki_kit::contracts::traits::AutoContract;
@@ -78,6 +79,22 @@ pub struct ParamsOfFundFromOrderBook {
     pub buyer_note: String,
     /// `uint256`, decimal or hex string.
     pub buyer_pubkey: String,
+    /// The DEAL slice of the buyer's order flags (`DEAL_FLAGS_MASK` — `FLAG_TEE`
+    /// 0x10 | `FLAG_SUBSCRIPTION` 0x40). These describe the deal rather than how
+    /// the order executed, so they survive the match and configure the TC: a
+    /// subscription settles by week, an ordinary deal by consumed ticks.
+    pub deal_flags: u8,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for `TokenContract.claimTokens` (seller states cumulative output).
+pub struct ParamsOfClaimTokens {
+    /// Cumulative tokens delivered since the deal opened — not a delta. The
+    /// contract derives the delta itself and bounds it three ways: at most one
+    /// tick per call, no more often than `MIN_CLAIM_INTERVAL`, and never faster
+    /// than `MIN_SECONDS_PER_TICK` of elapsed time per tick claimed.
+    pub cumulative_tokens: u128,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,6 +139,11 @@ pub struct ResultOfGetOffer {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 /// Result of `TokenContract.getState`.
+///
+/// The three `tokens_*` fields are the claim pipeline, newest to oldest: a claim
+/// lands in `tokens_pending`, is displaced into `tokens_superseded` by the next
+/// one, and goes final once `CLAIM_PROMOTE_WINDOW` passes undisputed. Only
+/// `tokens_final` is money owed; the other two are still contestable.
 pub struct ResultOfGetState {
     pub funded: bool,
     pub opened: bool,
@@ -129,18 +151,75 @@ pub struct ResultOfGetState {
     pub disputed: bool,
     #[serde(deserialize_with = "deserialize_u128")]
     pub deposit: u128,
+    /// The trial tick frozen at `open`, credited on probe-accept or burned.
     #[serde(deserialize_with = "deserialize_u128")]
-    pub prepaid: u128,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub frozen: u128,
+    pub probe_tick: u128,
     #[serde(deserialize_with = "deserialize_u128")]
     pub finalized_owed: u128,
+    /// Cumulative tokens that have gone final — the only claimable figure.
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub tokens_final: u128,
+    /// The older of the two live claims: displaced by a newer one but not yet
+    /// promoted.
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub tokens_superseded: u128,
+    /// The newest claim, still inside its contest window.
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub tokens_pending: u128,
     #[serde(deserialize_with = "deserialize_u64")]
-    pub prepaid_time: u64,
+    pub probe_time: u64,
+    /// When the claim now sitting in `tokens_superseded` was filed.
     #[serde(deserialize_with = "deserialize_u64")]
-    pub last_advance: u64,
+    pub prev_claim_time: u64,
+    /// When the claim now sitting in `tokens_pending` was filed.
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub last_claim_time: u64,
     #[serde(deserialize_with = "deserialize_u64")]
     pub dispute_time: u64,
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub funded_time: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Result of `TokenContract.getBuyerBond` — the `2P` posted alongside a
+/// subscription's escrow and held apart from it, which a dispute stake is taken
+/// from. `bond_required` is zero on an ordinary deal, where the stake comes
+/// straight out of the escrow and nothing is posted up front.
+pub struct ResultOfGetBuyerBond {
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub bond_held: u128,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub bond_required: u128,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Result of `TokenContract.getSubscription` — the weekly take-or-pay term. Only
+/// meaningful when the deal carries `FLAG_SUBSCRIPTION`.
+///
+/// `week_base_tokens` tracks CONSUMPTION at the last week boundary while
+/// `tokens_paid` tracks MONEY. The two part company whenever a week was
+/// under-consumed, so a client that reads only `tokens_paid` cannot tell how much
+/// the seller may still claim this week. Past `week_index == sub_weeks` the term
+/// sells no further capacity and no higher claim is admitted.
+pub struct ResultOfGetSubscription {
+    #[serde(deserialize_with = "deserialize_u8")]
+    pub deal_flags: u8,
+    #[serde(deserialize_with = "deserialize_u8")]
+    pub sub_weeks: u8,
+    #[serde(deserialize_with = "deserialize_u8")]
+    pub week_index: u8,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub tokens_per_week: u128,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub funded_tokens: u128,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub tokens_paid: u128,
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub period_start: u64,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub week_base_tokens: u128,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,10 +240,15 @@ pub struct ResultOfGetSellerBond {
 pub struct ResultOfGetConfig {
     #[serde(deserialize_with = "deserialize_u16")]
     pub platform_fee_bps: u16,
+    /// Floor on the gap between two claims. May sit below the promotion window:
+    /// each claim carries its own timestamp and is promoted on its own window, so
+    /// a fast claim rate never shortens the contest time of the claim before it.
     #[serde(deserialize_with = "deserialize_u64")]
-    pub settle_window: u64,
+    pub min_claim_interval: u64,
+    /// The physical rate ceiling — no model produces a tick in less, so a claim
+    /// of `d` ticks is refused unless `d * min_seconds_per_tick <= elapsed`.
     #[serde(deserialize_with = "deserialize_u64")]
-    pub stream_timeout: u64,
+    pub min_seconds_per_tick: u64,
     #[serde(deserialize_with = "deserialize_u64")]
     pub dispute_window: u64,
 }
@@ -269,13 +353,6 @@ impl TokenContract {
     ///
     /// Original contract method: `fund`
     ///
-    /// Takes no arguments: the buyer must first be bound to the deal via
-    /// `authorizeDirectFund`, and the deposit rides on the message value.
-    pub async fn fund(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet { function_name: "fund".to_string(), header: None, input: None };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     /// # Fund from a matched order book buy (sender must be the order book)
     ///
     /// Original contract method: `fundFromOrderBook`
@@ -316,11 +393,74 @@ impl TokenContract {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Seller advances one tick (optimistic-accept after settle window)
+    /// # Seller takes the trial tick after buyer silence (spec §3.1.2)
     ///
-    /// Original contract method: `advance`
-    pub async fn advance(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet { function_name: "advance".to_string(), header: None, input: None };
+    /// Silence on a live endpoint is consent: once `PROBE_WINDOW` has passed the
+    /// probe tick is credited and the deal becomes claimable. The seller bond
+    /// stays locked — from here on it mirrors the claim pipeline, not the probe.
+    ///
+    /// Original contract method: `acceptProbe`
+    pub async fn accept_probe(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
+        let call_set =
+            CallSet { function_name: "acceptProbe".to_string(), header: None, input: None };
+        self.send_message(Some(call_set), None, signer).await
+    }
+
+    /// # Seller states cumulative delivered output (spec §3.2)
+    ///
+    /// Replaces the old per-tick `advance`: the seller asserts a running total and
+    /// the contract derives the delta, so a missed call never loses a tick. The
+    /// claim is contestable until `finalize` promotes it.
+    ///
+    /// Original contract method: `claimTokens`
+    pub async fn claim_tokens(
+        &self,
+        params: ParamsOfClaimTokens,
+        signer: Signer,
+    ) -> KitResult<ResultOfSendMessage> {
+        let call_set = CallSet {
+            function_name: "claimTokens".to_string(),
+            header: None,
+            input: Some(json!(params)),
+        };
+        self.send_message(Some(call_set), None, signer).await
+    }
+
+    /// # Promote undisputed claims and settle when the volume is exhausted
+    ///
+    /// Permissionless. Without it the LAST claim of a deal would never be payable
+    /// — nothing supersedes it, so only the elapsed window can promote it.
+    ///
+    /// Original contract method: `finalize`
+    pub async fn finalize(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
+        let call_set = CallSet { function_name: "finalize".to_string(), header: None, input: None };
+        self.send_message(Some(call_set), None, signer).await
+    }
+
+    /// # Credit the seller for every elapsed subscription week (spec §5)
+    ///
+    /// Permissionless. Pays the WHOLE week each time regardless of consumption —
+    /// a subscription buys reserved availability, not delivered volume. A call
+    /// that crosses no new week boundary is refused rather than accepted.
+    ///
+    /// Original contract method: `settleWeek`
+    pub async fn settle_week(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
+        let call_set =
+            CallSet { function_name: "settleWeek".to_string(), header: None, input: None };
+        self.send_message(Some(call_set), None, signer).await
+    }
+
+    /// # Seller walks out of the deal (spec §4.3)
+    ///
+    /// Finalized work stays owed, but the week he abandons is not — take-or-pay
+    /// protects reserved availability, and he stopped reserving it. He forfeits
+    /// the pending tail exactly as the buyer would, so quitting never pays better
+    /// than delivering.
+    ///
+    /// Original contract method: `sellerStop`
+    pub async fn seller_stop(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
+        let call_set =
+            CallSet { function_name: "sellerStop".to_string(), header: None, input: None };
         self.send_message(Some(call_set), None, signer).await
     }
 
@@ -358,15 +498,6 @@ impl TokenContract {
             header: None,
             input: None,
         };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// # Buyer reclaims on seller no-show after the stream timeout
-    ///
-    /// Original contract method: `reclaimOnTimeout`
-    pub async fn reclaim_on_timeout(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set =
-            CallSet { function_name: "reclaimOnTimeout".to_string(), header: None, input: None };
         self.send_message(Some(call_set), None, signer).await
     }
 
@@ -421,6 +552,14 @@ impl TokenContract {
     /// Original contract method: `getSellerBond`.
     pub async fn get_seller_bond(&self) -> KitResult<ResultOfGetSellerBond> {
         self.call_get_method::<ResultOfGetSellerBond>("getSellerBond").await
+    }
+
+    pub async fn get_buyer_bond(&self) -> KitResult<ResultOfGetBuyerBond> {
+        self.call_get_method::<ResultOfGetBuyerBond>("getBuyerBond").await
+    }
+
+    pub async fn get_subscription(&self) -> KitResult<ResultOfGetSubscription> {
+        self.call_get_method::<ResultOfGetSubscription>("getSubscription").await
     }
 
     /// Original contract method: `getOffer`.

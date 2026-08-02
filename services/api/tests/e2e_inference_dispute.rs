@@ -75,9 +75,10 @@ const BUY_ESCROW: u128 = 10_000_000_000;
 // it scales with `price_per_tick`, so it must be derived from P (a fixed value
 // under-funds it and `fundSellerBond` rejects the message).
 const SELLER_BOND: u128 = 2 * PRICE_PER_TICK + PRICE_PER_TICK / 100;
-// Probe acceptance is gated by the same price-scaled window, so this waits out
-// W = 1200s, not the 180s floor.
-const PROBE_WAIT: Duration = Duration::from_secs(1215);
+// Probe acceptance is gated by the fixed PROBE_WINDOW (180s). v4.0.32 removed
+// the price-scaled advance window this used to wait out, so the wait no longer
+// depends on the tick price — just the window plus a margin.
+const PROBE_WAIT: Duration = Duration::from_secs(195);
 const DISPUTE_WINDOW_S: u64 = 600;
 const SETTLE_WINDOW_S: u64 = 1200;
 
@@ -156,13 +157,13 @@ async fn inference_dispute_timeout_burns_mark_for_mark() {
     // Wait the probe window once (both deals opened), then accept both probes.
     eprintln!("[e2e_dispute] sleeping {}s for the probe window…", PROBE_WAIT.as_secs());
     tokio::time::sleep(PROBE_WAIT).await;
-    dex.token_contract_advance(&tc_a, signer()).await.expect("advance A");
-    dex.token_contract_advance(&tc_b, signer()).await.expect("advance B");
+    dex.token_contract_accept_probe(&tc_a, signer()).await.expect("acceptProbe A");
+    dex.token_contract_accept_probe(&tc_b, signer()).await.expect("acceptProbe B");
     let advanced_at = Instant::now();
     if !wait_state(&dex, &tc_a, |s| s.probe_accepted).await
         || !wait_state(&dex, &tc_b, |s| s.probe_accepted).await
     {
-        failures.push("advance did not accept the probe on both deals".to_string());
+        failures.push("acceptProbe did not accept the probe on both deals".to_string());
         finish(&dex, &note.address, &model_hash, &keys, failures).await;
         return;
     }
@@ -234,7 +235,9 @@ struct PreDispute {
     ticks_finalized: u128,
     /// Seller credit accrued so far.
     owed: u128,
-    /// `D = prepaid + frozen` — the buyer's disputable sum, burned on timeout.
+    /// `D` — the buyer's disputable sum, burned on timeout. Since v4.0.32 that is
+    /// the claim pipeline's un-promoted value: what a dispute contests is the
+    /// claim(s) not yet final.
     disputable: u128,
     /// Mirror bond held against `D`.
     bond: u128,
@@ -258,7 +261,7 @@ async fn snapshot(dex: &Dex, tc: &str) -> PreDispute {
     PreDispute {
         ticks_finalized: fees.ticks_finalized,
         owed: state.finalized_owed,
-        disputable: state.prepaid + state.frozen,
+        disputable: state.tokens_pending + state.tokens_superseded,
         bond: bond.bond_held,
     }
 }
@@ -341,7 +344,7 @@ async fn setup_deal(
     .await
     .map_err(|e| format!("deploy TokenContract: {e:?}"))?;
 
-    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce }, signer())
+    dex.post_sell_offer(&note.address, ParamsOfPostSellOffer { flags: 0, nonce, ttl: 0 }, signer())
         .await
         .map_err(|e| format!("postSellOffer: {e:?}"))?;
     wait_sell_offer_rested(dex, ob, &tc, POLL_TICKS, POLL_TICK).await?;

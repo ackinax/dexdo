@@ -111,7 +111,7 @@ async fn order_placed_seeds_market_and_rests_order() {
         serde_json::json!({
         "orderId":"5","isBuy":true,"price":"100","ticks":"10","note":"0:note5",
         // A BUY carries the zero address on chain; only a SELL names a deal contract.
-        "tokenContract":ZERO_ADDRESS,"deadline":"0" }),
+        "tokenContract":ZERO_ADDRESS,"deadline":"0","flags":"0" }),
     );
     assert_eq!(project(&mut tx, &e, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
@@ -149,7 +149,7 @@ async fn order_placed_replay_does_not_reset_partial_fill() {
     let mut tx = pool.begin().await.unwrap();
     let e = ev(
         "InferenceOrderPlaced",
-        serde_json::json!({"orderId":"9","isBuy":false,"price":"7","ticks":"10","note":"0:n","tokenContract":"0:tc","deadline":"0"}),
+        serde_json::json!({"orderId":"9","isBuy":false,"price":"7","ticks":"10","note":"0:n","tokenContract":"0:tc","deadline":"0","flags":"0"}),
     );
     project(&mut tx, &e, &node(ob, "co-1")).await;
     tx.commit().await.unwrap();
@@ -168,8 +168,12 @@ async fn order_placed_replay_does_not_reset_partial_fill() {
     assert_eq!(rem, "4", "replay must not reset amount_remaining to full ticks");
 }
 
+/// A subscription no longer has an event of its own: it is an ordinary placement
+/// carrying `FLAG_SUBSCRIPTION` (0x40) in `flags`. The flag is the only thing that
+/// still tells the two apart, so pin that it reaches `is_subscription` — a
+/// regression here is silent, leaving the column uniformly false.
 #[tokio::test]
-async fn subscription_placed_rests_a_buy() {
+async fn subscription_flag_marks_the_placement_a_subscription() {
     let Some(pool) = setup().await else { return };
     let ob = "0:t_sub_ob";
     sqlx::query("delete from inference_orders where orderbook_address=$1")
@@ -183,10 +187,13 @@ async fn subscription_placed_rests_a_buy() {
         .await
         .unwrap();
     let mut tx = pool.begin().await.unwrap();
+    // 0x60 = FLAG_SUBSCRIPTION | FLAG_AON — a subscription always carries AON too,
+    // so the projector must test the bit rather than compare the whole byte.
     let e = ev(
-        "InferenceSubscriptionPlaced",
+        "InferenceOrderPlaced",
         serde_json::json!({
-        "orderId":"3","buyerNote":"0:bn","maxPrice":"50","ticks":"8","cycleBudget":"0","autoRenew":false }),
+        "orderId":"3","isBuy":true,"price":"50","ticks":"8","note":"0:bn",
+        "tokenContract":ZERO_ADDRESS,"deadline":"0","flags":"96" }),
     );
     assert_eq!(project(&mut tx, &e, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
@@ -194,6 +201,33 @@ async fn subscription_placed_rests_a_buy() {
         "select is_buy, is_subscription, price::text, amount_remaining::text from inference_orders where orderbook_address=$1 and order_id=3")
         .bind(ob).fetch_one(&pool).await.unwrap();
     assert_eq!((is_buy, is_sub, price.as_str(), rem.as_str()), (true, true, "50", "8"));
+}
+
+/// The mirror of the above: a placement without the bit must NOT be flagged. Pins
+/// the direction that a hardcoded `true` would break.
+#[tokio::test]
+async fn a_plain_placement_is_not_flagged_a_subscription() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:t_plain_flags_ob";
+    clean(&pool, ob).await;
+    let mut tx = pool.begin().await.unwrap();
+    // 0x08 = FLAG_POST_ONLY: a set flag byte that is not the subscription bit.
+    let e = ev(
+        "InferenceOrderPlaced",
+        serde_json::json!({
+        "orderId":"4","isBuy":true,"price":"50","ticks":"8","note":"0:bn",
+        "tokenContract":ZERO_ADDRESS,"deadline":"0","flags":"8" }),
+    );
+    assert_eq!(project(&mut tx, &e, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+    let is_sub: bool = sqlx::query_scalar(
+        "select is_subscription from inference_orders where orderbook_address=$1 and order_id=4",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!is_sub);
 }
 
 #[tokio::test]
@@ -225,12 +259,83 @@ async fn order_cancelled_is_terminal_and_defers_when_absent() {
     assert_eq!(n, 0);
     // Place then cancel => CANCELLED, swept_at NULL.
     let mut tx = pool.begin().await.unwrap();
-    project(&mut tx,&ev("InferenceOrderPlaced",serde_json::json!({"orderId":"2","isBuy":true,"price":"1","ticks":"5","note":"0:n","tokenContract":ZERO_ADDRESS,"deadline":"0"})),&node(ob,"co-2")).await;
+    project(&mut tx,&ev("InferenceOrderPlaced",serde_json::json!({"orderId":"2","isBuy":true,"price":"1","ticks":"5","note":"0:n","tokenContract":ZERO_ADDRESS,"deadline":"0","flags":"0"})),&node(ob,"co-2")).await;
     assert_eq!(project(&mut tx, &c, &node(ob, "co-3")).await, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
     let (status, swept_null): (String, bool) = sqlx::query_as(
         "select status, swept_at is null from inference_orders where orderbook_address=$1 and order_id=2").bind(ob).fetch_one(&pool).await.unwrap();
     assert_eq!((status.as_str(), swept_null), ("CANCELLED", true));
+}
+
+/// An expiry retires the order the same way a cancel does. It also clears any
+/// provisional `swept_at`: the sweep guesses a row is gone, the event knows it.
+#[tokio::test]
+async fn order_expired_closes_the_order_and_defers_when_absent() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:t_expire_ob";
+    clean(&pool, ob).await;
+
+    let e = ev(
+        "InferenceOrderExpired",
+        serde_json::json!({"orderId":"2","isBuy":true,"note":"0:n","tokenContract":ZERO_ADDRESS}),
+    );
+
+    // Expiry with no prior placement => Deferred (zero writes).
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &e, &node(ob, "co-1")).await, ProjectionOutcome::Deferred);
+    tx.commit().await.unwrap();
+    let n: i64 = sqlx::query_scalar(
+        "select count(*) from inference_orders where orderbook_address=$1 and order_id=2",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 0);
+
+    // Place, let the sweep provisionally cancel it, then expire => authoritative.
+    let mut tx = pool.begin().await.unwrap();
+    project(&mut tx,&ev("InferenceOrderPlaced",serde_json::json!({"orderId":"2","isBuy":true,"price":"1","ticks":"5","note":"0:n","tokenContract":ZERO_ADDRESS,"deadline":"0","flags":"0"})),&node(ob,"co-2")).await;
+    tx.commit().await.unwrap();
+    sqlx::query(
+        "update inference_orders set swept_at = now() where orderbook_address=$1 and order_id=2",
+    )
+    .bind(ob)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &e, &node(ob, "co-3")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+    let (status, swept_null): (String, bool) = sqlx::query_as(
+        "select status, swept_at is null from inference_orders where orderbook_address=$1 and order_id=2").bind(ob).fetch_one(&pool).await.unwrap();
+    assert_eq!((status.as_str(), swept_null), ("CANCELLED", true));
+}
+
+/// A rejected submission never became an order, so there is no row to touch — but
+/// it must still be accepted, not left to `Unknown`.
+#[tokio::test]
+async fn order_rejected_is_accepted_without_creating_a_row() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:t_reject_ob";
+    clean(&pool, ob).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let e = ev(
+        "InferenceOrderRejected",
+        serde_json::json!({"reason":"3","note":"0:n","tokenContract":ZERO_ADDRESS,"refund":"42"}),
+    );
+    assert_eq!(project(&mut tx, &e, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let n: i64 =
+        sqlx::query_scalar("select count(*) from inference_orders where orderbook_address=$1")
+            .bind(ob)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 0, "a rejected submission must not create an order row");
 }
 
 #[tokio::test]
@@ -288,7 +393,7 @@ async fn routes_by_event_type_when_event_name_is_empty() {
         contract_kind: "",
         event_name: String::new(), // <-- as the live loop builds it
         event_type: "InferenceOrderBook.InferenceOrderPlaced".to_string(),
-        value: serde_json::json!({"orderId":"7","isBuy":true,"price":"1","ticks":"3","note":"0:n","tokenContract":ZERO_ADDRESS,"deadline":"0"}),
+        value: serde_json::json!({"orderId":"7","isBuy":true,"price":"1","ticks":"3","note":"0:n","tokenContract":ZERO_ADDRESS,"deadline":"0","flags":"0"}),
     };
     assert_eq!(project(&mut tx, &loop_shaped, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
@@ -539,6 +644,7 @@ async fn expired_filled_orphan_decrements_present_leg() {
             "orderId":"700","isBuy":true,"price":"5","ticks":"10","note":"0:n",
             "tokenContract":ZERO_ADDRESS,
             "deadline":"0",
+            "flags":"0",
         }),
     );
     assert_eq!(
@@ -611,6 +717,7 @@ async fn place(
             // A BUY carries the zero address on chain; only a SELL names a deal contract.
             "tokenContract": if is_buy { ZERO_ADDRESS } else { "0:tc" },
             "deadline": "0",
+            "flags": "0",
         }),
     );
     project(tx, &e, &node(ob, co)).await;
@@ -811,14 +918,14 @@ async fn filled_links_deal_to_orderbook_seller_buyer() {
     let sell = ev(
         "InferenceOrderPlaced",
         serde_json::json!({
-        "orderId":"1","isBuy":false,"price":"100","ticks":"10","note":"0:seller","tokenContract":tc,"deadline":"0"}),
+        "orderId":"1","isBuy":false,"price":"100","ticks":"10","note":"0:seller","tokenContract":tc,"deadline":"0","flags":"0"}),
     );
     project(&mut tx, &sell, &node(ob, "co-1")).await;
     // BUY leg by the buyer note; order_id 2.
     let buy = ev(
         "InferenceOrderPlaced",
         serde_json::json!({
-        "orderId":"2","isBuy":true,"price":"100","ticks":"10","note":"0:buyer","tokenContract":ZERO_ADDRESS,"deadline":"0"}),
+        "orderId":"2","isBuy":true,"price":"100","ticks":"10","note":"0:buyer","tokenContract":ZERO_ADDRESS,"deadline":"0","flags":"0"}),
     );
     project(&mut tx, &buy, &node(ob, "co-2")).await;
     // Filled crossing them; carries sellerTC + buyerNote.
@@ -864,7 +971,7 @@ async fn orphan_repair_filled_links_deal() {
     let sell = ev(
         "InferenceOrderPlaced",
         serde_json::json!({
-        "orderId":"1","isBuy":false,"price":"100","ticks":"10","note":"0:seller","tokenContract":tc,"deadline":"0"}),
+        "orderId":"1","isBuy":false,"price":"100","ticks":"10","note":"0:seller","tokenContract":tc,"deadline":"0","flags":"0"}),
     );
     project_inference_event(&mut tx, &sell, &node(ob, "co-1")).await.unwrap();
     // Expired Filled orphan: maker(1) present, taker(2) dropped.
@@ -950,7 +1057,7 @@ async fn project_placed(
             "orderId": id.to_string(), "isBuy": is_buy, "price": price, "ticks": ticks,
             "note": "0:n",
             "tokenContract": tc.unwrap_or(ZERO_ADDRESS),
-            "deadline": deadline.to_string(),
+            "deadline": deadline.to_string(), "flags": "0",
         }),
     );
     let mut tx = pool.begin().await.unwrap();
@@ -959,12 +1066,15 @@ async fn project_placed(
     tx.commit().await.unwrap();
 }
 
+/// A subscription placement: a BUY carrying `FLAG_SUBSCRIPTION`. Like any BUY it
+/// names no tokenContract and rests without a deadline, so both land NULL and only
+/// the reconciler's getter probe can fill them in.
 async fn project_subscription(pool: &PgPool, ob: &str, id: i64, price: &str, ticks: &str) {
     let e = ev(
-        "InferenceSubscriptionPlaced",
+        "InferenceOrderPlaced",
         serde_json::json!({
-            "orderId": id.to_string(), "buyerNote": "0:bn", "maxPrice": price, "ticks": ticks,
-            "cycleBudget": "0", "autoRenew": false,
+            "orderId": id.to_string(), "isBuy": true, "price": price, "ticks": ticks,
+            "note": "0:bn", "tokenContract": ZERO_ADDRESS, "deadline": "0", "flags": "64",
         }),
     );
     let mut tx = pool.begin().await.unwrap();
@@ -1041,6 +1151,7 @@ async fn a_placement_missing_token_contract_fails_projection_instead_of_insertin
         serde_json::json!({
             "orderId": "10", "isBuy": false, "price": "10", "ticks": "5", "note": "0:n",
             "deadline": "0",
+            "flags": "0",
         }),
     )
     .await
@@ -1117,40 +1228,27 @@ async fn a_placement_missing_deadline_fails_projection_instead_of_inserting_null
     assert_eq!(rows, 0, "no row may be inserted from an undecodable placement");
 }
 
-async fn project_subscription_raw(
-    pool: &PgPool,
-    ob: &str,
-    id: i64,
-    value: serde_json::Value,
-) -> anyhow::Result<ProjectionOutcome> {
-    let e = ev("InferenceSubscriptionPlaced", value);
-    let mut tx = pool.begin().await.unwrap();
-    let co = format!("co-sub-raw-{id}");
-    let outcome = project_inference_event(&mut tx, &e, &node(ob, &co)).await?;
-    tx.commit().await.unwrap();
-    Ok(outcome)
-}
-
 #[tokio::test]
-async fn a_subscription_missing_buyer_note_fails_projection_instead_of_inserting_null() {
+async fn a_placement_missing_flags_fails_projection_instead_of_inserting_null() {
     let Some(pool) = setup().await else { return };
-    let ob = "0:buyer-note-drift";
+    let ob = "0:flags-drift";
     clean(&pool, ob).await;
 
-    // ABI or decoder drift: the mandatory field is gone. A subscription carries neither
-    // tokenContract nor deadline, so buyerNote is the only mandatory sibling field.
-    let err = project_subscription_raw(
+    // ABI or decoder drift: the mandatory field is gone. Defaulting it to 0 would
+    // mark every subscription an ordinary order and nothing downstream would notice,
+    // so the projection must fail loudly instead.
+    let err = project_placed_raw(
         &pool,
         ob,
         13,
         serde_json::json!({
-            "orderId": "13", "maxPrice": "10", "ticks": "5",
-            "cycleBudget": "0", "autoRenew": false,
+            "orderId": "13", "isBuy": true, "price": "10", "ticks": "5",
+            "note": "0:bn", "tokenContract": ZERO_ADDRESS, "deadline": "0",
         }),
     )
     .await
-    .expect_err("a missing buyerNote must fail the projection");
-    assert!(format!("{err:#}").contains("buyerNote"));
+    .expect_err("a missing flags must fail the projection");
+    assert!(format!("{err:#}").contains("flags"));
 
     let rows: i64 =
         sqlx::query_scalar("select count(*) from inference_orders where orderbook_address=$1")

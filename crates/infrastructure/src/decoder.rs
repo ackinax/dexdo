@@ -260,12 +260,12 @@ mod tests {
             assert!(decoder.contracts.contains_key(kind), "missing contract {kind}");
         }
 
-        // 50 DEX unique ids + 8 InferenceOrderBook ids + 13 TokenContract ids = 71
+        // 50 DEX unique ids + 9 InferenceOrderBook ids + 14 TokenContract ids = 73
         // distinct ids. (The InferenceOrderBook events carry an `Inference` prefix, so
         // none collides with the DEX OrderBook events. The two extra DEX ids over the
         // earlier 48 are PrivateNote's owner-facing inference mirrors,
         // InferenceOrderPlacedConfirmed / InferenceFilledConfirmed.)
-        assert_eq!(decoder.known_events(), 71, "unexpected total event id count");
+        assert_eq!(decoder.known_events(), 73, "unexpected total event id count");
 
         // sample lookups — find entries for PMP
         let pmp_event_ids: Vec<_> = decoder
@@ -286,8 +286,8 @@ mod tests {
     fn registers_inference_orderbook_and_counts_unique_ids() {
         let decoder = Decoder::new().unwrap();
         assert!(decoder.contracts.contains_key("InferenceOrderBook"), "inference abi missing");
-        // 50 DEX + 8 inference + 13 TokenContract = 71.
-        assert_eq!(decoder.unique_event_ids(), 71, "unexpected unique event-id count");
+        // 50 DEX + 9 inference + 14 TokenContract = 73.
+        assert_eq!(decoder.unique_event_ids(), 73, "unexpected unique event-id count");
     }
 
     #[test]
@@ -341,10 +341,10 @@ mod tests {
             checked += 1;
         }
         assert_eq!(
-            checked, 8,
-            "expected exactly 8 inference events (InferenceOrderPlaced, InferenceFilled, \
+            checked, 9,
+            "expected exactly 9 inference events (InferenceOrderPlaced, InferenceFilled, \
              InferenceExecuted, InferenceRefunded, InferenceOrderCancelled, \
-             InferenceSubscriptionPlaced, InferenceOrderBookDeployed, \
+             InferenceOrderExpired, InferenceOrderRejected, InferenceOrderBookDeployed, \
              InferenceOrderCancelRejected)"
         );
     }
