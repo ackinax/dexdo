@@ -111,7 +111,10 @@ pub struct ParamsOfAddRangeEvent {
     pub oracle_fee: u128,
     pub deadline: u64,
     pub describe: String,
-    /// `uint256[]` strictly increasing upper bounds, decimal/hex strings.
+    /// `uint256[]` strictly increasing upper bounds, decimal/hex strings. The
+    /// first bound must be ABOVE zero (enforced since v4.0.32): outcome 0 wins
+    /// on `price < bounds[0]`, so a zero first bound defines an outcome that can
+    /// be staked on and can never win.
     pub bounds: Vec<String>,
     pub outcome_names: HashMap<u32, String>,
     /// Address of the `InferenceOrderBook` providing the reference price.

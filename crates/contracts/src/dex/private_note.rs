@@ -619,7 +619,9 @@ impl PrivateNote {
     ///
     /// Original contract method: `changeOwner`
     ///
-    /// Should be signed with current ephemeral owner keys
+    /// Must be signed with the CURRENT ephemeral owner key. Enforced on chain
+    /// since v4.0.32 (`onlyOwnerPubkey(_ephemeralPubkey)`); before that the
+    /// method carried no owner gate at all, so an unsigned call went through.
     pub async fn change_owner(
         &self,
         params: ParamsOfChangeOwner,
