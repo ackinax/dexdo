@@ -10,8 +10,8 @@ depends_on:
 
 variables:
   - &ansible_image "docker.gosh.sh/ansible-ubuntu:24-fix"
-  - &acki_branch "test/dex-4.0.30"
-  - &allbin_image "docker.gosh.sh/ackinacki-all-bin:01ef664282679576fc46d882655fc6e0927767f9"
+  - &acki_branch "contracts/dex_bridge"
+  - &allbin_image "docker.gosh.sh/ackinacki-all-bin:889d1a884e4bfe4cd61a6ff4a7d79b1f0e9e498c"
   - &node_image_tag "latest-dev"
   - &busybox_image "busybox:musl"
   - &tvm_cli_version "v3.0.4-rc.an"
