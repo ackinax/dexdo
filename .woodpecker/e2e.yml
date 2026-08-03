@@ -17,6 +17,7 @@ variables:
   - &tvm_cli_version "v3.0.4-rc.an"
   - &sold_version "gosh_0.79.4-rc"
   - &dex_test_notes_cnt "10"
+  - &e2e_expected_tests "14"
   - &inventory_branch "main"
   - &e2e_inventory ".inventory/ansible/inventory/dexdo/e2e/dexdo-infra.yml"
   - &acki_dir_on_host "/opt/acki-nacki"
@@ -166,8 +167,23 @@ steps:
       E2E_CI_USER: { from_secret: e2e_ci_user }
       TEST_DATABASE_URL: { from_secret: e2e_test_database_url }   # postgres://dodex:<pw>@127.0.0.1:55432/dodex_test
       ACKI_DIR: *acki_dir_on_host
+      # Every #[ignore] test in services/api/tests/ minus the dispute binary the
+      # on-host script filters out (window-gated on a ~15 min timeout).
+      E2E_EXPECTED_TESTS: *e2e_expected_tests
     commands:
       - cp -ar $CI_WORKSPACE/.ssh ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519
+      # The host reuses ~/dexdo-e2e between pipelines, and `git checkout` will not
+      # clobber locally-modified tracked files — so a leftover edit survives the sync
+      # and the run silently tests something other than $CI_COMMIT_SHA. That is how
+      # pipeline 212/213 came to start 10 tests instead of 14: four inference tests
+      # were simply absent from the working tree, and a partial run still reports
+      # green/red as if it covered everything. Reset before the sync; keep `target/`
+      # (ignored, so `-x` is deliberately omitted) to preserve the build cache.
+      - >
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        "$E2E_CI_USER@$E2E_HOST"
+        "set -e; d=\$HOME/dexdo-e2e;
+        if [ -d \$d/.git ]; then cd \$d && git reset --hard -q && git clean -fdq; fi"
       - >
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
         -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o TCPKeepAlive=yes
@@ -176,7 +192,17 @@ steps:
         E2E_NETWORK_ENDPOINT='http://127.0.0.1'
         E2E_SEED_NOTES='$ACKI_DIR/config/dex_test_notes.keys.json'
         TEST_DATABASE_URL='$TEST_DATABASE_URL'
-        bash -s" < .acki-nacki/tests/dexdo/e2e-on-host.sh
+        bash -s" < .acki-nacki/tests/dexdo/e2e-on-host.sh 2>&1 | tee /tmp/e2e.out; rc=${PIPESTATUS[0]}
+      # A run that quietly covers less than it should must fail as loudly as a broken
+      # one. `Starting N tests` is the only place nextest states what it actually
+      # selected, so pin N. Update E2E_EXPECTED_TESTS whenever an #[ignore] e2e test
+      # is added or removed — same discipline as the decoder count pins.
+      - >
+        grep -qE "Starting $E2E_EXPECTED_TESTS tests" /tmp/e2e.out ||
+        { echo "FATAL: expected $E2E_EXPECTED_TESTS e2e tests, nextest selected:";
+          grep -oE 'Starting [0-9]+ tests' /tmp/e2e.out || echo '  (no Starting line at all)';
+          exit 1; }
+      - exit $rc
 
   dump_logs:
     depends_on:

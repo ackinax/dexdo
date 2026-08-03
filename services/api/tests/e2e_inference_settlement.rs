@@ -40,6 +40,7 @@ use common::e2e_setup::model_hash_dec;
 use common::e2e_setup::network_endpoint;
 use common::test_pns::TestPnPool;
 use dodex_chain::Dex;
+use dodex_contracts::airegistry::token_contract::ParamsOfClaimTokens;
 use dodex_contracts::airegistry::token_contract::ParamsOfOpen;
 use dodex_contracts::dex::private_note::ParamsOfDeployInferenceOrderBook;
 use dodex_contracts::dex::private_note::ParamsOfInferenceOrderBook;
@@ -65,6 +66,12 @@ const SELLER_BOND: u128 = 2 * PRICE_PER_TICK + PRICE_PER_TICK / 100;
 // the price-scaled advance window this used to wait out, so the wait no longer
 // depends on the tick price — just the window plus a margin.
 const PROBE_WAIT: Duration = Duration::from_secs(195);
+// `TokenContract.TICK_SIZE` — one tick is this many tokens, and a claim is stated
+// in tokens rather than ticks.
+const TICK_SIZE: u128 = 1_000_000;
+// MIN_CLAIM_INTERVAL (60s) is the floor between two claims, and the physical rate
+// bound needs the same 60s per claimed tick. One tick-time plus margin clears both.
+const CLAIM_WAIT: Duration = Duration::from_secs(65);
 
 fn unique_suffix() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
@@ -221,12 +228,46 @@ async fn inference_settlement_immediate_stop_does_not_pay_streaming_tick() {
             "probe acceptance should finalize exactly the probe tick: ticksFinalized={ticks_before}, want 1"
         ));
     }
-    // The old model prepaid the next tick at probe-accept; v4.0.32 does not —
-    // further output must be asserted with `claimTokens` and promoted by
-    // `finalize`, so there is no prepaid balance to check here.
+    // 7. Seller claims a second tick. `claimTokens` states a CUMULATIVE total, and
+    //    the probe already counts as tick one, so two ticks is `2 * TICK_SIZE`.
+    //    Three bounds gate this: at least MIN_CLAIM_INTERVAL since the last claim
+    //    (acceptProbe set that clock), a delta of at most MAX_CLAIM_DELTA = one
+    //    tick, and the physical rate `delta * MIN_SECONDS_PER_TICK <= elapsed *
+    //    TICK_SIZE`. Waiting one tick-time satisfies all three.
+    eprintln!("[e2e_settle] sleeping {}s for the claim interval…", CLAIM_WAIT.as_secs());
+    tokio::time::sleep(CLAIM_WAIT).await;
+    dex.token_contract_claim_tokens(
+        &tc,
+        ParamsOfClaimTokens { cumulative_tokens: 2 * TICK_SIZE },
+        signer(),
+    )
+    .await
+    .expect("TokenContract.claimTokens accepted");
+    if !wait_state(&dex, &tc, |s| s.tokens_pending >= 2 * TICK_SIZE, "the claim to land").await {
+        failures.push("claimTokens did not register the second tick within budget".to_string());
+        finish(&dex, &note.address, &model_hash, &keys, failures).await;
+        return;
+    }
+    let after_claim = dex.token_contract_get_state(&tc).await.expect("getState after claimTokens");
+    eprintln!(
+        "[e2e_settle] claimed: tokensFinal={} tokensPending={} (a claim is not a payment)",
+        after_claim.tokens_final, after_claim.tokens_pending
+    );
+    // A claim on its own moves nothing into `tokensFinal` — only `finalize`, after
+    // CLAIM_PROMOTE_WINDOW passes undisputed, does. Pin that: were a claim to credit
+    // the seller directly, the whole contest window would be decorative.
+    if after_claim.tokens_final != TICK_SIZE {
+        failures.push(format!(
+            "a pending claim must not be credited: tokensFinal={} want={TICK_SIZE} (the probe tick alone)",
+            after_claim.tokens_final
+        ));
+    }
 
-    // 7. IMMEDIATE stop — the streaming tick's window is still open ⇒ the seller
-    //    must NOT be paid it, so no second tick is finalized.
+    // 8. IMMEDIATE stop — the claim is still inside its promotion window, so the
+    //    seller must NOT be paid it. The contract states the rule outright: "the
+    //    contested tail (claimed but still inside its promotion window) is NOT paid
+    //    on this path — the buyer walking away is precisely the statement that it is
+    //    disputed." No second tick may be finalized.
     dex.stream_stop(&note.address, ParamsOfStreamDeal { token_contract: tc.clone() }, signer())
         .await
         .expect("streamStop accepted");
