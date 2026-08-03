@@ -243,7 +243,23 @@ async fn inference_settlement_immediate_stop_does_not_pay_streaming_tick() {
     )
     .await
     .expect("TokenContract.claimTokens accepted");
-    if !wait_state(&dex, &tc, |s| s.tokens_pending >= 2 * TICK_SIZE, "the claim to land").await {
+    // Deliberately a SHORTER budget than POLL_TICKS: the whole point of step 8 is to
+    // stop while the claim is still contestable, and CLAIM_PROMOTE_WINDOW is 120s
+    // from `_lastClaimTime`. The default 45 x 2s budget would leave only 30s of
+    // margin, so a slow runner could promote the claim on its own and the test
+    // would read that as the seller being paid. 15 ticks is ample for an external
+    // message to land and leaves ~90s.
+    let mut claim_landed = false;
+    for _ in 0..15u32 {
+        tokio::time::sleep(POLL_TICK).await;
+        if let Ok(st) = dex.token_contract_get_state(&tc).await
+            && st.tokens_pending >= 2 * TICK_SIZE
+        {
+            claim_landed = true;
+            break;
+        }
+    }
+    if !claim_landed {
         failures.push("claimTokens did not register the second tick within budget".to_string());
         finish(&dex, &note.address, &model_hash, &keys, failures).await;
         return;

@@ -172,6 +172,7 @@ steps:
       E2E_EXPECTED_TESTS: *e2e_expected_tests
     commands:
       - cp -ar $CI_WORKSPACE/.ssh ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519
+      - rm -f /tmp/e2e.out /tmp/e2e.failed
       # The host reuses ~/dexdo-e2e between pipelines, and `git checkout` will not
       # clobber locally-modified tracked files — so a leftover edit survives the sync
       # and the run silently tests something other than $CI_COMMIT_SHA. That is how
@@ -192,17 +193,23 @@ steps:
         E2E_NETWORK_ENDPOINT='http://127.0.0.1'
         E2E_SEED_NOTES='$ACKI_DIR/config/dex_test_notes.keys.json'
         TEST_DATABASE_URL='$TEST_DATABASE_URL'
-        bash -s" < .acki-nacki/tests/dexdo/e2e-on-host.sh 2>&1 | tee /tmp/e2e.out; rc=${PIPESTATUS[0]}
+        bash -s" < .acki-nacki/tests/dexdo/e2e-on-host.sh > /tmp/e2e.out 2>&1 || touch /tmp/e2e.failed
+      - cat /tmp/e2e.out
       # A run that quietly covers less than it should must fail as loudly as a broken
       # one. `Starting N tests` is the only place nextest states what it actually
       # selected, so pin N. Update E2E_EXPECTED_TESTS whenever an #[ignore] e2e test
-      # is added or removed — same discipline as the decoder count pins.
+      # is added or removed — same discipline as the decoder count pins. Checked
+      # BEFORE the pass/fail verdict: a run that tested the wrong set is not a
+      # meaningful red either, and its count is the more useful message.
       - >
-        grep -qE "Starting $E2E_EXPECTED_TESTS tests" /tmp/e2e.out ||
-        { echo "FATAL: expected $E2E_EXPECTED_TESTS e2e tests, nextest selected:";
-          grep -oE 'Starting [0-9]+ tests' /tmp/e2e.out || echo '  (no Starting line at all)';
-          exit 1; }
-      - exit $rc
+        if ! grep -qE "Starting $E2E_EXPECTED_TESTS tests" /tmp/e2e.out; then
+        echo "FATAL: expected $E2E_EXPECTED_TESTS e2e tests, nextest selected:";
+        grep -oE "Starting [0-9]+ tests" /tmp/e2e.out || echo "  (no Starting line at all)";
+        exit 1; fi
+      # The run itself is redirected rather than piped: the step shell is `/bin/sh`
+      # (dash in this image), which has neither PIPESTATUS nor pipefail, so a pipe
+      # would hand back tee's exit code and turn every failed run green.
+      - test ! -f /tmp/e2e.failed
 
   dump_logs:
     depends_on:
