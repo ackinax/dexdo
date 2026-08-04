@@ -156,6 +156,12 @@ or clear.
 | `get_pending_place_buy_lock` / `get_pending_place_buy_token_type` | getters | Inspect a pending buy in flight. |
 | `get_inference_order_book_address` | `getInferenceOrderBookAddress` | Deterministic book address for a `modelHash`. |
 
+The four lock callbacks all take `ParamsOfStreamLock { seller_pubkey, nonce }`:
+the deal is named by the pair its address is derived from, not by the address
+itself. The note recomputes the canonical `TokenContract` from that pair and
+requires `msg.sender` to equal it, so a foreign caller cannot lock the note by
+naming someone else's deal.
+
 ---
 
 ## 3. `Dex` facade — `crates/chain/src/test_helpers.rs`
