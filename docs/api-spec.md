@@ -856,6 +856,7 @@ Response:
         "version": "instruct",
         "ref": "qwen--qwen2.5-32b--instruct"
       },
+      "contractVersion": "4.0.30",
       "status": "TRADING",
       "quoteAsset": "SHELL",
       "makerCommission": "-0.02",
@@ -881,6 +882,7 @@ Response fields:
 | `hasMore` | BOOLEAN | Whether more pages follow. |
 | `inferenceOrderBookAddress` | STRING | Stable market id — the model's order-book address. Pass it as `?inferenceOrderBookAddress=` to fetch this one market, and as the key for [`/api/v1/inference/depth`](#inference-depth). |
 | `model` | OBJECT | Model identity. `ref` is the canonical `producer--model--version`. `producer` / `name` / `version` MAY be `null` if the model identity is not yet known on chain; `ref` then carries the model hash. |
+| `contractVersion` | STRING \| null | Version of the deployed order-book contract backing this market (e.g. `"4.0.30"`). Distinct from `model.version`, which is the AI model's own version. `null` when the contract version is not yet known on chain. |
 | `status` | ENUM | `TRADING`. Reserved for future inactive states; clients MUST treat it as opaque. |
 | `quoteAsset` | STRING | Always `SHELL`. |
 | `makerCommission` | DECIMAL | Maker (**seller**) fee rate, a signed decimal string. The seller is never charged; a negative value (`"-0.02"` = −2%) is a **rebate credited to the seller** for delivering ticks cleanly. This is the rebate **cap**: the actual rebate ramps from `0` with delivered ticks and applies only on a clean, non-disputed close, so a given deal may credit less. |
@@ -922,6 +924,7 @@ Response:
 ```json
 {
   "inferenceOrderBookAddress": "0:ob-addr...",
+  "contractVersion": "4.0.30",
   "lastUpdateId": "76a23086a006700000000000000000000000000000000000000000000000000000000000000000007",
   "bids": [
     ["1000", "120"],
@@ -938,6 +941,7 @@ Each bid or ask item is `[pricePerTick, ticks]` — price in `SHELL` and the tot
 
 | Field | Type | Description |
 | --- | --- | --- |
+| `contractVersion` | STRING \| null | Version of the deployed order-book contract for this book (e.g. `"4.0.30"`). Same value as `contractVersion` in [`/api/v1/inference/markets`](#inference-markets) for the same `inferenceOrderBookAddress`. `null` when the contract version is not yet known on chain. |
 | `lastUpdateId` | STRING | Opaque chain-order cursor for this book. Lex-comparable: a larger string means a newer event has touched the book. Empty string when no order has landed yet. Do not parse it as an integer. |
 
 Errors:
@@ -969,7 +973,7 @@ Query parameters:
 | `tokenContract` | STRING | NO | Exact deal `TokenContract` address. Mutually exclusive with `note`. Refused with `-1500` (HTTP 503, retry) while the book holds a live SELL whose `TokenContract` the indexer does not know. |
 | `note` | STRING | NO | Exact owning PrivateNote address. Mutually exclusive with `tokenContract`. |
 | `side` | STRING | NO | `BUY` or `SELL`. |
-| `status` | STRING | NO | Comma-separated: `LIVE`, `FILLED`, `CANCELLED`. Tokens are trimmed and de-duplicated. Default: all statuses. `LIVE` means currently resting. |
+| `status` | STRING | NO | Comma-separated: `LIVE`, `FILLED`, `CANCELLED`, `EXPIRED`. Tokens are trimmed and de-duplicated. Default: all statuses. `LIVE` means currently resting; `EXPIRED` means the book dropped it once its deadline passed. |
 | `limit` | INT | NO | Page size. Default: `100`. Range: `[1, 500]`; out-of-range values are rejected, not clamped. |
 | `cursor` | STRING | NO | Keyset cursor: the decimal `orderId` of the last row on the previous page, taken verbatim from a previous call's `nextCursor`. |
 
@@ -1018,7 +1022,7 @@ Response fields:
 | `ticks` | DECIMAL | The **resting remainder** — ticks still available at this order. Compare directly against a level in [`/api/v1/inference/depth`](#inference-depth), which uses the same name (`ticks`) for the same quantity. |
 | `ticksInitial` | DECIMAL | The size the order was placed with. On chain, `InferenceOrderPlaced.ticks` is this initial size — the same field name carries a different number in the chain event than it does in this response's `ticks`. |
 | `deadline` | STRING \| null | Unix seconds as a **decimal string**, reproducing the chain `uint64` verbatim (it can exceed both `i64` and JSON's exact-integer range). `null` means no deadline is known to the indexer — see the note below; it does not mean "no deadline". |
-| `status` | ENUM | `LIVE`, `FILLED`, or `CANCELLED`. See the notes below. |
+| `status` | ENUM | `LIVE`, `FILLED`, `CANCELLED`, or `EXPIRED`. `EXPIRED` means the book dropped the order once its `deadline` passed, as opposed to someone cancelling it. A past `deadline` on its own never implies `EXPIRED`: the status changes only when the chain reports the removal, so an order can read `LIVE` with a `deadline` already behind it. See the notes below. |
 | `createdAt` | LONG \| null | Unix seconds. `null` when the chain timestamp was not recovered — the row is served regardless. |
 | `updatedAt` | LONG \| null | Unix seconds, same convention as `createdAt`. |
 
