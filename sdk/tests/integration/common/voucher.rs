@@ -3,7 +3,6 @@
 //! and proves the resulting `RootPN.VoucherGenerated` event via the
 //! production `dodex_sdk::halo2::live::prove_voucher_for_event` Stage B.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +19,7 @@ use dodex_contracts::dex::root_pn::RootPn;
 use dodex_sdk::dex_contract_params;
 use dodex_sdk::halo2::live::prove_voucher_for_event;
 use dodex_sdk::halo2::sk_commit::compute_sk_u_commit_hex;
+use dodex_sdk::halo2::voucher_ecc;
 use dodex_sdk::halo2::voucher_event;
 use dodex_sdk::halo2::Halo2Paths;
 use dodex_sdk::proof;
@@ -73,16 +73,22 @@ pub async fn make_voucher_proof(
     //    another concurrent test's voucher event by accident, then fail later at
     //    submit with `ERR_INVALID_ZKPROOF (137)` because the proof was built
     //    against that other voucher's commitment.
+    //
+    //    The ECC shape is the contract's rule, not this harness's, so it comes
+    //    from the same helper the production flows use. Get it wrong and
+    //    `generateVoucher` reverts before emitting anything — the wait below
+    //    then burns its whole timeout against a chain busy emitting other
+    //    people's vouchers.
     let t_send = std::time::Instant::now();
-    let mut ecc = HashMap::new();
-    ecc.insert(voucher_token_type, voucher_value);
+    let plan = voucher_ecc::plan_voucher(voucher_token_type, voucher_value, is_fee)
+        .expect("voucher nominals in this harness are far below the overflow bound");
     let giver = GiverV3::new_default(context.clone());
     giver
         .send_currency_with_body(
             ParamsOfSendCurrencyWithBody {
                 dest: root_pn.address().to_string(),
                 value: 2_000_000_000,
-                ecc,
+                ecc: plan.ecc,
                 flag: 1,
                 body: voucher_body.body,
             },
@@ -120,7 +126,8 @@ pub async fn make_voucher_proof(
         event,
         sk_u_hex,
         sk_u_commit_hex,
-        voucher_value,
+        // The nominal the contract emitted, which is not always the sum sent.
+        plan.nominal,
         voucher_token_type,
         ephemeral_pubkey_hex,
         None,
