@@ -2,11 +2,10 @@
 // real shellnet, driven through `dodex_chain::Dex` (no DB, no HTTP). Fast (no
 // timed windows) — complements `e2e_inference_match` / `e2e_inference_stream`.
 //
-// Three independent flows (self-trade — one note plays every role):
+// Two independent flows (self-trade — one note plays every role):
 //   * partial fill — a 2-tick SELL offer is crossed by a 4-tick limit BUY: the
 //     match funds the TokenContract for 2 ticks and the BUY rests with 2 ticks
 //     left. Also reads getBestBidAsk / getWeeklyMedianPrice.
-//   * subscription — placeInferenceSubscription + getSubscription (§8).
 //   * Filled event — a match emits a `Filled` ext-out event; it is fetched and
 //     decoded through the airegistry event wrapper and its payload asserted.
 //
@@ -24,6 +23,8 @@ use ackinacki_kit::tvm_client::abi::Signer;
 use ackinacki_kit::tvm_client::crypto::KeyPair;
 use common::airegistry::deploy_token_contract;
 use common::airegistry::fetch_inference_event_ids;
+use common::airegistry::wait_inference_book_live;
+use common::airegistry::wait_sell_offer_rested;
 use common::airegistry::TokenDeal;
 use common::e2e_setup::model_hash_dec;
 use common::e2e_setup::network_endpoint;
@@ -34,15 +35,28 @@ use dodex_contracts::dex::private_note::ParamsOfCancelAllInferenceOrders;
 use dodex_contracts::dex::private_note::ParamsOfDeployInferenceOrderBook;
 use dodex_contracts::dex::private_note::ParamsOfInferenceOrderBook;
 use dodex_contracts::dex::private_note::ParamsOfPlaceInferenceBuy;
-use dodex_contracts::dex::private_note::ParamsOfPlaceInferenceSubscription;
 use dodex_contracts::dex::private_note::ParamsOfPostSellOffer;
 
 const POLL_TICK: Duration = Duration::from_secs(2);
 const POLL_TICKS: u32 = 45;
-const PRICE_PER_TICK: u128 = 1_000_000;
+// A limit price must be a positive whole multiple of `PRICE_STEP` (1 SHELL =
+// 1e9); the book rejects sub-SHELL dust with ERR_BAD_PARAM before assigning an
+// order id, so a too-small price reads as "the order never rested".
+const PRICE_PER_TICK: u128 = 1_000_000_000;
+/// `PrivateNote.MAX_SELL_TTL` — the longest lifetime a SELL offer may ask for.
+/// A SELL has no good-till-cancel: `ttl == 0` or anything above this reverts
+/// with `ERR_SELL_DEADLINE_TOO_LONG`, so the full hour is the safest value for
+/// a run whose pace depends on the shellnet.
+const MAX_SELL_TTL: u64 = 3600;
+/// `ERR_NO_LIQUIDITY` in `contracts/airegistry/InferenceOrderBook.sol` — what
+/// `getWeeklyMedianPrice` raises while the book has recorded no finalized ticks.
+const ERR_NO_LIQUIDITY: u32 = 334;
 
 fn note_and_signer() -> (common::test_pns::TestPn, KeyPair) {
-    let note = TestPnPool::load().first().clone();
+    let note = {
+        let p = TestPnPool::load_inference();
+        p.notes[9 % p.notes.len()].clone()
+    };
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
         secret: note.owner_secret_key_hex.clone(),
@@ -91,13 +105,10 @@ async fn deploy_book(
         )
         .await
         .expect("getInferenceOrderBookAddress");
-    for _ in 0..POLL_TICKS {
-        tokio::time::sleep(POLL_TICK).await;
-        if dex.inference_get_stats(&ob).await.is_ok() {
-            return (ob, model_hash);
-        }
-    }
-    panic!("InferenceOrderBook did not become live within budget");
+    wait_inference_book_live(dex, &ob, POLL_TICKS, POLL_TICK)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
+    (ob, model_hash)
 }
 
 #[tokio::test]
@@ -117,12 +128,7 @@ async fn inference_partial_fill_leaves_remainder() {
         &note.owner_public_key_hex,
         &note.address,
         nonce,
-        TokenDeal {
-            model_name: model_name.clone(),
-            tick_size: 1,
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 4,
-        },
+        TokenDeal { model_name: model_name.clone(), price_per_tick: PRICE_PER_TICK, max_ticks: 2 },
         keys.clone(),
     )
     .await
@@ -132,24 +138,16 @@ async fn inference_partial_fill_leaves_remainder() {
     // 2-tick SELL offer rests.
     dex.post_sell_offer(
         &note.address,
-        ParamsOfPostSellOffer {
-            model_hash: model_hash.clone(),
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 2,
-            token_contract: tc.clone(),
-            flags: 0,
-            nonce,
-        },
+        ParamsOfPostSellOffer { flags: 0, nonce, ttl: MAX_SELL_TTL },
         signer(),
     )
     .await
     .expect("postSellOffer");
-    for _ in 0..POLL_TICKS {
-        tokio::time::sleep(POLL_TICK).await;
-        let Ok(stats) = dex.inference_get_stats(&ob).await else { continue };
-        if stats.order_count >= 1 {
-            break;
-        }
+    // Assert the precondition instead of falling through: with no resting ask the
+    // buy below has nothing to cross, and the real cause resurfaces much later as a
+    // misleading "match never funded" / ERR_NO_LIQUIDITY out of getWeeklyMedianPrice.
+    if let Err(diag) = wait_sell_offer_rested(&dex, &ob, &tc, POLL_TICKS, POLL_TICK).await {
+        panic!("{diag} — no liquidity to match");
     }
 
     // 4-tick limit BUY crosses: 2 fill (fund the TC), 2 rest.
@@ -159,7 +157,8 @@ async fn inference_partial_fill_leaves_remainder() {
             model_hash: model_hash.clone(),
             max_price_per_tick: PRICE_PER_TICK,
             ticks: 4,
-            escrow: 6_000_000,
+            // >= ticks * (price + 2.5% fee) = 4 * 1.025e9 = 4.1e9.
+            escrow: 6_000_000_000,
             flags: 0,
             deadline: 0,
         },
@@ -212,81 +211,26 @@ async fn inference_partial_fill_leaves_remainder() {
         }
         Err(err) => failures.push(format!("getBestBidAsk: {err:?}")),
     }
+    // A match reserves escrow that a cancel or a no-show still refunds, so it
+    // must NOT move the reference price: the book records VWAP volume only from
+    // `reportFinalized`, which the TokenContract sends once ticks are served and
+    // paid. This flow never settles, so the book is dry and the getter reverts
+    // with ERR_NO_LIQUIDITY. Asserting the revert (not just tolerating it) pins
+    // that separation — a build that credited the median on fill would pass a
+    // mere `is_err`, and so would any unrelated getter failure.
     match dex.inference_get_weekly_median_price(&ob).await {
-        Ok(median) => eprintln!("[e2e_clob] weeklyMedianPrice={median}"),
+        Ok(median) => failures.push(format!(
+            "getWeeklyMedianPrice returned {median} after a match with no settlement: \
+             an unfinalized fill must not feed the reference price"
+        )),
+        Err(err) if err.tvm_exit_code() == Some(ERR_NO_LIQUIDITY) => {
+            eprintln!("[e2e_clob] weeklyMedianPrice: dry book (ERR_NO_LIQUIDITY), as expected")
+        }
         Err(err) => failures.push(format!("getWeeklyMedianPrice: {err:?}")),
     }
 
     cleanup(&dex, &note.address, &model_hash, &keys).await;
     assert!(failures.is_empty(), "e2e_clob partial-fill failures: {failures:#?}");
-}
-
-#[tokio::test]
-#[ignore = "requires shellnet + seed_notes.json"]
-async fn inference_subscription_place_and_read() {
-    let _ = tracing_subscriber::fmt().with_test_writer().with_env_filter("info").try_init();
-    let (note, keys) = note_and_signer();
-    let signer = || Signer::Keys { keys: keys.clone() };
-    let dex = Dex::from_endpoints(vec![network_endpoint()]).expect("Dex");
-    let model_name = unique_model_name("e2e-clob-sub");
-    let mut failures: Vec<String> = Vec::new();
-
-    let (ob, model_hash) = deploy_book(&dex, &note.address, &model_name, signer()).await;
-    eprintln!("[e2e_clob] subscription order_book={ob}");
-
-    // escrow must be >= ticks * (price + platform fee); 8 * (1M + 2.5%) = 8.2M.
-    dex.place_inference_subscription(
-        &note.address,
-        ParamsOfPlaceInferenceSubscription {
-            model_hash: model_hash.clone(),
-            max_price_per_tick: PRICE_PER_TICK,
-            ticks: 8,
-            escrow: 10_000_000,
-            auto_renew: true,
-        },
-        signer(),
-    )
-    .await
-    .expect("placeInferenceSubscription");
-
-    // The subscription gets an order id from the book's counter; scan the low
-    // ids until it surfaces (a fresh book starts at 1).
-    let mut seen = false;
-    for _ in 0..POLL_TICKS {
-        tokio::time::sleep(POLL_TICK).await;
-        if let Ok(stats) = dex.inference_get_stats(&ob).await {
-            eprintln!(
-                "[e2e_clob] stats: order_count={} next_order_id={}",
-                stats.order_count, stats.next_order_id
-            );
-        }
-        for id in 1..=5u128 {
-            let Ok(sub) = dex.inference_get_subscription(&ob, id).await else { continue };
-            if sub.exists {
-                eprintln!(
-                    "[e2e_clob] subscription id={id}: autoRenew={} cycleBudget={} curCycle={}",
-                    sub.auto_renew, sub.cycle_budget, sub.cur_cycle
-                );
-                if !sub.auto_renew {
-                    failures.push("subscription autoRenew should be true".to_string());
-                }
-                if sub.cycle_budget == 0 {
-                    failures.push("subscription cycleBudget should be > 0".to_string());
-                }
-                seen = true;
-                break;
-            }
-        }
-        if seen {
-            break;
-        }
-    }
-    if !seen {
-        failures.push("subscription never surfaced via getSubscription".to_string());
-    }
-
-    cleanup(&dex, &note.address, &model_hash, &keys).await;
-    assert!(failures.is_empty(), "e2e_clob subscription failures: {failures:#?}");
 }
 
 #[tokio::test]
@@ -306,12 +250,7 @@ async fn inference_match_emits_filled_event() {
         &note.owner_public_key_hex,
         &note.address,
         nonce,
-        TokenDeal {
-            model_name: model_name.clone(),
-            tick_size: 1,
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 4,
-        },
+        TokenDeal { model_name: model_name.clone(), price_per_tick: PRICE_PER_TICK, max_ticks: 2 },
         keys.clone(),
     )
     .await
@@ -319,24 +258,15 @@ async fn inference_match_emits_filled_event() {
 
     dex.post_sell_offer(
         &note.address,
-        ParamsOfPostSellOffer {
-            model_hash: model_hash.clone(),
-            price_per_tick: PRICE_PER_TICK,
-            max_ticks: 2,
-            token_contract: tc.clone(),
-            flags: 0,
-            nonce,
-        },
+        ParamsOfPostSellOffer { flags: 0, nonce, ttl: MAX_SELL_TTL },
         signer(),
     )
     .await
     .expect("postSellOffer");
-    for _ in 0..POLL_TICKS {
-        tokio::time::sleep(POLL_TICK).await;
-        let Ok(stats) = dex.inference_get_stats(&ob).await else { continue };
-        if stats.order_count >= 1 {
-            break;
-        }
+    // Same precondition as above: a missing ask surfaces much later as a
+    // misleading "match never funded" / ERR_NO_LIQUIDITY.
+    if let Err(diag) = wait_sell_offer_rested(&dex, &ob, &tc, POLL_TICKS, POLL_TICK).await {
+        panic!("{diag} — no liquidity to match");
     }
     dex.place_inference_buy(
         &note.address,
@@ -344,7 +274,8 @@ async fn inference_match_emits_filled_event() {
             model_hash: model_hash.clone(),
             max_price_per_tick: PRICE_PER_TICK,
             ticks: 2,
-            escrow: 3_000_000,
+            // >= ticks * (price + 2.5% fee) = 2 * 1.025e9.
+            escrow: 3_000_000_000,
             flags: 1,
             deadline: 0,
         },

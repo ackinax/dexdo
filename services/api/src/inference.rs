@@ -48,6 +48,10 @@ struct InferenceMarketDto {
     #[serde(rename = "inferenceOrderBookAddress")]
     orderbook_address: String,
     model: InferenceModelDto,
+    /// Version of the deployed order-book contract (e.g. `"4.0.30"`). Distinct
+    /// from `model.version` (the AI model's own version). `null` when not yet
+    /// known on chain.
+    contract_version: Option<String>,
     status: InferenceMarketStatusDto,
     quote_asset: String,
     /// Signed decimal string; the seller rebate cap (negative).
@@ -196,6 +200,7 @@ fn inference_market_to_dto(m: InferenceMarket) -> InferenceMarketDto {
             version: m.model.version,
             model_ref: m.model.model_ref,
         },
+        contract_version: m.contract_version,
         status: m.status.into(),
         quote_asset: m.quote_asset,
         maker_commission: m.maker_commission,
@@ -215,6 +220,9 @@ fn inference_market_to_dto(m: InferenceMarket) -> InferenceMarketDto {
 struct InferenceDepthResponse {
     #[serde(rename = "inferenceOrderBookAddress")]
     orderbook_address: String,
+    /// Version of the deployed order-book contract for this book; `null` when
+    /// not yet known on chain.
+    contract_version: Option<String>,
     /// Opaque lex-comparable chain-order cursor; empty when no order has landed.
     last_update_id: String,
     #[salvo(schema(schema_with = inference_depth_bids_schema))]
@@ -289,6 +297,7 @@ pub(crate) async fn get_inference_depth(
 
     Ok(Json(InferenceDepthResponse {
         orderbook_address: snapshot.orderbook_address,
+        contract_version: snapshot.contract_version,
         last_update_id: snapshot.last_update_id,
         bids: snapshot.bids.into_iter().map(|l| [l.price, l.quantity]).collect(),
         asks: snapshot.asks.into_iter().map(|l| [l.price, l.quantity]).collect(),
@@ -346,7 +355,7 @@ struct InferenceOrderDto {
         ("tokenContract" = Option<String>, Query, description = "Exact deal TokenContract. Mutually exclusive with `note`. Refused with -1500 (HTTP 503, retry) while the book has a live SELL whose TokenContract the indexer does not know."),
         ("note" = Option<String>, Query, description = "Exact owning PrivateNote address. Mutually exclusive with `tokenContract`."),
         ("side" = Option<String>, Query, description = "BUY or SELL."),
-        ("status" = Option<Vec<dto::InferenceOrderStatus>>, Query, style = Form, explode = false, description = "Comma-separated: LIVE, FILLED, CANCELLED. Default: all. LIVE means currently resting."),
+        ("status" = Option<Vec<dto::InferenceOrderStatus>>, Query, style = Form, explode = false, description = "Comma-separated: LIVE, FILLED, CANCELLED, EXPIRED. Default: all. LIVE means currently resting; EXPIRED means the book dropped it once its deadline passed."),
         ("limit" = Option<i64>, Query, minimum = 1, maximum = 500, description = "Page size. Default 100, max 500; out-of-range values are rejected."),
         ("cursor" = Option<String>, Query, description = "Keyset cursor from a previous call's nextCursor."),
     ),

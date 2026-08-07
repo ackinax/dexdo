@@ -17,7 +17,7 @@ import "./libraries/DexLib.sol";
 contract OrderBook is Modifiers {
 
     /// @notice Contract semantic version.
-    string constant version = "4.0.16";
+    string constant version = "4.0.35";
 
     /// @notice Event identifier associated with this order book.
     uint256 static _eventId;
@@ -160,7 +160,6 @@ contract OrderBook is Modifiers {
     uint8 constant FLAG_FOK       = 0x02;
     uint8 constant FLAG_MARKET    = 0x04;
     uint8 constant FLAG_POST_ONLY = 0x08;
-    uint8 constant TAKER_FLAGS_MASK = 0x07;
 
     /// @notice Parameters for placing a single order.
     /// @dev `clientOrderId` is optional (0 = not set). When non-zero it is
@@ -260,16 +259,20 @@ contract OrderBook is Modifiers {
     // ===== Constructor =====
 
     constructor(
-        uint256 pmpSaltedCodeHash,
-        uint16 pmpSaltedCodeDepth,
         uint64 resultStart,
         uint32 numOutcomes
     ) {
         tvm.accept();
         ensureBalance();
 
+        // The salt binds this book to the PrivateNote family and to the genuine
+        // PMP salted code hash. Because the PMP hash lives in the salt it is
+        // committed into this book's own address, so the canonical book can only
+        // be deployed by the genuine PMP. The hash is trusted (set by the
+        // deployer's DexLib) and is never taken as a caller-supplied argument.
         TvmCell salt = abi.codeSalt(tvm.code()).get();
-        (TvmCell PrivateNoteCode) = abi.decode(salt, (TvmCell));
+        (TvmCell PrivateNoteCode, uint256 pmpSaltedCodeHash, uint16 pmpSaltedCodeDepth)
+            = abi.decode(salt, (TvmCell, uint256, uint16));
         _privateNoteCodeHash  = tvm.hash(PrivateNoteCode);
         _privateNoteCodeDepth = uint16(PrivateNoteCode.depth());
 
@@ -333,11 +336,18 @@ contract OrderBook is Modifiers {
             depositIdentifierHash
         );
         require(msg.sender == wallet, ERR_INVALID_SENDER);
+        // Mirrors the bound `PrivateNote.placeBatch` applies before it sends.
+        // Re-checked here, and ahead of the accept, so an over-long batch is
+        // refused outright: silently keeping the head of it would leave the
+        // tail without a `Rejected` event or an owner callback, which is the
+        // terminal outcome every other refusal in this contract gives.
+        require(orders.length <= MAX_BATCH_SIZE, ERR_BATCH_TOO_LARGE);
+        require(cancelIds.length <= MAX_BATCH_SIZE, ERR_BATCH_TOO_LARGE);
         tvm.accept();
         ensureBalance();
 
-        uint32 nPlace  = uint32(orders.length)    > MAX_BATCH_SIZE ? MAX_BATCH_SIZE : uint32(orders.length);
-        uint32 nCancel = uint32(cancelIds.length) > MAX_BATCH_SIZE ? MAX_BATCH_SIZE : uint32(cancelIds.length);
+        uint32 nPlace  = uint32(orders.length);
+        uint32 nCancel = uint32(cancelIds.length);
 
         uint128 minNotional = minOrderNotional(_tokenType);
         uint128 lot = lotSize(_tokenType);
@@ -368,7 +378,9 @@ contract OrderBook is Modifiers {
             bool opIsFok      = (op.flags & FLAG_FOK)       != 0;
 
             if (op.amount == 0) valid = false;
-            else if (opIsPostOnly && (opIsMarket || opIsIoc || opIsFok)) valid = false;
+            // A POST_ONLY order only ever rests, so a taker-side minAmount is meaningless on it —
+            // reject it here rather than let it pass validation and be dropped silently in _doPlace.
+            else if (opIsPostOnly && (opIsMarket || opIsIoc || opIsFok || op.minAmount != 0)) valid = false;
             else if (opIsIoc && opIsFok) valid = false;
             else if (opIsMarket && (opIsIoc || opIsFok)) valid = false;
             else if (opIsMarket) {
@@ -1003,7 +1015,7 @@ contract OrderBook is Modifiers {
         // continuations, no other place/cancel runs in between) guarantees that
         // the available liquidity does not shrink before we consume it. Levels
         // are now keyed by epochId, so foreign-epoch orders cannot inflate
-        // totalAmount nor force phantom-skip walks.
+        // totalAmount nor force extra skip walks.
 
         if (remaining > 0) {
             if (isIoc || isFok || isMarket) {
@@ -1506,8 +1518,15 @@ contract OrderBook is Modifiers {
     ///         by the dispatch are committed and a bounce arrives in a later block.
     ///         External monitors must reconcile the affected PN. Without this hook
     ///         the bounce would silently be a no-op; here it surfaces as an event.
+    /// @dev Accepts so the report is paid for by this contract rather than by whatever the bounce
+    ///      carried back. A callback that failed hard returns almost nothing, and leaving the emit
+    ///      on the bounce's own value would drop the notice in exactly the case it exists to
+    ///      report. Bounces here can only follow messages this book itself sent, so the cost is
+    ///      bounded by its own traffic and is not something a caller can drive.
     onBounce(TvmSlice body) external pure {
         body;
+        tvm.accept();
+        ensureBalance();
         address addrExtern = address.makeAddrExtern(OB_CALLBACK_BOUNCED, bitCntAddress);
         emit CallbackBounced{dest: addrExtern}(msg.sender, tx.logicaltime);
     }

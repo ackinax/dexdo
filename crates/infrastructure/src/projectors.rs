@@ -78,6 +78,27 @@ pub async fn project_event(
         // in `config::IGNORABLE_EVENT_TYPES` (so `ignored_event_types` may shed
         // them) and neither is metric-critical — keep the two in sync.
         "PMP.StakeAccepted" | "PMP.MergeProcessed" => Ok(ProjectionOutcome::Applied),
+        // Carry nothing the read model serves, but still need an arm: without one
+        // they project as `Unknown`, get marked processed on first sight, and are
+        // never retried — so a handler added later needs an explicit backfill.
+        //
+        // Deliberately NOT in `IGNORABLE_EVENT_TYPES`. That list is permission for
+        // `ignored_event_types` to drop a type at ingest, before the `raw_events`
+        // insert; dodex-rewards reads the stake-forfeit payloads straight out of
+        // `raw_events`, so granting that permission would cut it off from them.
+        //
+        // The note-side inference mirrors follow `InferenceOrderPlacedConfirmed` /
+        // `InferenceFilledConfirmed`: the book is the authority on an order, the
+        // note's copy exists for its owner.
+        "PMP.StakeForfeited"
+        | "PrivateNote.StakeForfeitConfirmed"
+        | "PrivateNote.StakeDroppedLocally"
+        | "PrivateNote.DealCredited"
+        | "PrivateNote.BookCredited"
+        | "PrivateNote.InferenceOrderRemoved"
+        | "PrivateNote.InferenceOrderRejectedMirror"
+        | "PrivateNote.InferenceDealClosed"
+        | "RootPN.DealWriteOffReported" => Ok(ProjectionOutcome::Applied),
         et if et.starts_with("TokenContract.") => {
             crate::token_contract_projectors::project_token_contract_event(tx, event, node)
                 .await
@@ -156,14 +177,25 @@ async fn apply_oracle_event_list_deployed(
     // inventing a value.
     let description = field_str(&event.value, "description")?;
 
+    // Conflict on `address`, not `msg_id`: an oracle may emit
+    // OracleEventListDeployed more than once for the same list (e.g. once bare,
+    // then again once a description is set), and every emission carries its own
+    // msg_id. Keying the upsert on msg_id makes the second emission fall through
+    // to a plain insert, which trips the UNIQUE on `address` and leaves the raw
+    // event pending forever. `msg_id` is deliberately left untouched on update —
+    // it records the message that first created the row.
+    //
+    // `description` is NOT NULL, so "no description" arrives as ''. Take the
+    // incoming value only when it carries text, so a later bare re-emission
+    // cannot erase a description already on record.
     sqlx::query(
         r#"insert into oracle_event_lists (msg_id, oracle_id, address, list_index, description)
            values ($1, $2, $3, $4, $5)
-           on conflict (msg_id) do update
+           on conflict (address) do update
                set oracle_id = excluded.oracle_id,
-                   address = excluded.address,
                    list_index = excluded.list_index,
-                   description = coalesce(oracle_event_lists.description, excluded.description)"#,
+                   description =
+                       coalesce(nullif(excluded.description, ''), oracle_event_lists.description)"#,
     )
     .bind(&node.msg_id)
     .bind(oracle_id)

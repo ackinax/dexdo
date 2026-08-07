@@ -5,7 +5,6 @@ use ackinacki_kit::contracts::account::Account;
 use ackinacki_kit::contracts::deserialize::deserialize_u128;
 use ackinacki_kit::contracts::deserialize::deserialize_u128_map;
 use ackinacki_kit::contracts::deserialize::deserialize_u32;
-use ackinacki_kit::contracts::deserialize::deserialize_u64;
 use ackinacki_kit::contracts::error::KitModule;
 use ackinacki_kit::contracts::traits::AccountAccessor;
 use ackinacki_kit::contracts::traits::AutoContract;
@@ -430,17 +429,6 @@ pub struct ParamsOfOnBatchComplete {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-/// Parameters for the stream-lock callbacks `streamLock`, `streamUnlock`,
-/// `streamDisputeLock`, `streamDisputeUnlock`.
-///
-/// `deal` is the streaming-deal (TokenContract) address; the contract requires
-/// `msg.sender == deal`, so these are normally only invoked by the deal itself.
-pub struct ParamsOfStreamLock {
-    pub deal: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 /// Parameters for `PrivateNote.getInferenceOrderBookAddress`.
 ///
 /// Keyed only by `model_hash`: the canonical `InferenceOrderBook` code is
@@ -468,18 +456,47 @@ pub struct ParamsOfDeployInferenceOrderBook {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 /// Parameters for `PrivateNote.postSellOffer`.
+///
+/// The note no longer carries the offer terms: it derives the canonical
+/// `TokenContract` from `(ephemeralPubkey, nonce)` and calls `postFromNote` on
+/// it, and the TC posts to the book using its own constructor-pinned
+/// `pricePerTick` / `maxTicks` / `modelHash`. To change the terms, deploy a TC
+/// with different ones — they cannot be overridden per offer.
 pub struct ParamsOfPostSellOffer {
-    /// `uint256` model hash, decimal/hex string — identifies the book.
-    pub model_hash: String,
-    pub price_per_tick: u128,
-    pub max_ticks: u128,
-    pub token_contract: String,
+    /// Order flags (POST_ONLY / IOC / FOK / MARKET) forwarded to the book.
     pub flags: u8,
-    /// Deal nonce. The contract verifies `token_contract` is the canonical
-    /// TokenContract derived from the pinned code + the seller note's key and
-    /// this nonce (else the offer reverts with `ERR_BAD_TOKEN_CONTRACT`); it
-    /// must match the nonce the `token_contract` address was computed from.
+    /// Deal nonce the `TokenContract` address is derived from.
     pub nonce: u64,
+    /// Offer lifetime in seconds, turned into an absolute deadline by the note.
+    ///
+    /// Mandatory and bounded: `ttl == 0` or `ttl > MAX_SELL_TTL` (3600 s) reverts
+    /// with `ERR_SELL_DEADLINE_TOO_LONG`. `0` is NOT good-till-cancel here — a
+    /// SELL offer has no such value, unlike the BUY deadline it looks like.
+    pub ttl: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for `PrivateNote.fundDeployShell`.
+///
+/// Pre-funds the seller's cross-dApp deploy target so no external operational
+/// wallet is needed. The target is DERIVED from this note's own key plus
+/// `nonce` — the call takes no address, so SHELL sent this way can only ever
+/// reach the note's own canonical `TokenContract`.
+///
+/// ONE LEG, NOT TWO. A `rootModelShell` leg used to sit beside `tcShell`,
+/// because a RootModel was deployed by its owner as an external message and
+/// something had to put native gas at that address first. The super root
+/// deploys it now with an internal `new`, which carries its own value, so there
+/// is nothing left to pre-fund and the parameter is gone from the ABI. A caller
+/// that still wants a RootModel on chain calls `SuperRoot::deploy_root_model`,
+/// not this.
+pub struct ParamsOfFundDeployShell {
+    /// Deal nonce the `TokenContract` address is derived from.
+    pub nonce: u64,
+    /// SHELL for the canonical `TokenContract` of `(this note's key, nonce)`.
+    /// `0` skips it.
+    pub tc_shell: u128,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -489,23 +506,16 @@ pub struct ParamsOfPlaceInferenceBuy {
     /// `uint256` model hash, decimal/hex string — identifies the book.
     pub model_hash: String,
     pub max_price_per_tick: u128,
+    /// Must be `>= 2`: a deal serves a probe tick plus at least one stream tick,
+    /// so the book rejects a 1-tick buy outright and never rests a sub-2
+    /// remainder.
     pub ticks: u128,
+    /// Must cover `ticks * (max_price_per_tick + 2.5% fee)` for a limit buy, or
+    /// the book rejects the placement and bounces the escrow back.
     pub escrow: u128,
     pub flags: u8,
     /// Time-in-force deadline (`0` = good-till-cancel).
     pub deadline: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-/// Parameters for `PrivateNote.placeInferenceSubscription`.
-pub struct ParamsOfPlaceInferenceSubscription {
-    /// `uint256` model hash, decimal/hex string — identifies the book.
-    pub model_hash: String,
-    pub max_price_per_tick: u128,
-    pub ticks: u128,
-    pub escrow: u128,
-    pub auto_renew: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -527,21 +537,11 @@ pub struct ParamsOfCancelAllInferenceOrders {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-/// Parameters for the streaming-deal driver methods `streamStop` and
-/// `streamDispute` (buyer note → deal `TokenContract`).
+/// Parameters for the streaming-deal driver methods `streamStop`,
+/// `streamDispute`, `streamReclaim` and `streamCleanup` (buyer note → deal
+/// `TokenContract`).
 pub struct ParamsOfStreamDeal {
     pub token_contract: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-/// Result of `PrivateNote.getStreamLocks`.
-pub struct ResultOfGetStreamLocks {
-    #[serde(rename = "streamCount", deserialize_with = "deserialize_u32")]
-    pub stream_count: u32,
-    #[serde(rename = "disputeCount", deserialize_with = "deserialize_u32")]
-    pub dispute_count: u32,
-    #[serde(rename = "lastChange", deserialize_with = "deserialize_u64")]
-    pub last_change: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -983,15 +983,6 @@ impl PrivateNote {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Clear busy transfer state
-    ///
-    /// Original contract method: `clearTransferBusy`
-    pub async fn clear_transfer_busy(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set =
-            CallSet { function_name: "clearTransferBusy".to_string(), header: None, input: None };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     /// # Discard unused coupon
     ///
     /// Original contract method: `discardCoupon`
@@ -1184,85 +1175,6 @@ impl PrivateNote {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    // ─── Inference market: stream locks (spec §4.3) ───────────────────
-    // Stream/dispute locks are set by a streaming-deal (TokenContract); while
-    // any lock is held the note cannot withdraw / split / merge. The contract
-    // gates these on `msg.sender == deal`, so they are normally only invoked by
-    // the deal — exposed here for admin tools and tests.
-
-    /// Original contract method: `streamLock` (callback from a streaming deal).
-    pub async fn stream_lock(
-        &self,
-        params: ParamsOfStreamLock,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "streamLock".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// Original contract method: `streamUnlock` (callback from a streaming deal).
-    pub async fn stream_unlock(
-        &self,
-        params: ParamsOfStreamLock,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "streamUnlock".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// Original contract method: `streamDisputeLock` (callback from a streaming
-    /// deal).
-    pub async fn stream_dispute_lock(
-        &self,
-        params: ParamsOfStreamLock,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "streamDisputeLock".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// Original contract method: `streamDisputeUnlock` (callback from a
-    /// streaming deal).
-    pub async fn stream_dispute_unlock(
-        &self,
-        params: ParamsOfStreamLock,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "streamDisputeUnlock".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// # Owner escape hatch: clear stale stream/dispute locks
-    ///
-    /// Original contract method: `forceClearStreamLocks`
-    ///
-    /// Should be signed with PrivateNote owner keys. Only succeeds once the
-    /// locks have been stale longer than the contract's `STREAM_LOCK_MAX`.
-    pub async fn force_clear_stream_locks(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "forceClearStreamLocks".to_string(),
-            header: None,
-            input: None,
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     // ─── Inference market: order book + streaming deals (spec §2-§8) ──
     // Inference settles in SHELL held physically by the note, so the note
     // itself is the market participant. All of these are owner-signed.
@@ -1290,6 +1202,10 @@ impl PrivateNote {
     ///
     /// Original contract method: `postSellOffer`
     ///
+    /// Indirect: the note authorises its canonical `TokenContract` for `nonce`
+    /// (`postFromNote`) and that TC posts the offer on the book with its own
+    /// pinned terms. The TC must already be deployed, or the call is a no-op.
+    ///
     /// Should be signed with PrivateNote owner keys.
     pub async fn post_sell_offer(
         &self,
@@ -1316,24 +1232,6 @@ impl PrivateNote {
     ) -> KitResult<ResultOfSendMessage> {
         let call_set = CallSet {
             function_name: "placeInferenceBuy".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// # Place a subscription (semantic order)
-    ///
-    /// Original contract method: `placeInferenceSubscription`
-    ///
-    /// Should be signed with PrivateNote owner keys.
-    pub async fn place_inference_subscription(
-        &self,
-        params: ParamsOfPlaceInferenceSubscription,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "placeInferenceSubscription".to_string(),
             header: None,
             input: Some(json!(params)),
         };
@@ -1412,18 +1310,47 @@ impl PrivateNote {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Buyer note reclaims a probe tick after the stream timeout (no-show)
+    /// # Buyer note recovers a funded deal the seller never opened
     ///
-    /// Original contract method: `streamReclaim`
+    /// Original contract method: `streamCleanup`
+    ///
+    /// Distinct from [`Self::stream_reclaim`], which exits a deal that WAS
+    /// opened and then abandoned. This one is scoped to the never-opened case
+    /// by a permanent latch on the deal: it refunds the whole deposit, returns
+    /// the seller's bond unslashed (nothing was delivered, so no fee and no
+    /// penalty) and destroys the deal contract.
     ///
     /// Should be signed with PrivateNote owner keys.
-    pub async fn stream_reclaim(
+    pub async fn stream_cleanup(
         &self,
         params: ParamsOfStreamDeal,
         signer: Signer,
     ) -> KitResult<ResultOfSendMessage> {
         let call_set = CallSet {
-            function_name: "streamReclaim".to_string(),
+            function_name: "streamCleanup".to_string(),
+            header: None,
+            input: Some(json!(params)),
+        };
+        self.send_message(Some(call_set), None, signer).await
+    }
+
+    /// # Pre-fund the note's own cross-dApp deploy target with SHELL
+    ///
+    /// Original contract method: `fundDeployShell`
+    ///
+    /// The deploy of a deal `TokenContract` is a cross-dApp message, which only
+    /// activates if the target address already holds SHELL. This ships it there
+    /// from the note itself, so a seller needs no external operational wallet
+    /// to get a deal contract on chain.
+    ///
+    /// Should be signed with PrivateNote owner keys.
+    pub async fn fund_deploy_shell(
+        &self,
+        params: ParamsOfFundDeployShell,
+        signer: Signer,
+    ) -> KitResult<ResultOfSendMessage> {
+        let call_set = CallSet {
+            function_name: "fundDeployShell".to_string(),
             header: None,
             input: Some(json!(params)),
         };
@@ -1478,13 +1405,6 @@ impl PrivateNote {
     ) -> KitResult<ResultOfGetPendingPlaceBuyTokenType> {
         self.call_get_method::<ResultOfGetPendingPlaceBuyTokenType>("_pendingPlaceBuyTokenType")
             .await
-    }
-
-    /// # Get inference-market stream/dispute lock state
-    ///
-    /// Original contract method: `getStreamLocks`
-    pub async fn get_stream_locks(&self) -> KitResult<ResultOfGetStreamLocks> {
-        self.call_get_method::<ResultOfGetStreamLocks>("getStreamLocks").await
     }
 
     /// # Get deterministic InferenceOrderBook address for a model
@@ -1554,14 +1474,7 @@ mod inference_abi_tests {
             abi_input_names("getInferenceOrderBookAddress")
         );
         assert_eq!(
-            keys(&ParamsOfPostSellOffer {
-                model_hash: "1".into(),
-                price_per_tick: 1,
-                max_ticks: 1,
-                token_contract: "0:1".into(),
-                flags: 0,
-                nonce: 0,
-            }),
+            keys(&ParamsOfPostSellOffer { flags: 0, nonce: 0, ttl: 1 }),
             abi_input_names("postSellOffer")
         );
         assert_eq!(
@@ -1576,22 +1489,16 @@ mod inference_abi_tests {
             abi_input_names("placeInferenceBuy")
         );
         assert_eq!(
-            keys(&ParamsOfPlaceInferenceSubscription {
-                model_hash: "1".into(),
-                max_price_per_tick: 1,
-                ticks: 1,
-                escrow: 1,
-                auto_renew: true,
-            }),
-            abi_input_names("placeInferenceSubscription")
-        );
-        assert_eq!(
             keys(&ParamsOfCancelInferenceOrder { model_hash: "1".into(), order_id: 1 }),
             abi_input_names("cancelInferenceOrder")
         );
         assert_eq!(
             keys(&ParamsOfCancelAllInferenceOrders { model_hash: "1".into() }),
             abi_input_names("cancelAllInferenceOrders")
+        );
+        assert_eq!(
+            keys(&ParamsOfFundDeployShell { nonce: 1, tc_shell: 1 }),
+            abi_input_names("fundDeployShell")
         );
     }
 
@@ -1603,8 +1510,33 @@ mod inference_abi_tests {
         );
         assert_eq!(
             keys(&ParamsOfStreamDeal { token_contract: "0:1".into() }),
-            abi_input_names("streamReclaim")
+            abi_input_names("streamCleanup")
         );
-        assert_eq!(keys(&ParamsOfStreamLock { deal: "0:1".into() }), abi_input_names("streamLock"));
+        assert_eq!(
+            keys(&ParamsOfStreamDeal { token_contract: "0:1".into() }),
+            abi_input_names("streamDispute")
+        );
+        // The four note-side stream/dispute lock callbacks are gone: the seller's
+        // per-deal mirror bond in TokenContract is the only collateral, so the
+        // note is never locked by a deal. Pin their absence so a reintroduction
+        // has to come with wrappers rather than silently going unsupported.
+        let names: BTreeSet<String> = {
+            let v: serde_json::Value = serde_json::from_str(ABI).expect("parse PrivateNote ABI");
+            v["functions"]
+                .as_array()
+                .expect("functions array")
+                .iter()
+                .map(|f| f["name"].as_str().expect("function name").to_string())
+                .collect()
+        };
+        for func in [
+            "streamLock",
+            "streamUnlock",
+            "streamDisputeLock",
+            "streamDisputeUnlock",
+            "getStreamLocks",
+        ] {
+            assert!(!names.contains(func), "{func} is back in the ABI but has no wrapper");
+        }
     }
 }

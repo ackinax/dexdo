@@ -72,20 +72,17 @@ impl AsyncGuardedMut<Account> for TokenContract {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-/// Parameters for `TokenContract.fund`.
-pub struct ParamsOfFund {
-    /// `uint256`, decimal or hex string.
-    pub buyer_pubkey: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 /// Parameters for `TokenContract.fundFromOrderBook` (callback from the order
 /// book on a match; sender must be the order book).
 pub struct ParamsOfFundFromOrderBook {
+    /// SHELL the match actually moved into the deal.
+    pub paid: u128,
     pub buyer_note: String,
     /// `uint256`, decimal or hex string.
     pub buyer_pubkey: String,
+    /// Shape of the matched order, carried over from the taker's flags — this is
+    /// how a deal learns it is a subscription rather than a one-off.
+    pub deal_flags: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,17 +99,21 @@ pub struct ParamsOfOpen {
 /// Parameters for `TokenContract.withdrawShell`.
 pub struct ParamsOfWithdrawShell {
     pub amount: u128,
-    pub recipient: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-/// Parameters for `TokenContract.destroy`.
-pub struct ParamsOfDestroy {
-    pub payout_address: String,
 }
 
 // ─── Result structs ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// Result of `TokenContract.getOffer`.
+///
+/// The whole sell-offer chain (note → `postFromNote` → book) is `bounce:false`,
+/// so this latch is the only readable evidence of where an offer got to:
+/// `offer_posted` is set the moment the TC forwards to the book and cleared
+/// again by `onSellClosed` when the book refuses to rest it.
+pub struct ResultOfGetOffer {
+    pub offer_posted: bool,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,29 +125,43 @@ pub struct ResultOfGetState {
     pub disputed: bool,
     #[serde(deserialize_with = "deserialize_u128")]
     pub deposit: u128,
+    /// Ticks frozen at probe acceptance, the reference the deal is priced from.
     #[serde(deserialize_with = "deserialize_u128")]
-    pub prepaid: u128,
-    #[serde(deserialize_with = "deserialize_u128")]
-    pub frozen: u128,
+    pub probe_tick: u128,
     #[serde(deserialize_with = "deserialize_u128")]
     pub finalized_owed: u128,
+    /// Cumulative tokens the deal has actually credited — the `trusted` figure
+    /// carried by `TicksClaimed`.
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub tokens_final: u128,
+    /// Claimed but not yet trusted — the `claimed` figure on `TicksClaimed`.
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub tokens_pending: u128,
     #[serde(deserialize_with = "deserialize_u64")]
-    pub prepaid_time: u64,
+    pub probe_time: u64,
+    /// Claims are rate-limited: `MIN_CLAIM_INTERVAL` (60 s) must elapse since
+    /// this, or `claimTokens` reverts with `ERR_SETTLE_WINDOW_OPEN`.
     #[serde(deserialize_with = "deserialize_u64")]
-    pub last_advance: u64,
+    pub last_claim_time: u64,
     #[serde(deserialize_with = "deserialize_u64")]
     pub dispute_time: u64,
+    /// When the order-book match handed this deal its escrow. The no-show
+    /// cleanup window (`MATCH_OPEN_TIMEOUT`) is measured from here, so a
+    /// caller can tell how long it still has to wait rather than guess.
+    #[serde(deserialize_with = "deserialize_u64")]
+    pub funded_time: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-/// Result of `TokenContract.getProbe`.
-pub struct ResultOfGetProbe {
-    pub probe_funded: bool,
+/// Result of `TokenContract.getSellerBond` — the seller's mirror bond, the only
+/// seller collateral held against the deal (spec §4.2).
+pub struct ResultOfGetSellerBond {
+    pub bond_funded: bool,
     #[serde(deserialize_with = "deserialize_u128")]
-    pub probe_locked: u128,
+    pub bond_held: u128,
     #[serde(deserialize_with = "deserialize_u128")]
-    pub probe_commission: u128,
+    pub bond_required: u128,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,10 +170,12 @@ pub struct ResultOfGetProbe {
 pub struct ResultOfGetConfig {
     #[serde(deserialize_with = "deserialize_u16")]
     pub platform_fee_bps: u16,
+    /// Minimum gap between two `claimTokens` calls, seconds. A claim inside it
+    /// reverts with `ERR_SETTLE_WINDOW_OPEN`.
     #[serde(deserialize_with = "deserialize_u64")]
-    pub settle_window: u64,
+    pub min_claim_interval: u64,
     #[serde(deserialize_with = "deserialize_u64")]
-    pub stream_timeout: u64,
+    pub min_seconds_per_tick: u64,
     #[serde(deserialize_with = "deserialize_u64")]
     pub dispute_window: u64,
 }
@@ -259,19 +276,6 @@ impl TokenContract {
 
     // ─── Funding ──────────────────────────────────────────────────────
 
-    /// # Direct fund (buyer pays the deposit straight to the deal)
-    ///
-    /// Original contract method: `fund`
-    pub async fn fund(
-        &self,
-        params: ParamsOfFund,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set =
-            CallSet { function_name: "fund".to_string(), header: None, input: Some(json!(params)) };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     /// # Fund from a matched order book buy (sender must be the order book)
     ///
     /// Original contract method: `fundFromOrderBook`
@@ -288,15 +292,6 @@ impl TokenContract {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Seller posts the probe commission (ECC[2] SHELL)
-    ///
-    /// Original contract method: `fundProbeCommission`
-    pub async fn fund_probe_commission(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set =
-            CallSet { function_name: "fundProbeCommission".to_string(), header: None, input: None };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     // ─── Streaming lifecycle ──────────────────────────────────────────
 
     /// # Seller opens the stream (freezes the probe tick, spec §3.1.2)
@@ -309,14 +304,6 @@ impl TokenContract {
     ) -> KitResult<ResultOfSendMessage> {
         let call_set =
             CallSet { function_name: "open".to_string(), header: None, input: Some(json!(params)) };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
-    /// # Seller advances one tick (optimistic-accept after settle window)
-    ///
-    /// Original contract method: `advance`
-    pub async fn advance(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet { function_name: "advance".to_string(), header: None, input: None };
         self.send_message(Some(call_set), None, signer).await
     }
 
@@ -357,15 +344,6 @@ impl TokenContract {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Buyer reclaims on seller no-show after the stream timeout
-    ///
-    /// Original contract method: `reclaimOnTimeout`
-    pub async fn reclaim_on_timeout(&self, signer: Signer) -> KitResult<ResultOfSendMessage> {
-        let call_set =
-            CallSet { function_name: "reclaimOnTimeout".to_string(), header: None, input: None };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     /// # Recover funds from a funded-but-unopened deal (seller no-show, §2.1)
     ///
     /// Original contract method: `cleanupUnopened`
@@ -391,22 +369,6 @@ impl TokenContract {
         self.send_message(Some(call_set), None, signer).await
     }
 
-    /// # Destroy a settled deal, sweeping any residue to `payoutAddress`
-    ///
-    /// Original contract method: `destroy`
-    pub async fn destroy(
-        &self,
-        params: ParamsOfDestroy,
-        signer: Signer,
-    ) -> KitResult<ResultOfSendMessage> {
-        let call_set = CallSet {
-            function_name: "destroy".to_string(),
-            header: None,
-            input: Some(json!(params)),
-        };
-        self.send_message(Some(call_set), None, signer).await
-    }
-
     // ─── Getters ──────────────────────────────────────────────────────
 
     /// Original contract method: `getState`.
@@ -414,9 +376,14 @@ impl TokenContract {
         self.call_get_method::<ResultOfGetState>("getState").await
     }
 
-    /// Original contract method: `getProbe`.
-    pub async fn get_probe(&self) -> KitResult<ResultOfGetProbe> {
-        self.call_get_method::<ResultOfGetProbe>("getProbe").await
+    /// Original contract method: `getSellerBond`.
+    pub async fn get_seller_bond(&self) -> KitResult<ResultOfGetSellerBond> {
+        self.call_get_method::<ResultOfGetSellerBond>("getSellerBond").await
+    }
+
+    /// Original contract method: `getOffer`.
+    pub async fn get_offer(&self) -> KitResult<ResultOfGetOffer> {
+        self.call_get_method::<ResultOfGetOffer>("getOffer").await
     }
 
     /// Original contract method: `getConfig`.

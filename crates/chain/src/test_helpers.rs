@@ -10,6 +10,7 @@
 // The prod api/infrastructure build leaves `test-helpers` off so
 // `Dex` exposes only the trader-path methods in `client.rs`.
 
+use ackinacki_kit::contracts::traits::AccountAccessor;
 use ackinacki_kit::tvm_client::abi::Signer;
 use ackinacki_kit::tvm_client::processing::ResultOfSendMessage;
 use dodex_contracts::airegistry::inference_order_book::InferenceOrderBook;
@@ -18,11 +19,13 @@ use dodex_contracts::airegistry::inference_order_book::ParamsOfOrderId as IobPar
 use dodex_contracts::airegistry::inference_order_book::ResultOfGetBestBidAsk;
 use dodex_contracts::airegistry::inference_order_book::ResultOfGetOrder as IobOrder;
 use dodex_contracts::airegistry::inference_order_book::ResultOfGetStats as IobStats;
-use dodex_contracts::airegistry::inference_order_book::ResultOfGetSubscription as IobSubscription;
 use dodex_contracts::airegistry::token_contract::ParamsOfOpen;
 use dodex_contracts::airegistry::token_contract::ParamsOfWithdrawShell;
+use dodex_contracts::airegistry::token_contract::ResultOfGetConfig as TcConfig;
+use dodex_contracts::airegistry::token_contract::ResultOfGetFees as TcFees;
+use dodex_contracts::airegistry::token_contract::ResultOfGetOffer as TcOffer;
 use dodex_contracts::airegistry::token_contract::ResultOfGetParties as TcParties;
-use dodex_contracts::airegistry::token_contract::ResultOfGetProbe as TcProbe;
+use dodex_contracts::airegistry::token_contract::ResultOfGetSellerBond as TcSellerBond;
 use dodex_contracts::airegistry::token_contract::ResultOfGetState as TcState;
 use dodex_contracts::airegistry::token_contract::TokenContract;
 use dodex_contracts::dex::oracle::Oracle;
@@ -38,9 +41,9 @@ use dodex_contracts::dex::private_note::ParamsOfCancelAllInferenceOrders;
 use dodex_contracts::dex::private_note::ParamsOfCancelInferenceOrder;
 use dodex_contracts::dex::private_note::ParamsOfDeployInferenceOrderBook;
 use dodex_contracts::dex::private_note::ParamsOfDeployPmp;
+use dodex_contracts::dex::private_note::ParamsOfFundDeployShell;
 use dodex_contracts::dex::private_note::ParamsOfInferenceOrderBook;
 use dodex_contracts::dex::private_note::ParamsOfPlaceInferenceBuy;
-use dodex_contracts::dex::private_note::ParamsOfPlaceInferenceSubscription;
 use dodex_contracts::dex::private_note::ParamsOfPostSellOffer;
 use dodex_contracts::dex::private_note::ParamsOfSetStake;
 use dodex_contracts::dex::private_note::ParamsOfStreamDeal;
@@ -58,6 +61,10 @@ use super::dapp::dex_contract_params;
 use super::dapp::self_rooted_contract_params;
 use super::error::ChainResult;
 
+/// ECC currency carrying SHELL, matching `CURRENCIES_ID_SHELL` in
+/// `contracts/dex/modifiers/modifiers.sol`.
+const SHELL_ECC_ID: u32 = 2;
+
 /// Shape returned by `Pmp.getDetails`. Aliased so call sites don't
 /// have to reach for the kit's three-deep contract path.
 pub type PmpDetails = PmpKitDetails;
@@ -65,6 +72,44 @@ pub type PmpDetails = PmpKitDetails;
 /// Shape returned by `OracleEventList.getEvents`. `.events` is a
 /// `HashMap<String, serde_json::Value>` keyed by event id.
 pub type OracleEvents = ResultOfGetEvents;
+
+/// Account-level state of an `InferenceOrderBook`, independent of whether its
+/// getters run. Returned by `Dex::inference_book_account`.
+#[derive(Debug, Clone)]
+pub struct IobAccount {
+    /// `AccountStatus` rendered for a message: `Active`, `Uninit`, `Frozen`,
+    /// `NonExist`.
+    pub acc_type: String,
+    /// Hash of the account's code cell. `None` before the account holds state.
+    pub code_hash: Option<String>,
+    /// Native balance in nanovmshell.
+    pub balance: Option<String>,
+}
+
+/// What an address holds, whether or not anything was ever deployed to it.
+///
+/// A cross-dApp deploy target is funded BEFORE its code arrives, so the only
+/// thing that separates "pre-funded and waiting" from "nothing happened" is
+/// these fields — a getter cannot be called on either.
+///
+/// Both balances are here because SHELL arrives in two different places
+/// depending on how it was sent. An ordinary ECC transfer (`flag: 1`) lands in
+/// `shell`; a `flag: 16` send — the one a cross-dApp deploy target needs, and
+/// the only one that leaves it able to activate — converts it into `native`
+/// instead and leaves `shell` at zero. Reading one and not the other reads a
+/// successful funding as nothing having happened.
+#[derive(Debug, Clone)]
+pub struct AccountShell {
+    /// `AccountStatus` rendered for a message: `Active`, `Uninit`, `Frozen`,
+    /// `NonExist`.
+    pub acc_type: String,
+    /// Physical ECC SHELL (currency 2) sitting on the account. This is the
+    /// chain's own ledger, not a contract field — distinct from a note's
+    /// internal `_balance`, which only tracks what the note minted for itself.
+    pub shell: u128,
+    /// Native balance, in nanovmshell. Where a `flag: 16` credit ends up.
+    pub native: u128,
+}
 
 impl Dex {
     // ── PrivateNote (deployer-side) ──────────────────────────────────
@@ -315,18 +360,6 @@ impl Dex {
             .map_err(Into::into)
     }
 
-    pub async fn place_inference_subscription(
-        &self,
-        pn_address: &str,
-        params: ParamsOfPlaceInferenceSubscription,
-        signer: Signer,
-    ) -> ChainResult<ResultOfSendMessage> {
-        PrivateNote::new(self.ctx.clone(), dex_contract_params(pn_address))
-            .place_inference_subscription(params, signer)
-            .await
-            .map_err(Into::into)
-    }
-
     /// Buyer note stops the stream cleanly (`PrivateNote.streamStop`).
     pub async fn stream_stop(
         &self,
@@ -353,16 +386,30 @@ impl Dex {
             .map_err(Into::into)
     }
 
-    /// Buyer note reclaims a probe tick on seller no-show
-    /// (`PrivateNote.streamReclaim`).
-    pub async fn stream_reclaim(
+    /// Buyer note recovers a deal the seller funded but never opened
+    /// (`PrivateNote.streamCleanup`).
+    pub async fn stream_cleanup(
         &self,
         pn_address: &str,
         params: ParamsOfStreamDeal,
         signer: Signer,
     ) -> ChainResult<ResultOfSendMessage> {
         PrivateNote::new(self.ctx.clone(), dex_contract_params(pn_address))
-            .stream_reclaim(params, signer)
+            .stream_cleanup(params, signer)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Note pre-funds its own cross-dApp deploy targets with SHELL
+    /// (`PrivateNote.fundDeployShell`).
+    pub async fn fund_deploy_shell(
+        &self,
+        pn_address: &str,
+        params: ParamsOfFundDeployShell,
+        signer: Signer,
+    ) -> ChainResult<ResultOfSendMessage> {
+        PrivateNote::new(self.ctx.clone(), dex_contract_params(pn_address))
+            .fund_deploy_shell(params, signer)
             .await
             .map_err(Into::into)
     }
@@ -387,6 +434,24 @@ impl Dex {
             .map_err(Into::into)
     }
 
+    /// Raw account state of a book, for telling apart the ways a book can fail
+    /// to answer its getters. `getStats` reports the same "cannot run" error
+    /// whether the account is missing, uninitialised, or carries a code cell
+    /// that has no runnable code — only the account itself separates them.
+    pub async fn inference_book_account(
+        &self,
+        order_book_address: &str,
+    ) -> ChainResult<IobAccount> {
+        let ob = InferenceOrderBook::new(self.ctx.clone(), dex_contract_params(order_book_address));
+        ob.fetch_account().await?;
+        let account = ob.account().lock().await;
+        Ok(IobAccount {
+            acc_type: format!("{:?}", account.acc_type),
+            code_hash: account.code_hash.clone(),
+            balance: account.balance.as_ref().map(ToString::to_string),
+        })
+    }
+
     pub async fn inference_get_queue_size(&self, order_book_address: &str) -> ChainResult<u8> {
         InferenceOrderBook::new(self.ctx.clone(), dex_contract_params(order_book_address))
             .get_queue_size()
@@ -405,13 +470,20 @@ impl Dex {
             .map_err(Into::into)
     }
 
-    pub async fn inference_get_subscription(
+    /// Drop a resting order whose deadline has passed
+    /// (`InferenceOrderBook.expireOrder`).
+    ///
+    /// Permissionless by design — the book checks that the id names an expired
+    /// order and nothing about who is asking — so this takes no signer and sends
+    /// the external message unsigned, which is the weakest caller the contract
+    /// can be asked to accept.
+    pub async fn inference_expire_order(
         &self,
         order_book_address: &str,
         order_id: u128,
-    ) -> ChainResult<IobSubscription> {
+    ) -> ChainResult<ResultOfSendMessage> {
         InferenceOrderBook::new(self.ctx.clone(), dex_contract_params(order_book_address))
-            .get_subscription(IobParamsOfOrderId { order_id })
+            .expire_order(IobParamsOfOrderId { order_id }, Signer::None)
             .await
             .map_err(Into::into)
     }
@@ -439,30 +511,6 @@ impl Dex {
     ) -> ChainResult<ResultOfSendMessage> {
         TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
             .open(params, signer)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Seller advances one tick (`TokenContract.advance`).
-    pub async fn token_contract_advance(
-        &self,
-        token_contract_address: &str,
-        signer: Signer,
-    ) -> ChainResult<ResultOfSendMessage> {
-        TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
-            .advance(signer)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Seller posts the probe commission (`TokenContract.fundProbeCommission`).
-    pub async fn token_contract_fund_probe_commission(
-        &self,
-        token_contract_address: &str,
-        signer: Signer,
-    ) -> ChainResult<ResultOfSendMessage> {
-        TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
-            .fund_probe_commission(signer)
             .await
             .map_err(Into::into)
     }
@@ -503,12 +551,35 @@ impl Dex {
             .map_err(Into::into)
     }
 
-    pub async fn token_contract_get_probe(
+    pub async fn token_contract_get_seller_bond(
         &self,
         token_contract_address: &str,
-    ) -> ChainResult<TcProbe> {
+    ) -> ChainResult<TcSellerBond> {
         TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
-            .get_probe()
+            .get_seller_bond()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// `ticksFinalized` here is the only bond-free measure of "did the seller get
+    /// paid for a tick": `finalizedOwed` also carries the returned seller bond and
+    /// the close rebate, both of which dwarf a single tick.
+    pub async fn token_contract_get_fees(
+        &self,
+        token_contract_address: &str,
+    ) -> ChainResult<TcFees> {
+        TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
+            .get_fees()
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn token_contract_get_offer(
+        &self,
+        token_contract_address: &str,
+    ) -> ChainResult<TcOffer> {
+        TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
+            .get_offer()
             .await
             .map_err(Into::into)
     }
@@ -532,5 +603,58 @@ impl Dex {
             .await
             .map(|r| r.value)
             .map_err(Into::into)
+    }
+
+    /// The per-deal windows the `TokenContract` computed for itself from its
+    /// tick price. `settle_window` and `stream_timeout` are NOT constants —
+    /// they scale with the price — so a test that has to outwait one must read
+    /// it here rather than hardcode the value its own price happens to give.
+    pub async fn token_contract_get_config(
+        &self,
+        token_contract_address: &str,
+    ) -> ChainResult<TcConfig> {
+        TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
+            .get_config()
+            .await
+            .map_err(Into::into)
+    }
+
+    // ── Raw account reads ─────────────────────────────────────────────
+
+    /// Physical SHELL on a contract that is the root of its own dApp — the
+    /// airegistry ones — reachable before any code lands there.
+    pub async fn self_rooted_account_shell(&self, address: &str) -> ChainResult<AccountShell> {
+        self.read_account_shell(self_rooted_contract_params(address)).await
+    }
+
+    /// Physical SHELL on a DEX-dApp account, a note above all. Distinct from
+    /// `getDetails().balance`, which is the note's own ledger of what it holds
+    /// for its owner and says nothing about the account's ECC.
+    pub async fn dex_account_shell(&self, address: &str) -> ChainResult<AccountShell> {
+        self.read_account_shell(dex_contract_params(address)).await
+    }
+
+    async fn read_account_shell(
+        &self,
+        params: ackinacki_kit::contracts::account::ParamsOfNewContract,
+    ) -> ChainResult<AccountShell> {
+        // Any contract handle reads the same account record; the ABI only
+        // matters once a method is called, and none is here.
+        let handle = TokenContract::new(self.ctx.clone(), params);
+        handle.fetch_account().await?;
+        let account = handle.account().lock().await;
+        Ok(AccountShell {
+            acc_type: format!("{:?}", account.acc_type),
+            shell: account
+                .ecc
+                .get(&SHELL_ECC_ID)
+                .and_then(|v| v.to_string().parse::<u128>().ok())
+                .unwrap_or(0),
+            native: account
+                .balance
+                .as_ref()
+                .and_then(|v| v.to_string().parse::<u128>().ok())
+                .unwrap_or(0),
+        })
     }
 }
