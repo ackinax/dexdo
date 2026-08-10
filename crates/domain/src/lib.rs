@@ -364,14 +364,17 @@ pub fn bps_to_decimal_string(bps: i32) -> String {
     }
 }
 
-/// One public trade: a maker↔taker match projected from an
-/// `OrderBook.OrderFilled` event, as served by `GET /api/v1/prediction/trades`.
-/// All money fields are pre-rendered decimal strings at API-render scale
-/// (`price` at `price_precision`, `qty` at `quantity_precision`, `quote_qty`
-/// at the quote asset's `decimals`); `time` is Unix milliseconds.
+/// One public trade: a maker↔taker match projected from an `OrderBook.OrderFilled`
+/// event (prediction) or an `InferenceOrderBook.InferenceFilled` event (inference), as
+/// served by `GET /api/v1/prediction/trades` and `GET /api/v1/inference/trades`. All
+/// money fields are pre-rendered decimal strings at API-render scale (`price` at
+/// `price_precision`, `qty` at `quantity_precision`, `quote_qty` at the quote asset's
+/// `decimals`); `time` is Unix milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trade {
-    /// Opaque, lex-comparable id for the match (the taker event's chain order).
+    /// Opaque, lex-comparable id for the match: the chain order of the event that
+    /// recorded it (the taker-side `OrderFilled` on prediction books, the single
+    /// `InferenceFilled` on inference books).
     pub trade_id: String,
     pub price: String,
     pub qty: String,
