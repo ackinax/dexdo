@@ -177,3 +177,44 @@ async fn the_run_converged_and_every_book_of_it_has_a_verdict() {
 
     print_diagnostics(&repo, since, started.elapsed()).await;
 }
+
+#[tokio::test]
+#[ignore = "e2e: reads the stand database at the tail of a run"]
+async fn at_least_one_visible_book_carries_an_order_and_events_from_this_run() {
+    let Some(repo) = observer_repo().await else { return };
+    let since = run_window();
+    let limit = deadline();
+
+    // Опрос по той же причине, что и у диагностики: книга последнего сценария
+    // становится видимой только после цикла реконсайлера, и срез поймал бы её
+    // в законном `discovering`.
+    let started = Instant::now();
+    loop {
+        let anchored =
+            repo.inference_anchored_books_since(since).await.expect("observer: anchor query failed");
+        if !anchored.is_empty() {
+            eprintln!("observer: якорь — {} видимых книг с ордерами: {anchored:?}", anchored.len());
+            break;
+        }
+        if started.elapsed() >= limit {
+            // Печать здесь нужнее, чем в диагностике. Текст ассерта ниже
+            // покрывает ДВА разных диагноза: трафик до индексера не доехал
+            // вовсе (ошибка `dapp_id` или `dst`-фильтра — ровно та дыра, ради
+            // которой матрица разводит якорь с диагностикой) либо доехал, но
+            // видимым ничего не стало (встал реконсайлер). Различает их
+            // «книг в окне»: ноль против ненуля. Своей печати у соседнего теста
+            // при `--test-threads 1` может и не случиться — он мог упасть раньше.
+            print_diagnostics(&repo, since, started.elapsed()).await;
+            panic!(
+                "observer: за {}s не нашлось ни одной видимой книги со спроецированным \
+                 ордером и событиями этого прогона. Смотреть на «книг в окне» в строке \
+                 выше: ноль значит, что трафик до индексера не доехал; ненуль — что \
+                 доехал, но видимым ничего не стало. Диагностический шаг такой прогон \
+                 считает идеальным — пустая база проходит все его утверждения, — \
+                 поэтому якорь и существует отдельно",
+                limit.as_secs()
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
