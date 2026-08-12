@@ -87,9 +87,12 @@ pub async fn project_event(
         // insert; dodex-rewards reads the stake-forfeit payloads straight out of
         // `raw_events`, so granting that permission would cut it off from them.
         //
-        // The note-side inference mirrors follow `InferenceOrderPlacedConfirmed` /
-        // `InferenceFilledConfirmed`: the book is the authority on an order, the
-        // note's copy exists for its owner.
+        // Note-side inference mirrors: the book is the authority on an order, the
+        // note's copy exists for its owner. `InferenceOrderPlacedConfirmed` and
+        // `InferenceFilledConfirmed` were the STATED PRECEDENT for this whole list
+        // and were themselves missing from it — that is, they fell through to
+        // `_ => Unknown`, which marks the row processed on first sight and never
+        // retries it, so every one of them was lost for good.
         "PMP.StakeForfeited"
         | "PrivateNote.StakeForfeitConfirmed"
         | "PrivateNote.StakeDroppedLocally"
@@ -98,6 +101,8 @@ pub async fn project_event(
         | "PrivateNote.InferenceOrderRemoved"
         | "PrivateNote.InferenceOrderRejectedMirror"
         | "PrivateNote.InferenceDealClosed"
+        | "PrivateNote.InferenceOrderPlacedConfirmed"
+        | "PrivateNote.InferenceFilledConfirmed"
         | "RootPN.DealWriteOffReported"
         // ABI RootModel загружен ради разрешения коллизии `ContractDeployed` по `dst`
         // (см. decoder.rs), а не ради проекции — в read-модель ни одно его событие не

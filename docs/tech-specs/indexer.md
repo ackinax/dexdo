@@ -231,6 +231,24 @@ The projector never returns `Deferred`; the skeleton seed ensures the row always
 
 **Read-model contract intended for the forthcoming rewards service.** Given a deal's `TokenContract` address, a single query — `SELECT orderbook_address, seller_note, buyer_note, finalized_ticks, clean_settlement, settled_at_chain FROM inference_deals WHERE token_contract_address = $1` — resolves the originating order book, both parties, and the tick/settlement outcome without replaying raw events. `inference_ticks` provides per-tick granularity (one row per finalized tick) for tick-level scoring such as "Tick выдан / Tick потрачен".
 
+## Deliberately not projected
+
+These event types are decoded and routed, but write nothing to the read model. The
+distinction matters: an arm that returns `Applied` records a decision, while an
+unrouted type falls through to `Unknown`, which marks the `raw_events` row processed
+**on first sight and never retries it** — so adding a projector later needs an explicit
+backfill of everything already swallowed. Every type below therefore has an explicit
+arm, and this table is the record of why.
+
+| Event type | Why nothing is written |
+|---|---|
+| `PMP.StakeForfeited` | Payload is consumed straight from `raw_events` by dodex-rewards; a projection would duplicate it. Deliberately **not** added to `ignored_event_types` either — dropping it at ingest would cut that consumer off from the payload. |
+| `PrivateNote.StakeForfeitConfirmed` / `StakeDroppedLocally` / `DealCredited` / `BookCredited` | Note-side accounting mirrors. The note's own contract is the authority for its owner; nothing in the public read model depends on them. |
+| `PrivateNote.InferenceOrderPlacedConfirmed` / `InferenceFilledConfirmed` | Note-side mirrors of book events. The **book** is the authority on an order — `inference_orders` is built from `InferenceOrderBook.*` — and the note's copy exists for its owner. |
+| `PrivateNote.InferenceOrderRemoved` / `InferenceOrderRejectedMirror` / `InferenceDealClosed` | Same rule, for the removal / rejection / close mirrors. |
+| `RootPN.DealWriteOffReported` | Reporting event; no read-model column corresponds to it. |
+| `RootModel.ContractDeployed` / `TokenContractRegistered` | The `RootModel` ABI is loaded **only** to disambiguate the `ContractDeployed` id collision by `dst` (see [Ingestion](#ingestion-sequence-per-edge)); neither event feeds the read model. `ContractDeployed` in particular must write nothing: attributing it to a deal is exactly the bug the route fixes. |
+
 ## Reconciliation
 
 Three reconcilers (market, OracleEventList, inference) fill metadata that the event stream alone does not carry. All run on a fixed cadence (configured under `indexer:` in `config/indexer.<env>.yaml`) and share a failure-backoff pattern (`last_reconcile_failed_at`, `reconcile_attempts` on the parent row) so a permanently broken contract cannot starve the queue. The inference reconciler additionally exposes three cadence knobs (`inference_reference_price_refresh_ms`, `inference_sweep_interval_ms`, `inference_orphan_cutoff_ms`) beyond its base interval; see [Inference reconciler](#inference-reconciler) for the full table.
