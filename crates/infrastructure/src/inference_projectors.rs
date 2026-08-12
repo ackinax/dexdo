@@ -11,11 +11,16 @@ use sqlx::Transaction;
 use tracing::error;
 use tracing::warn;
 
+use dodex_contracts::airegistry::inference_order_book_events::FilledData;
+use dodex_contracts::airegistry::inference_order_book_events::InferenceOrderBookEvent;
+use dodex_contracts::airegistry::inference_order_book_events::OrderPlacedData;
+use dodex_contracts::airegistry::inference_order_book_events::RefundedData;
+
 use crate::decoder::DecodedEvent;
 use crate::graphql::EventNode;
 use crate::indexer_repo::parse_unix_seconds;
-use crate::projectors::field_str;
 use crate::projectors::node_chain_order;
+use crate::projectors::uint256_maybe_hex;
 use crate::projectors::uint_field_to_decimal;
 use crate::projectors::ProjectionOutcome;
 
@@ -50,23 +55,35 @@ pub async fn project_inference_event(
     // the live loop and the direct tests.
     let suffix =
         event.event_type.strip_prefix("InferenceOrderBook.").unwrap_or(event.event_type.as_str());
-    match suffix {
-        "InferenceOrderPlaced" => apply_inference_order_placed(tx, event, node).await,
-        "InferenceOrderCancelled" => apply_inference_order_cancelled(tx, event, node).await,
-        "InferenceOrderExpired" => apply_inference_order_expired(tx, event, node).await,
-        "InferenceFilled" => apply_inference_filled(tx, event, node).await,
+    // Маршрут по ВАРИАНТУ enum'а, а не по строковому литералу. Вариант пинится к
+    // ABI (`inference_order_book_enum_covers_every_abi_event`), поэтому арм,
+    // называющий несуществующее событие, перестаёт быть выразимым — так прожили
+    // мёртвыми `InferenceSubscriptionPlaced` и `StreamReclaimed`. `match`
+    // исчерпывающий БЕЗ `_`: новый вариант не соберётся, пока ему не назначат исход.
+    use InferenceOrderBookEvent as E;
+    let Some(kind) = E::ALL.iter().copied().find(|v| {
+        let n = format!("{v:?}");
+        let n = if n.starts_with("Inference") { n } else { format!("Inference{n}") };
+        n == suffix
+    }) else {
+        return Ok(ProjectionOutcome::Unknown);
+    };
+    match kind {
+        E::OrderPlaced => apply_inference_order_placed(tx, event, node).await,
+        E::OrderCancelled => apply_inference_order_cancelled(tx, event, node).await,
+        E::OrderExpired => apply_inference_order_expired(tx, event, node).await,
+        E::Filled => apply_inference_filled(tx, event, node).await,
         // Observability-only. `InferenceOrderCancelRejected` fires from `_doCancel`
         // when the cancel matched no resting order or came from a foreign owner —
         // by construction the book did not change, so there is no row to touch.
         // `InferenceOrderRejected` carries no `orderId` — the placement was refused
         // before anything rested, so there is no row to key on, same as
         // `InferenceOrderCancelRejected`.
-        "InferenceRefunded" => apply_inference_refunded(tx, event, node).await,
-        "InferenceExecuted"
-        | "InferenceOrderCancelRejected"
-        | "InferenceOrderRejected"
-        | "InferenceOrderBookDeployed" => Ok(ProjectionOutcome::Applied),
-        _ => Ok(ProjectionOutcome::Unknown),
+        E::Refunded => apply_inference_refunded(tx, event, node).await,
+        E::Executed
+        | E::OrderCancelRejected
+        | E::OrderRejected
+        | E::InferenceOrderBookDeployed => Ok(ProjectionOutcome::Applied),
     }
 }
 
@@ -166,36 +183,20 @@ async fn apply_inference_order_placed(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let ob = node.src.as_deref().context("OrderPlaced: src missing")?;
-    let order_id = uint_field_to_decimal(&event.value, "orderId")?;
-    let is_buy = event
-        .value
-        .get("isBuy")
-        .and_then(serde_json::Value::as_bool)
-        .context("OrderPlaced: missing isBuy")?;
-    let price = uint_field_to_decimal(&event.value, "price")?;
-    let ticks = uint_field_to_decimal(&event.value, "ticks")?;
-    // `note` is mandatory in the ABI and the endpoint filters exactly on it; a NULL
-    // would hide the order from every `note=X` listing forever, since the sweep
-    // repairs only `token_contract` and `deadline`.
-    let note = Some(field_str(&event.value, "note")?);
-    // `tokenContract` and `deadline` are mandatory in the ABI too — a BUY carries the
-    // zero address and a resting SELL carries deadline 0, but neither field is ever
-    // absent. Decode strictly and normalize only a successfully decoded zero to NULL:
-    // `.ok()` would map ABI/decoder drift onto a NULL insert and still create the row,
-    // and nothing would ever repair it once it fills or is cancelled before a sweep.
-    let token_contract: Option<&str> =
-        non_zero_address(Some(field_str(&event.value, "tokenContract")?));
-    let deadline: Option<String> =
-        non_zero_uint(Some(uint_field_to_decimal(&event.value, "deadline")?));
+    // Исчерпывающая деструктуризация: каждое поле ABI обязано быть названо.
+    let OrderPlacedData { order_id, is_buy, price, ticks, note, token_contract, deadline, flags } =
+        serde_json::from_value(event.value.clone())
+            .context("InferenceOrderPlaced: payload не разбирается по ABI")?;
+    let order_id = order_id.to_string();
+    // `price` — uint256, см. `FilledFields::parse`.
+    let price = uint256_maybe_hex(&price)?;
+    let ticks = ticks.to_string();
+    let note = Some(note.as_str());
+    let token_contract: Option<&str> = non_zero_address(Some(token_contract.as_str()));
+    let deadline: Option<String> = non_zero_uint(Some(deadline.to_string()));
     // `flags` — 8-й параметр события с v4.0.33. Подписка это бит FLAG_SUBSCRIPTION
-    // (0x40, contracts/airegistry/modifiers/modifiers.sol), а не отдельное событие:
-    // `InferenceSubscriptionPlaced` в ABI книги не существует и никогда не
-    // существовало — арм под него был мёртвым кодом и единственным писателем этой
-    // колонки, из-за чего в бою она всегда читалась `false`.
-    const FLAG_SUBSCRIPTION: u64 = 0x40;
-    let flags: u64 = uint_field_to_decimal(&event.value, "flags")?
-        .parse()
-        .context("OrderPlaced: flags не разбирается как целое")?;
+    // (0x40, contracts/airegistry/modifiers/modifiers.sol), а не отдельное событие.
+    const FLAG_SUBSCRIPTION: u8 = 0x40;
     let is_subscription = flags & FLAG_SUBSCRIPTION != 0;
     let chain_order = node_chain_order(node, "InferenceOrderPlaced")?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
@@ -249,34 +250,35 @@ struct FilledFields {
 
 impl FilledFields {
     fn parse(event: &DecodedEvent, node: &EventNode) -> anyhow::Result<Self> {
-        let ob = node.src.as_deref().context("Filled: src missing")?.to_string();
-        let maker_id = uint_field_to_decimal(&event.value, "makerId")?;
-        let taker_id = uint_field_to_decimal(&event.value, "takerId")?;
-        let ticks = uint_field_to_decimal(&event.value, "ticks")?;
-        let clearing_price = uint_field_to_decimal(&event.value, "clearingPrice")?;
-        let chain_order = node_chain_order(node, "InferenceFilled")?;
-        let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
-        let seller_tc = field_str(&event.value, "sellerTC").ok().map(str::to_string);
-        let buyer_note = field_str(&event.value, "buyerNote").ok().map(str::to_string);
-        // `.ok()`, а не `?`, ровно как у `sellerTC` строкой выше: дрейф ABI не должен
-        // валить событие, иначе КАЖДЫЙ филл начнёт отказывать навсегда из-за потерянной
-        // связки сделки (см. `link_deal_from_filled`). Ловить дрейф — работа ABI-гарда,
-        // а не рантайма. Побочно это и делает обход по ноге настоящим фолбэком.
-        let seller_note =
-            non_zero_address(field_str(&event.value, "sellerNote").ok()).map(str::to_string);
+        // ИСЧЕРПЫВАЮЩАЯ деструктуризация — единственная работающая форма гарда
+        // «поле ABI потребляется». Компилятор обязывает назвать каждое поле:
+        // приехавшее и никому не нужное нельзя молча проигнорировать. Сверка
+        // ключей DTO с ABI этого НЕ доказывает — она зелёная и тогда, когда поле
+        // объявлено, но выброшено (так и потерялся `sellerNote`).
+        let FilledData { maker_id, taker_id, ticks, clearing_price, seller_tc, buyer_note, seller_note } =
+            serde_json::from_value(event.value.clone())
+                .context("InferenceFilled: payload не разбирается по ABI")?;
+
+        let maker_id = maker_id.to_string();
+        let taker_id = taker_id.to_string();
         let ids = vec![maker_id.clone(), taker_id.clone()];
         Ok(Self {
-            ob,
+            ob: node.src.as_deref().context("Filled: src missing")?.to_string(),
             maker_id,
             taker_id,
-            ticks,
-            clearing_price,
-            chain_order,
-            chain_seconds,
+            ticks: ticks.to_string(),
+            // `clearingPrice` — uint256, декодер отдаёт его "0x"+64 hex. DTO держит
+            // СЫРОЕ значение ABI, поэтому конверсия остаётся здесь: без неё hex
+            // поедет в `inference_trades.price`, а numeric его не примет. Тесты с
+            // десятичными фикстурами разницы не увидят — см. гард
+            // `a_uint256_price_arrives_as_decimal_not_hex`.
+            clearing_price: uint256_maybe_hex(&clearing_price)?,
+            chain_order: node_chain_order(node, "InferenceFilled")?,
+            chain_seconds: parse_unix_seconds(node.created_at.as_ref()),
             ids,
-            seller_tc,
-            buyer_note,
-            seller_note,
+            seller_tc: non_zero_address(seller_tc.as_deref()).map(str::to_string),
+            buyer_note: Some(buyer_note),
+            seller_note: non_zero_address(seller_note.as_deref()).map(str::to_string),
         })
     }
 }
@@ -735,7 +737,16 @@ async fn apply_inference_refunded(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let ob = node.src.as_deref().context("Refunded: src missing")?;
-    let order_id = uint_field_to_decimal(&event.value, "orderId")?;
+    let RefundedData {
+        order_id,
+        // Кому вернули — знает сама нота; в `inference_orders` для этого нет колонки.
+        note: _,
+        // Сумма возврата read-модели не нужна: закрытие строки решает дедлайн,
+        // а не размер возврата (см. тело функции).
+        amount: _,
+    } = serde_json::from_value(event.value.clone())
+        .context("InferenceRefunded: payload не разбирается по ABI")?;
+    let order_id = order_id.to_string();
     let chain_order = node_chain_order(node, "InferenceRefunded")?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
 

@@ -465,7 +465,7 @@ fn event_payloads_decode_abi_shape() {
     decodes!(iob::OrderPlacedData, INFERENCE_ORDER_BOOK_ABI, "InferenceOrderPlaced");
     decodes!(iob::OrderCancelledData, INFERENCE_ORDER_BOOK_ABI, "InferenceOrderCancelled");
     let filled = decodes!(iob::FilledData, INFERENCE_ORDER_BOOK_ABI, "InferenceFilled");
-    assert_eq!(filled.seller_tc, SAMPLE_ADDRESS);
+    assert_eq!(filled.seller_tc.as_deref(), Some(SAMPLE_ADDRESS));
     decodes!(iob::ExecutedData, INFERENCE_ORDER_BOOK_ABI, "InferenceExecuted");
     decodes!(iob::RefundedData, INFERENCE_ORDER_BOOK_ABI, "InferenceRefunded");
     decodes!(iob::OrderBookDeployedData, INFERENCE_ORDER_BOOK_ABI, "InferenceOrderBookDeployed");

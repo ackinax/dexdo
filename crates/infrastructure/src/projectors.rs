@@ -1246,6 +1246,20 @@ pub(crate) fn field_str<'a>(value: &'a Value, key: &str) -> anyhow::Result<&'a s
     value.get(key).and_then(Value::as_str).with_context(|| format!("missing field `{key}`"))
 }
 
+/// То же правило, что применяет `uint_field_to_decimal`, но к уже извлечённой
+/// строке — для путей, где значение приходит из типизированного DTO, а не из
+/// `serde_json::Value`. Декодер отдаёт uint256 как "0x"+64 hex, а всё, что уже,
+/// — десятичным; принять надо оба.
+pub(crate) fn uint256_maybe_hex(raw: &str) -> anyhow::Result<String> {
+    if raw.starts_with("0x") || raw.starts_with("0X") {
+        uint256_hex_to_decimal(raw)
+    } else {
+        BigUint::parse_bytes(raw.as_bytes(), 10)
+            .map(|b| b.to_str_radix(10))
+            .ok_or_else(|| anyhow!("invalid uint256: {raw}"))
+    }
+}
+
 pub fn uint256_hex_to_decimal(value: &str) -> anyhow::Result<String> {
     // tvm_abi serialises uint256 as "0x" + 64 lowercase hex chars.
     let stripped = value.strip_prefix("0x").unwrap_or(value);

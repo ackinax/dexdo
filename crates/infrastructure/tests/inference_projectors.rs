@@ -467,6 +467,93 @@ async fn expired_orphans_name_all_four_deferrable_types() {
 }
 
 #[tokio::test]
+async fn a_uint256_price_arrives_as_decimal_not_hex() {
+    // ГАРД. `clearingPrice` и `price` — uint256, декодер отдаёт их "0x"+64 hex
+    // (`uint256_hex_to_decimal`). Все прочие фикстуры подают десятичное, где
+    // старый и новый код неотличимы, — поэтому здесь hex.
+    //
+    // `expect`, а не `else { return }`: этот гард — единственное, что отличает
+    // верный переход на DTO от порчи данных.
+    let pool = setup().await.expect("hex-гард требует Postgres");
+    let ob = "0:uint256_hex";
+    clean(&pool, ob).await;
+    let mut tx = pool.begin().await.unwrap();
+    // 0x…0101 = 257
+    let hex257 = "0x0000000000000000000000000000000000000000000000000000000000000101";
+    project(
+        &mut tx,
+        &ev(
+            "InferenceOrderPlaced",
+            serde_json::json!({
+                "orderId": "1", "isBuy": false, "price": hex257, "ticks": "10",
+                "note": "0:s", "tokenContract": "0:tc", "deadline": "1700009999", "flags": "0"
+            }),
+        ),
+        &node(ob, "co-hex-1"),
+    )
+    .await;
+    project(
+        &mut tx,
+        &ev(
+            "InferenceOrderPlaced",
+            serde_json::json!({
+                "orderId": "2", "isBuy": true, "price": hex257, "ticks": "10",
+                "note": "0:b", "tokenContract": ZERO_ADDRESS, "deadline": "0", "flags": "0"
+            }),
+        ),
+        &node(ob, "co-hex-2"),
+    )
+    .await;
+    let f = ev(
+        "InferenceFilled",
+        serde_json::json!({
+            "makerId": "1", "takerId": "2", "ticks": "10", "clearingPrice": hex257,
+            "sellerTC": "0:tc_hex", "buyerNote": "0:b", "sellerNote": "0:s"
+        }),
+    );
+    assert_eq!(project(&mut tx, &f, &node(ob, "co-hex-3")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let price: String = sqlx::query_scalar(
+        "select price::text from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(price, "257", "uint256 обязан доехать десятичным: numeric не примет hex");
+
+    let traded: String =
+        sqlx::query_scalar("select price::text from inference_trades where orderbook_address=$1")
+            .bind(ob)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(traded, "257", "цена сделки в ленте обязана быть десятичной");
+}
+
+#[tokio::test]
+async fn a_fill_without_seller_tc_still_decrements_the_legs() {
+    // ГАРД на снисходительность: строгое поле в DTO превратит дрейф ABI из
+    // «сделка не связалась, есть warn» в «каждый филл отказывает вечно».
+    let Some(pool) = setup().await else { return };
+    let ob = "0:dto_lenient";
+    clean(&pool, ob).await;
+    let mut tx = pool.begin().await.unwrap();
+    place(&pool, &mut tx, ob, "1", false, "10", "co-lenient-1").await;
+    place(&pool, &mut tx, ob, "2", true, "10", "co-lenient-2").await;
+    let f = ev(
+        "InferenceFilled",
+        // sellerTC и sellerNote отсутствуют — форма payload'а до v4.0.33.
+        serde_json::json!({"makerId":"1","takerId":"2","ticks":"10","clearingPrice":"1","buyerNote":"0:b"}),
+    );
+    assert_eq!(project(&mut tx, &f, &node(ob, "co-lenient-3")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+    assert_eq!(status_rem(&pool, ob, 1).await, ("FILLED".into(), "0".into()));
+    assert_eq!(status_rem(&pool, ob, 2).await, ("FILLED".into(), "0".into()));
+}
+
+#[tokio::test]
 async fn a_refund_on_a_gtc_order_leaves_it_open() {
     let Some(pool) = setup().await else { return };
     let ob = "0:ref_gtc";

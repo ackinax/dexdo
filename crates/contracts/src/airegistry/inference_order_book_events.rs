@@ -303,10 +303,15 @@ pub struct FilledData {
     pub clearing_price: String,
     /// ABI field is `sellerTC` (both caps); `rename_all = camelCase` would emit
     /// `sellerTc`, so the name is pinned explicitly.
-    #[serde(rename = "sellerTC")]
-    pub seller_tc: String,
+    /// `Option`, а не `String`, и это решение, а не упущение: связка сделки — не
+    /// то, ради чего стоит отказывать событию навсегда. Дрейф ABI здесь
+    /// логируется и пропускается (`link_deal_from_filled`), а ловит его гард
+    /// формы, а не рантайм.
+    #[serde(default, rename = "sellerTC")]
+    pub seller_tc: Option<String>,
     pub buyer_note: String,
-    pub seller_note: String,
+    #[serde(default)]
+    pub seller_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
