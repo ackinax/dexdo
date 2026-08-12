@@ -13,12 +13,16 @@ use anyhow::Context;
 use sqlx::Postgres;
 use sqlx::Transaction;
 
+use dodex_contracts::airegistry::token_contract_events::StreamFundedData;
+use dodex_contracts::airegistry::token_contract_events::StreamOpenedData;
+use dodex_contracts::airegistry::token_contract_events::TickFinalizedData;
+use dodex_contracts::airegistry::token_contract_events::TicksClaimedData;
+use dodex_contracts::airegistry::token_contract_events::TokenContractEvent;
+
 use crate::decoder::DecodedEvent;
 use crate::graphql::EventNode;
 use crate::indexer_repo::parse_unix_seconds;
-use crate::projectors::field_str;
 use crate::projectors::node_chain_order;
-use crate::projectors::uint_field_to_decimal;
 use crate::projectors::ProjectionOutcome;
 
 pub async fn project_token_contract_event(
@@ -33,26 +37,34 @@ pub async fn project_token_contract_event(
 
     let suffix =
         event.event_type.strip_prefix("TokenContract.").unwrap_or(event.event_type.as_str());
-    match suffix {
-        "ContractDeployed" => Ok(ProjectionOutcome::Applied), // skeleton only
-        "StreamFunded" => apply_stream_funded(tx, event, node).await,
-        "StreamOpened" => apply_stream_opened(tx, event, node).await,
-        "TickFinalized" => apply_tick_finalized(tx, event, node).await,
-        "TicksClaimed" => apply_ticks_claimed(tx, event, node).await,
-        "StreamStopped" => apply_close(tx, node, "STOPPED", true).await,
-        "DisputeResolved" => apply_close(tx, node, "DISPUTE_RESOLVED", false).await,
-        "ContractDestroyed" => apply_terminal_close(tx, node, "DESTROYED").await,
-        "StreamDisputed" => apply_disputed(tx, node).await,
-        "ProbeBurned" => apply_terminal_close(tx, node, "PROBE_BURNED").await,
+    // Маршрут по ВАРИАНТУ enum'а, а не по строковому литералу: вариант пинится к
+    // ABI (`token_contract_enum_covers_every_abi_event`), поэтому арм, называющий
+    // несуществующее событие, перестаёт быть выразимым — так прожил мёртвым
+    // `StreamReclaimed`. `match` исчерпывающий БЕЗ `_`: новый вариант не соберётся,
+    // пока ему не назначат исход.
+    use TokenContractEvent as E;
+    let Some(kind) = E::ALL.iter().copied().find(|v| format!("{v:?}") == suffix) else {
+        return Ok(ProjectionOutcome::Unknown);
+    };
+    match kind {
+        E::ContractDeployed => Ok(ProjectionOutcome::Applied), // skeleton only
+        E::StreamFunded => apply_stream_funded(tx, event, node).await,
+        E::StreamOpened => apply_stream_opened(tx, event, node).await,
+        E::TickFinalized => apply_tick_finalized(tx, event, node).await,
+        E::TicksClaimed => apply_ticks_claimed(tx, event, node).await,
+        E::StreamStopped => apply_close(tx, node, "STOPPED", true).await,
+        E::DisputeResolved => apply_close(tx, node, "DISPUTE_RESOLVED", false).await,
+        E::ContractDestroyed => apply_terminal_close(tx, node, "DESTROYED").await,
+        E::StreamDisputed => apply_disputed(tx, node).await,
+        E::ProbeBurned => apply_terminal_close(tx, node, "PROBE_BURNED").await,
         // Seller bond / probe accept / withdrawal carry no deal-level state the
         // SETTLEMENT read-model needs; the skeleton seed already recorded the deal.
         // `BuyerBondFunded` is the counterpart of `SellerBondFunded` — v4.0.35 made
         // the bond two-sided — and belongs here for the same reason. `EndpointSet`
         // carries the buyer's endpoint as ciphertext only the two parties can read, so
         // there is nothing in it a read model could serve.
-        "SellerBondFunded" | "BuyerBondFunded" | "ProbeAccepted" | "ShellWithdrawn"
-        | "EndpointSet" => Ok(ProjectionOutcome::Applied),
-        _ => Ok(ProjectionOutcome::Unknown),
+        E::SellerBondFunded | E::BuyerBondFunded | E::ProbeAccepted | E::ShellWithdrawn
+        | E::EndpointSet => Ok(ProjectionOutcome::Applied),
     }
 }
 
@@ -79,8 +91,11 @@ async fn apply_stream_funded(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("StreamFunded: src missing")?;
-    let buyer = field_str(&event.value, "buyer")?;
-    let deposit = uint_field_to_decimal(&event.value, "deposit")?;
+    // Исчерпывающая деструктуризация: каждое поле ABI обязано быть названо.
+    let StreamFundedData { buyer, deposit } = serde_json::from_value(event.value.clone())
+        .context("StreamFunded: payload не разбирается по ABI")?;
+    let buyer = buyer.as_str();
+    let deposit = deposit.to_string();
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
     sqlx::query(
         r#"update inference_deals
@@ -106,8 +121,10 @@ async fn apply_stream_opened(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("StreamOpened: src missing")?;
-    let buyer = field_str(&event.value, "buyer")?;
-    let ppt = uint_field_to_decimal(&event.value, "pricePerTick")?;
+    let StreamOpenedData { buyer, price_per_tick } = serde_json::from_value(event.value.clone())
+        .context("StreamOpened: payload не разбирается по ABI")?;
+    let buyer = buyer.as_str();
+    let ppt = price_per_tick.to_string();
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
     sqlx::query(
         r#"update inference_deals
@@ -142,8 +159,10 @@ async fn apply_ticks_claimed(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("TicksClaimed: src missing")?;
-    let trusted = uint_field_to_decimal(&event.value, "trusted")?;
-    let claimed = uint_field_to_decimal(&event.value, "claimed")?;
+    let TicksClaimedData { trusted, claimed } = serde_json::from_value(event.value.clone())
+        .context("TicksClaimed: payload не разбирается по ABI")?;
+    let trusted = trusted.to_string();
+    let claimed = claimed.to_string();
     let chain_order = node_chain_order(node, "TicksClaimed")?;
 
     sqlx::query(
@@ -171,8 +190,10 @@ async fn apply_tick_finalized(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("TickFinalized: src missing")?;
-    let finalized_owed = uint_field_to_decimal(&event.value, "finalizedOwed")?;
-    let deposit = uint_field_to_decimal(&event.value, "deposit")?;
+    let TickFinalizedData { finalized_owed, deposit } = serde_json::from_value(event.value.clone())
+        .context("TickFinalized: payload не разбирается по ABI")?;
+    let finalized_owed = finalized_owed.to_string();
+    let deposit = deposit.to_string();
     let chain_order = node_chain_order(node, "TickFinalized")?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
 
