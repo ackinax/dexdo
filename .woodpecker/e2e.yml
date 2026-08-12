@@ -196,6 +196,13 @@ steps:
       - mkdir -p ~/.ssh
       - echo "$SSH_NET_KEY" | tr '@' '\n' > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
       - cp -ar ~/.ssh ./.ssh
+      # Начало прогона, для окна наблюдателя (шаг `observer`). Этот шаг выбран
+      # потому, что он единственный без `depends_on` — то есть гарантированно
+      # предшествует всему, что трогает хост. Окружение между шагами Woodpecker
+      # не переносит, поэтому метка едет файлом. Наблюдателю уходит не она сама, а
+      # ПРОШЕДШЕЕ время: хост восстановит начало по своим часам, и расхождение
+      # часов раннера и стенда в окно не попадёт.
+      - date +%s > ./.e2e_started_at
 
   prepare_host:
     depends_on:
@@ -1173,8 +1180,68 @@ steps:
         docker compose -f docker/dexdo-e2e.compose.yaml logs --tail=100 block_manager 2>/dev/null;
         true"
 
+  # Наблюдатель. Трафика не создаёт — проверяет, что оставили сценарии, поэтому
+  # идёт последним. `status: [success, failure]` не про снисходительность: прогон,
+  # в котором сценарий упал, тем более нуждается в диагнозе, а без клаузы один
+  # упавший сценарий пропустил бы этот шаг целиком.
+  #
+  # `depends_on` здесь — тот же список, что у `dump_logs`, то есть все сценарные
+  # шаги; и `net_down` ниже ждёт ЭТОТ шаг. Без второй половины правка была бы не
+  # просто бесполезной, а опасной: порядок задаёт только `depends_on`, так что
+  # Woodpecker снёс бы стенд и отпустил лиз параллельно с чтением его базы.
+  observer:
+    when:
+      - status: [ success, failure ]
+    depends_on:
+      - e2e_tests
+      - sdk_proof
+      - sdk_parallel_acceptance
+      - sdk_usdc_release
+      - sdk_resting_orders
+      - sdk_market_orders
+      - sdk_matching_ladder
+      - sdk_shutdown_orders
+      - sdk_price_above_par
+      - sdk_bounce_recovery
+      - sdk_losing_claim
+      - sdk_key_rotation
+      - sdk_cancelled_event
+      - sdk_bounce_deploy
+      - sdk_book_segments
+      - sdk_mm_cycle
+      - sdk_coupon_debt
+      - sdk_forfeit_close
+      - sdk_oracle_quorum
+      - sdk_multi_market
+      - sdk_usdc_market
+      - sdk_order_refusals
+      - sdk_market_clock
+      - sdk_exit_gates
+      - sdk_oracle_admin
+      - sdk_impostor_calls
+      - sdk_replay
+      - sdk_event_rejects
+    image: *ansible_image
+    environment:
+      E2E_HOST: { from_secret: e2e_host }
+      E2E_CI_USER: { from_secret: e2e_ci_user }
+      TEST_DATABASE_URL: { from_secret: e2e_test_database_url }
+    commands:
+      - cp -ar $CI_WORKSPACE/.ssh ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519
+      - export E2E_ELAPSED_SECONDS=$(( $(date +%s) - $(cat $CI_WORKSPACE/.e2e_started_at) ))
+      - >
+        ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o TCPKeepAlive=yes
+        "$E2E_CI_USER@$E2E_HOST"
+        "DEXDO_SHA='$CI_COMMIT_SHA'
+        PIPELINE_ID='$CI_PIPELINE_NUMBER'
+        TEST_DATABASE_URL='$TEST_DATABASE_URL'
+        E2E_ELAPSED_SECONDS='$E2E_ELAPSED_SECONDS'
+        bash -s" < $CI_WORKSPACE/tests/e2e/observer-on-host.sh
+
   net_down:
     depends_on:
+      - observer
       - e2e_tests
       - dump_logs
       - sdk_proof
