@@ -520,7 +520,7 @@ impl IndexerRepository {
                     stats.applied += 1;
                 }
                 Ok(ProjectionOutcome::Deferred) => {
-                    if Self::is_expired_inference_orphan(
+                    if Self::is_dead_letterable_orphan(
                         &row,
                         self.inference_orphan_cutoff,
                         capture_at_head,
@@ -530,12 +530,27 @@ impl IndexerRepository {
                         // naming the data consequence). A repair DB error aborts this
                         // optimistic batch like a projector error; the savepointed
                         // replay then isolates the row.
-                        match crate::inference_projectors::repair_expired_inference_orphan(
-                            &mut tx, &event, &node,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
+                        let repaired = if event.event_type.starts_with("InferenceOrderBook.") {
+                            crate::inference_projectors::repair_expired_inference_orphan(
+                                &mut tx, &event, &node,
+                            )
+                            .await
+                            .map(|_| ())
+                        } else {
+                            // Nothing in the read model to repair: `RangeEventAdded`
+                            // annotates a row it does not create, so with the parent
+                            // gone there is no partial state to correct. The loss is
+                            // still named — a silent drop is indistinguishable from a
+                            // row that was never captured at all.
+                            warn!(
+                                msg_id = %row.msg_id,
+                                event_type = ?event.event_type,
+                                "orphan past cutoff dead-lettered: parent lies outside the captured history; nothing in the read model to repair"
+                            );
+                            Ok(())
+                        };
+                        match repaired {
+                            Ok(()) => {
                                 self.inference_orphans_dropped.fetch_add(1, Ordering::Relaxed);
                                 to_mark.push(row.id); // mark processed so it stops looping
                                 stats.applied += 1;
@@ -645,19 +660,29 @@ impl IndexerRepository {
                     stats.applied += 1;
                 }
                 Ok(ProjectionOutcome::Deferred) => {
-                    if Self::is_expired_inference_orphan(
+                    if Self::is_dead_letterable_orphan(
                         &row,
                         self.inference_orphan_cutoff,
                         capture_at_head,
                     ) {
                         // Repair the present leg(s) inside this row's savepoint, then
                         // release it; a repair error rolls back only this row.
-                        match crate::inference_projectors::repair_expired_inference_orphan(
-                            &mut sp, &event, &node,
-                        )
-                        .await
-                        {
-                            Ok(_) => {
+                        let repaired = if event.event_type.starts_with("InferenceOrderBook.") {
+                            crate::inference_projectors::repair_expired_inference_orphan(
+                                &mut sp, &event, &node,
+                            )
+                            .await
+                            .map(|_| ())
+                        } else {
+                            warn!(
+                                msg_id = %row.msg_id,
+                                event_type = ?event.event_type,
+                                "orphan past cutoff dead-lettered: parent lies outside the captured history; nothing in the read model to repair"
+                            );
+                            Ok(())
+                        };
+                        match repaired {
+                            Ok(()) => {
                                 sp.commit().await.context("reproject savepoint release")?;
                                 self.inference_orphans_dropped.fetch_add(1, Ordering::Relaxed);
                                 to_mark.push(row.id); // mark processed so it stops looping
@@ -705,22 +730,56 @@ impl IndexerRepository {
         Ok(stats)
     }
 
-    /// Returns `true` when the row is an inference event whose parent
-    /// `OrderPlaced` has not arrived, the row's **ingest** age
+    /// Event types whose deferral is allowed to end in a dead letter, and why
+    /// each one is here. This is an ALLOW-LIST on purpose: the cutoff asserts
+    /// "this parent will never arrive", which is a claim about a specific parent,
+    /// not a property of deferral in general. `projectors.rs` defers in fourteen
+    /// places and nearly all of them wait for something that legitimately arrives
+    /// later — `PMPDeployed` waits for its `token_type` to show up in
+    /// `ref_tokens`, and `TimingsSet`, `PoolsFrozen`, `Resolved` and the
+    /// cancellation events wait for their own `PMPDeployed`. At the 30-minute
+    /// production cutoff (`indexer.yaml.j2`), dead-lettering those would kill a
+    /// market silently and permanently: the row is marked processed and never
+    /// re-asked (IX-FAIL-06).
+    const DEAD_LETTERABLE: &'static [&'static str] = &[
+        // The book's own events. The parent `InferenceOrderPlaced` is captured
+        // from the same address in the same stream, so if it has not arrived by
+        // the cutoff with capture at head, it was dropped and is not coming.
+        // `repair_expired_inference_orphan` fixes depth on whichever leg is
+        // present before the row is dropped.
+        "InferenceOrderBook.",
+        // The range binding. `RangeEventAdded` annotates an `oracle_events` row
+        // it does not create, and its parents (`OracleEventListDeployed`,
+        // `EventAdded`) come from an oracle list that may have been deployed
+        // BEFORE this deployment's capture cursor ever started — in which case
+        // they are not late, they lie outside the captured history. Nothing in
+        // the read model to repair; the row is dropped with a `warn!` naming the
+        // loss.
+        //
+        // Matched by FULL name, not by contract prefix: `OracleEventList.EventAdded`
+        // from the same contract is deliberately absent — its parent arrives
+        // legitimately later.
+        "OracleEventList.RangeEventAdded",
+    ];
+
+    /// Returns `true` when a deferred row has reached the dead-letter cutoff: its
+    /// type is in [`Self::DEAD_LETTERABLE`], its **ingest** age
     /// (`now() - raw_events.created_at`) exceeds the configured cutoff, AND the
     /// capture stream has drained to the chain tip (`capture_at_head`). The
     /// `at_head` requirement keeps a parent that is merely still-ahead in an
     /// in-progress backfill from being mistaken for one that was permanently
     /// dropped at capture — "the parent will never arrive" is only declared once
-    /// capture has reached head. DEX rows (non-`InferenceOrderBook.*`) always
-    /// return `false`.
-    fn is_expired_inference_orphan(
+    /// capture has reached head.
+    fn is_dead_letterable_orphan(
         row: &PendingRow,
         cutoff: std::time::Duration,
         capture_at_head: bool,
     ) -> bool {
         capture_at_head
-            && row.event_type.as_deref().is_some_and(|t| t.starts_with("InferenceOrderBook."))
+            && row
+                .event_type
+                .as_deref()
+                .is_some_and(|t| Self::DEAD_LETTERABLE.iter().any(|p| t.starts_with(p)))
             && (chrono::Utc::now() - row.created_at)
                 .to_std()
                 .map(|age| age > cutoff)

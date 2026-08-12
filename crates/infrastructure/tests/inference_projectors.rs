@@ -1365,6 +1365,112 @@ async fn expired_filled_orphan_decrements_present_leg() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn a_range_event_orphan_dead_letters_like_the_books_own() {
+    // `OracleEventList.RangeEventAdded` откладывается, пока нет родительского
+    // `oracle_events`. Родители эмитятся oracle-списком, который мог быть
+    // развёрнут ДО старта курсора захвата этого развёртывания — тогда они лежат
+    // вне захваченной истории и не придут никогда. Сам RangeEventAdded строку не
+    // создаёт, он аннотирует чужую, так что ждать нечего. Без финального исхода
+    // строка pending навсегда и держит backlog наблюдателя выше нуля.
+    let Some(pool) = setup().await else { return };
+    let oel = "0:t_range_orphan_list";
+    sqlx::query("delete from raw_events where chain_order like '00rgoph-%'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Возраст приёма 3600 с — заведомо больше отсечки в 60 с.
+    insert_raw(
+        &pool,
+        "rgoph-range",
+        "00rgoph-a",
+        3600,
+        0,
+        oel,
+        "OracleEventList.RangeEventAdded",
+        serde_json::json!({"eventId": "0x2a", "ob": "0:t_range_orphan_book", "bounds": []}),
+    )
+    .await;
+
+    let stream = "range_orphan_stream";
+    set_cursor_at_head(&pool, stream, true).await;
+    let stats = IndexerRepository::new(pool.clone())
+        .with_capture_stream(stream)
+        .with_inference_orphan_cutoff(Duration::from_secs(60))
+        .reproject_pending_from(50, Some("00rgoph-"), Some("00rgoph-z"))
+        .await
+        .unwrap();
+
+    assert_eq!(stats.applied, 1, "dead-letter засчитывается как applied, как и у книги");
+    assert!(
+        raw_processed(&pool, "rgoph-range").await,
+        "RangeEventAdded старше отсечки обязан получить финальный исход: \
+         иначе он pending навсегда и роняет наблюдателя"
+    );
+
+    sqlx::query("delete from raw_events where chain_order like '00rgoph-%'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_prediction_orphan_is_never_dead_lettered_however_old() {
+    // ГАРД ОБРАТНОЙ СТОРОНЫ. Без него положительный тест выше не отличает
+    // allow-list от снятого префиксного условия — а снятие было бы регрессом:
+    // `projectors.rs` откладывает в четырнадцати местах, и почти все ждут того,
+    // что законно приходит позже (`PMPDeployed` ждёт строку в `ref_tokens`,
+    // `TimingsSet`/`Resolved` ждут свой `PMPDeployed`). При проде-отсечке в 30
+    // минут их dead-letter убивает рынок молча и навсегда: строка помечается
+    // processed и не переспрашивается (IX-FAIL-06).
+    //
+    // `OracleEventList.EventAdded` взят намеренно: тот же контракт, что у
+    // разрешённого `RangeEventAdded`. Тест поэтому проверяет список по ПОЛНОМУ
+    // имени, а не по префиксу контракта.
+    let Some(pool) = setup().await else { return };
+    let oel = "0:t_pred_orphan_list";
+    sqlx::query("delete from raw_events where chain_order like '00prdph-%'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert_raw(
+        &pool,
+        "prdph-added",
+        "00prdph-a",
+        3600,
+        0,
+        oel,
+        "OracleEventList.EventAdded",
+        serde_json::json!({
+            "eventId": "0x2a", "eventName": "probe", "oracleFee": "0", "deadline": "0"
+        }),
+    )
+    .await;
+
+    let stream = "pred_orphan_stream";
+    set_cursor_at_head(&pool, stream, true).await;
+    let stats = IndexerRepository::new(pool.clone())
+        .with_capture_stream(stream)
+        .with_inference_orphan_cutoff(Duration::from_secs(60))
+        .reproject_pending_from(50, Some("00prdph-"), Some("00prdph-z"))
+        .await
+        .unwrap();
+
+    // `deferred`, а не просто «строка ещё pending»: ошибка разбора payload'а
+    // тоже оставила бы строку pending, и тест зеленел бы по неверной причине.
+    assert_eq!(stats.deferred, 1, "строка обязана быть именно ОТЛОЖЕНА, а не упасть с Err");
+    assert!(
+        !raw_processed(&pool, "prdph-added").await,
+        "не-разрешённый тип обязан остаться отложенным независимо от возраста: \
+         его родитель приходит законно позже, и dead-letter убил бы рынок молча"
+    );
+
+    sqlx::query("delete from raw_events where chain_order like '00prdph-%'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 // ---- Filled handler helpers ----
 
 async fn place(
