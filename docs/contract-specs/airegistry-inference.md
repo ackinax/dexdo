@@ -51,7 +51,7 @@ names differ from the `*Emit` constant names, so the typed decoders in the
 site. These events are decoded into `raw_events` (`event_type = "TokenContract.<Event>"`,
 `src_address` = the TokenContract address) and projected into the SETTLEMENT
 read-model: `inference_deals` (one row per TokenContract / deal) and
-`inference_ticks` (one row per finalized tick). The deal's `orderbook_address`,
+`inference_ticks` (one row per `TickFinalized` event — the emit follows the week loop in `_chargeWeeksThrough`, so one row can stand for a batch of closed boundaries, not one week). The deal's `orderbook_address`,
 `seller_note`, and `buyer_note` are linked from `InferenceOrderBook.InferenceFilled`
 (`sellerTC` + `buyerNote` + `sellerNote`). The SELL leg's note in `inference_orders`
 is a fallback for the one case the event cannot cover: a payload with no `sellerNote`
