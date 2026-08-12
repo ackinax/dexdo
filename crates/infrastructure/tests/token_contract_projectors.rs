@@ -477,7 +477,8 @@ async fn token_contract_event_seeds_skeleton_then_filled_enriches() {
                     "ticks": "10",
                     "note": "0:seller",
                     "tokenContract": tc,
-                    "deadline": "0"
+                    "deadline": "0",
+                    "flags": "0"
                 }),
             ),
             &node(ob, "co-op-sell"),
@@ -498,7 +499,8 @@ async fn token_contract_event_seeds_skeleton_then_filled_enriches() {
                     "ticks": "10",
                     "note": "0:buyer",
                     "tokenContract": tc,
-                    "deadline": "0"
+                    "deadline": "0",
+                    "flags": "0"
                 }),
             ),
             &node(ob, "co-op-buy"),

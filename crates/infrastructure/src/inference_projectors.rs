@@ -52,7 +52,6 @@ pub async fn project_inference_event(
         event.event_type.strip_prefix("InferenceOrderBook.").unwrap_or(event.event_type.as_str());
     match suffix {
         "InferenceOrderPlaced" => apply_inference_order_placed(tx, event, node).await,
-        "InferenceSubscriptionPlaced" => apply_inference_subscription_placed(tx, event, node).await,
         "InferenceOrderCancelled" => apply_inference_order_cancelled(tx, event, node).await,
         "InferenceOrderExpired" => apply_inference_order_expired(tx, event, node).await,
         "InferenceFilled" => apply_inference_filled(tx, event, node).await,
@@ -91,8 +90,9 @@ async fn seed_market_skeleton(
     Ok(())
 }
 
-// Shared resting-order upsert for OrderPlaced (is_subscription=false) and
-// SubscriptionPlaced (is_subscription=true). Same still-fresh conflict guard as
+// Shared resting-order upsert. `is_subscription` приходит из бита FLAG_SUBSCRIPTION
+// поля `flags` события placement — отдельного события подписки в ABI нет.
+// Same still-fresh conflict guard as
 // projectors::apply_order_placed: a replay onto a closed or partially-filled-OPEN
 // row is a no-op, so it never resets amount_remaining and corrupts depth.
 #[allow(clippy::too_many_arguments)]
@@ -187,6 +187,16 @@ async fn apply_inference_order_placed(
         non_zero_address(Some(field_str(&event.value, "tokenContract")?));
     let deadline: Option<String> =
         non_zero_uint(Some(uint_field_to_decimal(&event.value, "deadline")?));
+    // `flags` — 8-й параметр события с v4.0.33. Подписка это бит FLAG_SUBSCRIPTION
+    // (0x40, contracts/airegistry/modifiers/modifiers.sol), а не отдельное событие:
+    // `InferenceSubscriptionPlaced` в ABI книги не существует и никогда не
+    // существовало — арм под него был мёртвым кодом и единственным писателем этой
+    // колонки, из-за чего в бою она всегда читалась `false`.
+    const FLAG_SUBSCRIPTION: u64 = 0x40;
+    let flags: u64 = uint_field_to_decimal(&event.value, "flags")?
+        .parse()
+        .context("OrderPlaced: flags не разбирается как целое")?;
+    let is_subscription = flags & FLAG_SUBSCRIPTION != 0;
     let chain_order = node_chain_order(node, "InferenceOrderPlaced")?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
     upsert_resting_order(
@@ -196,45 +206,10 @@ async fn apply_inference_order_placed(
         is_buy,
         &price,
         &ticks,
-        false,
+        is_subscription,
         note,
         token_contract,
         deadline.as_deref(),
-        &chain_order,
-        chain_seconds,
-    )
-    .await?;
-    Ok(ProjectionOutcome::Applied)
-}
-
-async fn apply_inference_subscription_placed(
-    tx: &mut Transaction<'_, Postgres>,
-    event: &DecodedEvent,
-    node: &EventNode,
-) -> anyhow::Result<ProjectionOutcome> {
-    let ob = node.src.as_deref().context("SubscriptionPlaced: src missing")?;
-    let order_id = uint_field_to_decimal(&event.value, "orderId")?;
-    let price = uint_field_to_decimal(&event.value, "maxPrice")?;
-    let ticks = uint_field_to_decimal(&event.value, "ticks")?;
-    // `buyerNote` is mandatory in the ABI and the endpoint filters exactly on it; a NULL
-    // would hide the subscription from every `note=X` listing forever.
-    let note = Some(field_str(&event.value, "buyerNote")?);
-    let chain_order = node_chain_order(node, "InferenceSubscriptionPlaced")?;
-    let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
-    // InferenceSubscriptionPlaced carries no tokenContract (a subscription is a bid) and
-    // no deadline, though the chain stores one. The reconciler's getter probe is the only
-    // source for a subscription row's deadline.
-    upsert_resting_order(
-        tx,
-        ob,
-        &order_id,
-        true,
-        &price,
-        &ticks,
-        true,
-        note,
-        None,
-        None,
         &chain_order,
         chain_seconds,
     )
