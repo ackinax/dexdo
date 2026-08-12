@@ -16,7 +16,8 @@ use sqlx::PgPool;
 /// Пять выражений — ровно то, что потребитель читает. Ни `finalized_ticks`,
 /// ни `close_kind` он не запрашивает, и требовать их здесь значило бы
 /// придумывать обязательство, которого никто не брал.
-const REWARDS_RESOLVE_DEAL: &str = "select orderbook_address, seller_note, buyer_note, clean_settlement, \
+const REWARDS_RESOLVE_DEAL: &str =
+    "select orderbook_address, seller_note, buyer_note, clean_settlement, \
      (settled_at_chain is not null) as settled \
      from inference_deals where token_contract_address = $1";
 

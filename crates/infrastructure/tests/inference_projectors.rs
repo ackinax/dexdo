@@ -10,8 +10,8 @@ use dodex_infrastructure::database;
 use dodex_infrastructure::decoder::DecodedEvent;
 use dodex_infrastructure::graphql::EventNode;
 use dodex_infrastructure::inference_projectors::project_inference_event;
-use dodex_infrastructure::inference_projectors::ExpiredOrphanOutcome;
 use dodex_infrastructure::inference_projectors::repair_expired_inference_orphan;
+use dodex_infrastructure::inference_projectors::ExpiredOrphanOutcome;
 use dodex_infrastructure::projectors::ProjectionOutcome;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -268,10 +268,18 @@ async fn a_late_cancel_does_not_demote_an_expired_order() {
         &node(ob, "a1"),
     )
     .await;
-    project(&mut tx, &ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"})), &node(ob, "a2")).await;
     project(
         &mut tx,
-        &ev("InferenceOrderCancelled", serde_json::json!({"orderId": "1", "refunded": "0", "note": "0:b"})),
+        &ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"})),
+        &node(ob, "a2"),
+    )
+    .await;
+    project(
+        &mut tx,
+        &ev(
+            "InferenceOrderCancelled",
+            serde_json::json!({"orderId": "1", "refunded": "0", "note": "0:b"}),
+        ),
         &node(ob, "a3"),
     )
     .await;
@@ -314,7 +322,12 @@ async fn a_late_fill_does_not_revive_an_expired_order() {
         &node(ob, "a2"),
     )
     .await;
-    project(&mut tx, &ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"})), &node(ob, "a3")).await;
+    project(
+        &mut tx,
+        &ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"})),
+        &node(ob, "a3"),
+    )
+    .await;
     let outcome = project(
         &mut tx,
         &ev(
@@ -409,13 +422,18 @@ async fn a_filled_orphan_with_no_legs_still_records_the_seller() {
     repair_expired_inference_orphan(&mut tx, &e, &node(ob, "co-sellerdirect-1")).await.unwrap();
     tx.commit().await.unwrap();
 
-    let seller: Option<String> =
-        sqlx::query_scalar("select seller_note from inference_deals where token_contract_address=$1")
-            .bind(tc)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(seller.as_deref(), Some("0:seller"), "продавец приехал в событии — обход по ноге не нужен");
+    let seller: Option<String> = sqlx::query_scalar(
+        "select seller_note from inference_deals where token_contract_address=$1",
+    )
+    .bind(tc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        seller.as_deref(),
+        Some("0:seller"),
+        "продавец приехал в событии — обход по ноге не нужен"
+    );
     sqlx::query("delete from inference_deals where token_contract_address = $1")
         .bind(tc)
         .execute(&pool)
@@ -436,8 +454,9 @@ async fn expired_orphans_name_all_four_deferrable_types() {
         let ob = "0:orphan_types";
         clean(&pool, ob).await;
         let mut tx = pool.begin().await.unwrap();
-        let outcome =
-            repair_expired_inference_orphan(&mut tx, &ev(name, value), &node(ob, "a1")).await.unwrap();
+        let outcome = repair_expired_inference_orphan(&mut tx, &ev(name, value), &node(ob, "a1"))
+            .await
+            .unwrap();
         tx.commit().await.unwrap();
         assert_ne!(
             outcome,
@@ -536,7 +555,10 @@ async fn a_refund_over_a_filled_row_changes_nothing_at_all() {
     tx.commit().await.unwrap();
 
     let (status, _) = status_rem(&pool, ob, 1).await;
-    assert_eq!(status, "FILLED", "рефанд обслуживает и удаление dust — исполненную строку он не трогает");
+    assert_eq!(
+        status, "FILLED",
+        "рефанд обслуживает и удаление dust — исполненную строку он не трогает"
+    );
     let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "select updated_at from inference_orders where orderbook_address=$1 and order_id=1",
     )
@@ -553,7 +575,10 @@ async fn a_refund_without_its_parent_defers() {
     let ob = "0:ref_orphan";
     clean(&pool, ob).await;
     let mut tx = pool.begin().await.unwrap();
-    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a1")).await, ProjectionOutcome::Deferred);
+    assert_eq!(
+        project(&mut tx, &refunded("1"), &node(ob, "a1")).await,
+        ProjectionOutcome::Deferred
+    );
     tx.commit().await.unwrap();
 }
 
@@ -623,7 +648,10 @@ async fn a_refund_before_its_expiry_event_leaves_expired_standing() {
 
     let mut tx = pool.begin().await.unwrap();
     assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
-    assert_eq!(project(&mut tx, &expired_ev("1"), &node(ob, "a3")).await, ProjectionOutcome::Applied);
+    assert_eq!(
+        project(&mut tx, &expired_ev("1"), &node(ob, "a3")).await,
+        ProjectionOutcome::Applied
+    );
     tx.commit().await.unwrap();
 
     let (status, swept_null): (String, bool) = sqlx::query_as(
@@ -652,7 +680,10 @@ async fn a_refund_after_its_expiry_event_changes_nothing_at_all() {
     place_with_deadline(&pool, ob, "1", true, "1699999999", "a1").await;
 
     let mut tx = pool.begin().await.unwrap();
-    assert_eq!(project(&mut tx, &expired_ev("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    assert_eq!(
+        project(&mut tx, &expired_ev("1"), &node(ob, "a2")).await,
+        ProjectionOutcome::Applied
+    );
     tx.commit().await.unwrap();
     let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "select updated_at from inference_orders where orderbook_address=$1 and order_id=1",
@@ -674,7 +705,10 @@ async fn a_refund_after_its_expiry_event_changes_nothing_at_all() {
     .await
     .unwrap();
     assert_eq!(status, "EXPIRED");
-    assert_eq!(after, before, "`EXPIRED` обязан быть вне предиката рефанда: строка не тронута вовсе");
+    assert_eq!(
+        after, before,
+        "`EXPIRED` обязан быть вне предиката рефанда: строка не тронута вовсе"
+    );
 }
 
 #[tokio::test]
@@ -848,7 +882,8 @@ async fn observability_event_seeds_market_only() {
     // бывает. Теперь у рефанда есть свой проектор со строгим разбором id, и такой
     // payload уронил бы `project`. Смысл теста (любое inference-событие сеет скелет
     // рынка) держит любой из оставшихся observability-типов.
-    let r = ev("InferenceExecuted", serde_json::json!({"ticks":"1","clearingPrice":"1","cost":"1"}));
+    let r =
+        ev("InferenceExecuted", serde_json::json!({"ticks":"1","clearingPrice":"1","cost":"1"}));
     assert_eq!(project(&mut tx, &r, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
     let m: i64 =
@@ -983,7 +1018,8 @@ async fn expired_orphans_dropped_all_four_types_using_ingest_age_not_chain_time(
         .unwrap();
     let filled = serde_json::json!({"makerId":"900","takerId":"901","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"});
     let cancel = serde_json::json!({"orderId":"902","refunded":"0"});
-    let expired = serde_json::json!({"orderId":"903","isBuy":true,"note":"0:b","tokenContract":ZERO_ADDRESS});
+    let expired =
+        serde_json::json!({"orderId":"903","isBuy":true,"note":"0:b","tokenContract":ZERO_ADDRESS});
     let refunded = serde_json::json!({"orderId":"904","note":"0:b","amount":"1"});
     // (a)-(b'') aged-ingest orphans of ALL FOUR deferrable types => dropped.
     //
