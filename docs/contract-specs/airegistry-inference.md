@@ -61,8 +61,8 @@ repair: there the SELL leg is precisely what was never projected, so the lookup 
 nothing and the deal keeps a NULL `seller_note` unless the fill's own field supplies it; per-tick rows and the
 `finalized_ticks` aggregate comes from `TickFinalized` (per-tick `finalized_owed` is stored on each `inference_ticks` row — it is the contract's cumulative `_finalizedOwed`, not a per-tick delta);
 `close_kind` + `clean_settlement` + `settled_at_chain` from the stream-close
-events: `StreamStopped` sets `clean_settlement = true`; `DisputeResolved` and
-`StreamReclaimed` set it to `false`; `ContractDestroyed` (`'DESTROYED'`) and
+events: `StreamStopped` sets `clean_settlement = true`; `DisputeResolved` sets it to
+`false`; `ContractDestroyed` (`'DESTROYED'`) and
 `ProbeBurned` (`'PROBE_BURNED'` — a buyer stop before probe-accept, or the
 dispute-burn path; both terminal) set only `close_kind` and `settled_at_chain`,
 leaving `clean_settlement` unchanged (remains `NULL` if no prior close event set

@@ -435,7 +435,7 @@ The inference settlement side tracks the lifecycle of each deal escrow (`TokenCo
 
 ### `inference_deals`
 
-One row per `TokenContract` address. Seeded as a skeleton from the first observed `TokenContract.*` event (keyed by `src_address`); remaining columns filled by the SETTLEMENT projector as `InferenceOrderBook.InferenceFilled`, `TokenContract.StreamOpened`, and the stream-close events (`StreamStopped`/`DisputeResolved`/`StreamReclaimed`/`ContractDestroyed`), and related events arrive.
+One row per `TokenContract` address. Seeded as a skeleton from the first observed `TokenContract.*` event (keyed by `src_address`); remaining columns filled by the SETTLEMENT projector as `InferenceOrderBook.InferenceFilled`, `TokenContract.StreamOpened`, and the stream-close events (`StreamStopped`/`DisputeResolved`/`ContractDestroyed`/`ProbeBurned`), and related events arrive.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -445,7 +445,7 @@ One row per `TokenContract` address. Seeded as a skeleton from the first observe
 | `buyer_note` | `text` (nullable) | PrivateNote address of the buyer. Filled from `InferenceOrderBook.InferenceFilled`. |
 | `deposit` | `numeric(78,0)` (nullable) | Initial deposit amount (quote token units). |
 | `price_per_tick` | `numeric(78,0)` (nullable) | Agreed price per finalized tick (quote token units). |
-| `finalized_ticks` | `integer` NOT NULL default `0` | Count of `TokenContract.TickFinalized` events for this deal (= number of `inference_ticks` rows). NOT the contract's on-chain `_ticksFinalized`, which additionally counts the probe-accept tick (`ProbeAccepted`) and the closing tick (folded into `StreamStopped`/`StreamReclaimed`/`DisputeResolved`), neither emitted as `TickFinalized`. |
+| `finalized_ticks` | `integer` NOT NULL default `0` | Count of `TokenContract.TickFinalized` events for this deal (= number of `inference_ticks` rows). NOT the contract's on-chain `_ticksFinalized`, which additionally counts the probe-accept tick (`ProbeAccepted`) and the closing tick (folded into `StreamStopped`/`DisputeResolved`), neither emitted as `TickFinalized`. |
 | `trusted_ticks` | `numeric(78,0)` (nullable) | High-water mark of `TokenContract.TicksClaimed.trusted` — work the deal has actually credited. NULL until the seller first calls `claimTokens`. |
 | `claimed_ticks` | `numeric(78,0)` (nullable) | High-water mark of `TicksClaimed.claimed` — what the seller has claimed but that has not yet been trusted or contested, so it runs ahead of `trusted_ticks` while a claim is pending. Both columns track the position *between* weekly boundaries, where `finalized_ticks` and `inference_ticks` say nothing: a subscription week is 604800 s, so a deal would otherwise look motionless for days. Kept as high-water marks because the chain's own `claimTokens` is cumulative and non-decreasing (`require(cumulativeTokens >= _tokensPend2)`), so a replayed or out-of-order event cannot walk them backwards. |
 | `funded_at_chain` | `timestamptz` (nullable) | Chain timestamp of the funding event. |

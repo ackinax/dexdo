@@ -290,6 +290,29 @@ mod tests {
         assert!(pmp_event_ids.iter().any(|(_, n)| n == "ApprovedByOracle"));
     }
 
+    // Арм в `token_contract_projectors.rs` называл событие, которого в ABI нет:
+    // мёртвый код с вечно зелёным тестом. Тест держит удаление на том же основании,
+    // на котором оно сделано, — на ABI, а не на пересказе. Именованная проверка на
+    // ОДНО событие: общий гард «каждое маршрутизируемое событие существует в ABI»
+    // приезжает волной 1 и поглотит этот тест; тогда его надо удалить, а не оставить.
+    #[test]
+    fn token_contract_abi_does_not_declare_stream_reclaimed() {
+        let abi: serde_json::Value = serde_json::from_str(ABI_TOKEN_CONTRACT).unwrap();
+        let names: Vec<&str> = abi["events"]
+            .as_array()
+            .expect("TokenContract ABI must carry an events array")
+            .iter()
+            .filter_map(|e| e["name"].as_str())
+            .collect();
+        // Без этой проверки переименование ключа `events` превратило бы тест в
+        // утверждение о пустом списке, верное всегда.
+        assert!(!names.is_empty(), "events array parsed empty — ключ ABI изменился, тест ослеп");
+        assert!(
+            !names.contains(&"StreamReclaimed"),
+            "StreamReclaimed вернулся в ABI: арм и проекция close_kind='RECLAIMED' удалены как мёртвые — восстановить их, а не тест"
+        );
+    }
+
     #[test]
     fn registers_inference_orderbook_and_counts_unique_ids() {
         let decoder = Decoder::new().unwrap();

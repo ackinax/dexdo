@@ -41,7 +41,6 @@ pub async fn project_token_contract_event(
         "TicksClaimed" => apply_ticks_claimed(tx, event, node).await,
         "StreamStopped" => apply_close(tx, node, "STOPPED", true).await,
         "DisputeResolved" => apply_close(tx, node, "DISPUTE_RESOLVED", false).await,
-        "StreamReclaimed" => apply_close(tx, node, "RECLAIMED", false).await,
         "ContractDestroyed" => apply_terminal_close(tx, node, "DESTROYED").await,
         "StreamDisputed" => apply_disputed(tx, node).await,
         "ProbeBurned" => apply_terminal_close(tx, node, "PROBE_BURNED").await,

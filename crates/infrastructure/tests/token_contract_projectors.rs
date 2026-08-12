@@ -277,34 +277,6 @@ async fn dispute_resolved_marks_close_kind_and_not_clean() {
 }
 
 #[tokio::test]
-async fn stream_reclaimed_marks_close_kind_and_not_clean() {
-    let Some(pool) = setup().await else { return };
-    let tc = "0:tc_reclaimed";
-    sqlx::query("delete from inference_deals where token_contract_address=$1")
-        .bind(tc)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let mut tx = pool.begin().await.unwrap();
-    let outcome = project(
-        &mut tx,
-        &ev("StreamReclaimed", serde_json::json!({"buyer":"0:b","refundToBuyer":"100"})),
-        &node(tc, "co-sr-1"),
-    )
-    .await;
-    assert_eq!(outcome, ProjectionOutcome::Applied);
-    tx.commit().await.unwrap();
-
-    let (kind, clean, settled): (Option<String>, Option<bool>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
-        "select close_kind, clean_settlement, settled_at_chain from inference_deals where token_contract_address=$1")
-        .bind(tc).fetch_one(&pool).await.unwrap();
-    assert_eq!(kind.as_deref(), Some("RECLAIMED"));
-    assert_eq!(clean, Some(false));
-    assert!(settled.is_some(), "settled_at_chain must be set on StreamReclaimed");
-}
-
-#[tokio::test]
 async fn stream_disputed_sets_disputed_at_and_not_clean() {
     let Some(pool) = setup().await else { return };
     let tc = "0:tc_disputed";
