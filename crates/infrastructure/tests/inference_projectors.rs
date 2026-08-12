@@ -381,6 +381,49 @@ fn expired_ev(order_id: &str) -> DecodedEvent {
 // Конъюнкт 1: `deadline is not null`. GTC-бид приходит с нулём, проектор размещения
 // нормализует его в SQL NULL.
 #[tokio::test]
+async fn a_filled_orphan_with_no_legs_still_records_the_seller() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:seller_direct";
+    // `clean` чистит orders/trades/markets, но НЕ inference_deals, а upsert сделки
+    // сохраняет первый ненулевой seller_note через coalesce. Общий ключ `0:tc`
+    // делил бы строку с другими тестами, и под параллельным nextest результат
+    // зависел бы от порядка. Ключ уникален и убирается за собой.
+    let tc = "0:tc_seller_direct";
+    clean(&pool, ob).await;
+    sqlx::query("delete from inference_deals where token_contract_address = $1")
+        .bind(tc)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+
+    // Ни одна нога не спроецирована — ровно случай orphan-repair. Продавец при
+    // этом назван самим событием, значит теряться ему не за что.
+    let e = ev(
+        "InferenceFilled",
+        serde_json::json!({
+            "makerId": "1", "takerId": "2", "ticks": "3", "clearingPrice": "5",
+            "sellerTC": tc, "buyerNote": "0:buyer", "sellerNote": "0:seller"
+        }),
+    );
+    repair_expired_inference_orphan(&mut tx, &e, &node(ob, "co-sellerdirect-1")).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let seller: Option<String> =
+        sqlx::query_scalar("select seller_note from inference_deals where token_contract_address=$1")
+            .bind(tc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(seller.as_deref(), Some("0:seller"), "продавец приехал в событии — обход по ноге не нужен");
+    sqlx::query("delete from inference_deals where token_contract_address = $1")
+        .bind(tc)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn expired_orphans_name_all_four_deferrable_types() {
     // Отложиться без родителя умеют Filled, Cancelled, Expired и Refunded.
     // Каждый обязан иметь собственный исход: `Nothing` означает «мы не знаем, что
@@ -938,7 +981,7 @@ async fn expired_orphans_dropped_all_four_types_using_ingest_age_not_chain_time(
         .execute(&pool)
         .await
         .unwrap();
-    let filled = serde_json::json!({"makerId":"900","takerId":"901","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"});
+    let filled = serde_json::json!({"makerId":"900","takerId":"901","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"});
     let cancel = serde_json::json!({"orderId":"902","refunded":"0"});
     let expired = serde_json::json!({"orderId":"903","isBuy":true,"note":"0:b","tokenContract":ZERO_ADDRESS});
     let refunded = serde_json::json!({"orderId":"904","note":"0:b","amount":"1"});
@@ -1070,7 +1113,7 @@ async fn expired_orphan_not_dropped_until_capture_at_head() {
         .execute(&pool)
         .await
         .unwrap();
-    let filled = serde_json::json!({"makerId":"800","takerId":"801","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"});
+    let filled = serde_json::json!({"makerId":"800","takerId":"801","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"});
     // Aged ingest (1h) — well past the 60s cutoff — so only the at_head gate decides.
     insert_raw(
         &pool,
@@ -1151,7 +1194,7 @@ async fn expired_filled_orphan_decrements_present_leg() {
     assert_eq!(order_amount_status(&pool, ob, "700").await, Some((10, "OPEN".into())));
 
     // Aged Filled orphan: maker 700 is present and resting; taker 701's OrderPlaced was dropped.
-    let filled = serde_json::json!({"makerId":"700","takerId":"701","ticks":"3","clearingPrice":"5","sellerTC":"0:s","buyerNote":"0:b"});
+    let filled = serde_json::json!({"makerId":"700","takerId":"701","ticks":"3","clearingPrice":"5","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"});
     insert_raw(
         &pool,
         "orphld-fill",
@@ -1254,7 +1297,7 @@ async fn filled_closes_sell_offer_and_zeroes_buy_taker() {
     place(&pool, &mut tx, ob, "2", true, "10", "co-2").await; // BUY taker
     let f = ev(
         "InferenceFilled",
-        serde_json::json!({"makerId":"1","takerId":"2","ticks":"10","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"}),
+        serde_json::json!({"makerId":"1","takerId":"2","ticks":"10","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"}),
     );
     // Applied Filled mints a global-PK inference_trades row keyed on this chain order —
     // must stay unique repo-wide, not just within this test.
@@ -1273,12 +1316,12 @@ async fn buy_maker_fills_across_deals_to_filled_at_zero() {
     place(&pool, &mut tx, ob, "10", true, "10", "co-1").await; // BUY maker
     place(&pool, &mut tx, ob, "11", false, "6", "co-2").await; // SELL taker A
     place(&pool, &mut tx, ob, "12", false, "4", "co-3").await; // SELL taker B
-    project(&mut tx,&ev("InferenceFilled",serde_json::json!({"makerId":"10","takerId":"11","ticks":"6","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"})),&node(ob,"co-fillacross-4")).await; // trade_id unique repo-wide
+    project(&mut tx,&ev("InferenceFilled",serde_json::json!({"makerId":"10","takerId":"11","ticks":"6","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"})),&node(ob,"co-fillacross-4")).await; // trade_id unique repo-wide
     tx.commit().await.unwrap();
     // Read via the pool only AFTER commit — a separate pooled connection cannot see uncommitted rows.
     assert_eq!(status_rem(&pool, ob, 10).await, ("OPEN".into(), "4".into())); // committed partial
     let mut tx = pool.begin().await.unwrap();
-    project(&mut tx,&ev("InferenceFilled",serde_json::json!({"makerId":"10","takerId":"12","ticks":"4","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"})),&node(ob,"co-fillacross-5")).await; // trade_id unique repo-wide
+    project(&mut tx,&ev("InferenceFilled",serde_json::json!({"makerId":"10","takerId":"12","ticks":"4","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"})),&node(ob,"co-fillacross-5")).await; // trade_id unique repo-wide
     tx.commit().await.unwrap();
     assert_eq!(status_rem(&pool, ob, 10).await, ("FILLED".into(), "0".into()));
 }
@@ -1292,7 +1335,7 @@ async fn filled_defers_zero_writes_when_one_side_absent_then_applies_once() {
     place(&pool, &mut tx, ob, "20", false, "5", "co-1").await; // only the maker exists
     let f = ev(
         "InferenceFilled",
-        serde_json::json!({"makerId":"20","takerId":"21","ticks":"5","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"}),
+        serde_json::json!({"makerId":"20","takerId":"21","ticks":"5","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"}),
     );
     assert_eq!(project(&mut tx, &f, &node(ob, "co-2")).await, ProjectionOutcome::Deferred);
     tx.commit().await.unwrap();
@@ -1327,7 +1370,7 @@ async fn filled_overrides_provisional_sweep_cancel_and_resets_discovery_cursor()
     let mut tx = pool.begin().await.unwrap();
     let f = ev(
         "InferenceFilled",
-        serde_json::json!({"makerId":"30","takerId":"31","ticks":"4","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"}),
+        serde_json::json!({"makerId":"30","takerId":"31","ticks":"4","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"}),
     );
     // Applied Filled mints a global-PK inference_trades row — chain order unique repo-wide.
     assert_eq!(
@@ -1382,7 +1425,7 @@ async fn filled_after_real_cancel_is_terminal_no_override() {
     let mut tx = pool.begin().await.unwrap();
     let f = ev(
         "InferenceFilled",
-        serde_json::json!({"makerId":"40","takerId":"41","ticks":"4","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"}),
+        serde_json::json!({"makerId":"40","takerId":"41","ticks":"4","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"}),
     );
     // Applied Filled mints a global-PK inference_trades row — chain order unique repo-wide.
     project(&mut tx, &f, &node(ob, "co-fillrealcancel-3")).await;
@@ -1446,7 +1489,7 @@ async fn filled_links_deal_to_orderbook_seller_buyer() {
     let filled = ev(
         "InferenceFilled",
         serde_json::json!({
-        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer"}),
+        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer","sellerNote":"0:seller"}),
     );
     // Applied Filled mints a global-PK inference_trades row — chain order unique repo-wide.
     assert_eq!(
@@ -1501,7 +1544,7 @@ async fn orphan_repair_filled_links_deal() {
     let filled = ev(
         "InferenceFilled",
         serde_json::json!({
-        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer"}),
+        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer","sellerNote":"0:seller"}),
     );
     // Applied via the orphan path mints a global-PK inference_trades row — chain order
     // unique repo-wide.
@@ -1547,7 +1590,10 @@ async fn orphan_repair_filled_no_leg_still_links() {
     let filled = ev(
         "InferenceFilled",
         serde_json::json!({
-        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer"}),
+        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer",
+        // ZERO намеренно: тест про ФОЛБЭК — продавец обязан остаться невосстановимым,
+        // когда SELL-нога не спроецирована, а событие его не назвало.
+        "sellerNote":ZERO_ADDRESS}),
     );
     repair_expired_inference_orphan(&mut tx, &filled, &node(ob, "co-1")).await.unwrap();
     tx.commit().await.unwrap();
@@ -1614,7 +1660,10 @@ async fn orphan_repair_filled_taker_only_resolves_from_taker_side() {
     let filled = ev(
         "InferenceFilled",
         serde_json::json!({
-        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer"}),
+        "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer",
+        // ZERO намеренно: тест упражняет разрешение НАПРАВЛЕНИЯ по присутствующей ноге,
+        // а не связку продавца — событие его не называет.
+        "sellerNote":ZERO_ADDRESS}),
     );
     // Applied via the orphan path mints a global-PK inference_trades row — chain order
     // unique repo-wide.

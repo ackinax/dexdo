@@ -241,6 +241,10 @@ struct FilledFields {
     /// Deal-link fields (present on the normal `Filled`; unused by orphan repair).
     seller_tc: Option<String>,
     buyer_note: Option<String>,
+    /// Продавец, названный самим событием (7-е поле `InferenceFilled` с v4.0.33).
+    /// До него продавец восстанавливался обходом по SELL-ноге в `inference_orders`,
+    /// что теряло его ровно тогда, когда нога не приехала — то есть на orphan-repair.
+    seller_note: Option<String>,
 }
 
 impl FilledFields {
@@ -254,6 +258,12 @@ impl FilledFields {
         let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
         let seller_tc = field_str(&event.value, "sellerTC").ok().map(str::to_string);
         let buyer_note = field_str(&event.value, "buyerNote").ok().map(str::to_string);
+        // `.ok()`, а не `?`, ровно как у `sellerTC` строкой выше: дрейф ABI не должен
+        // валить событие, иначе КАЖДЫЙ филл начнёт отказывать навсегда из-за потерянной
+        // связки сделки (см. `link_deal_from_filled`). Ловить дрейф — работа ABI-гарда,
+        // а не рантайма. Побочно это и делает обход по ноге настоящим фолбэком.
+        let seller_note =
+            non_zero_address(field_str(&event.value, "sellerNote").ok()).map(str::to_string);
         let ids = vec![maker_id.clone(), taker_id.clone()];
         Ok(Self {
             ob,
@@ -266,6 +276,7 @@ impl FilledFields {
             ids,
             seller_tc,
             buyer_note,
+            seller_note,
         })
     }
 }
@@ -400,8 +411,9 @@ async fn link_deal_from_filled(
         return Ok(());
     };
 
-    // Seller = the note on the SELL leg (is_buy=false) of this match.
-    let seller_note: Option<String> = sqlx::query_scalar(
+    // Обход по SELL-ноге (is_buy=false): работает, только если нога СПРОЕЦИРОВАНА.
+    // Оставлен фолбэком — событие теперь называет продавца прямым полем.
+    let seller_from_leg: Option<String> = sqlx::query_scalar(
         r#"select note_address from inference_orders
             where orderbook_address = $1 and order_id = any($2::numeric[]) and is_buy = false
             limit 1"#,
@@ -412,6 +424,10 @@ async fn link_deal_from_filled(
     .await
     .context("resolve seller_note for deal link")?
     .flatten();
+
+    // Событие авторитетнее обхода: обход теряет продавца ровно тогда, когда нога не
+    // приехала (orphan-repair), а `sellerNote` есть всегда.
+    let seller_note = f.seller_note.clone().or(seller_from_leg);
 
     sqlx::query(
         r#"insert into inference_deals

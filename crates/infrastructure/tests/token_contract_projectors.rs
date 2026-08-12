@@ -523,6 +523,7 @@ async fn token_contract_event_seeds_skeleton_then_filled_enriches() {
                     "ticks": "10",
                     "clearingPrice": "100",
                     "sellerTC": tc,
+                    "sellerNote": "0:seller",
                     "buyerNote": "0:buyer"
                 }),
             ),
