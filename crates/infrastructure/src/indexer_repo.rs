@@ -167,6 +167,50 @@ impl IndexerRepository {
                       select 1 from raw_events e
                        where e.src_address = m.orderbook_address
                          and e.processed_at is null)"#;
+    /// Shared WHERE-clause fragment for "a `raw_events` row the projection loop
+    /// will pick up": unprocessed, typed and decoded. `count_pending_projection`
+    /// (whole-table), `projection_lag_seconds` (age of the oldest such row) and
+    /// `pending_projection_since` (the run-window breakdown the e2e observer
+    /// reads) all build from this one constant — edit the predicate here only,
+    /// never duplicate it.
+    const PENDING_PROJECTION_WHERE: &'static str = r#"processed_at is null
+                  and event_type is not null
+                  and decoded is not null"#;
+    /// Shared WHERE-clause fragment for "a row the projection loop will NOT pick
+    /// up": untyped or undecoded. A deliberate complement to
+    /// [`Self::PENDING_PROJECTION_WHERE`], not a variant of it: a growing count
+    /// here diagnoses ABI drift (IX-CAP-05), but an event from a contract we do
+    /// not know is not our failure, so the observer prints these rather than
+    /// failing on them. `count_undecodable_since` (whole-table) and
+    /// `undecodable_addresses_since` (scoped) both build from it.
+    const UNDECODABLE_WHERE: &'static str = r#"processed_at is null
+                  and (event_type is null or decoded is null)"#;
+    /// Shared subquery for "addresses that emitted at least one event inside the
+    /// run window". Shared by `inference_books_with_events_since` and
+    /// `inference_anchored_books_since`: their window predicate must be
+    /// identical, or the anchor and the diagnostic would be talking about
+    /// different runs.
+    ///
+    /// Written as `in (subquery)` rather than a per-book `exists(...)` for the
+    /// query plan: `exists` with `src_address = m.orderbook_address` is covered
+    /// by NO existing index — both `src_address` indices are partial on
+    /// `processed_at is null` (`raw_events_pending_src_idx`,
+    /// `raw_events_unprocessed_src_idx`), and processed rows are exactly what a
+    /// run window needs (at the tail of a run they are the majority). This way
+    /// the window is scanned once via `raw_events_created_at_idx` (migration
+    /// 0007) instead of once per book on every poll.
+    const EVENTS_IN_WINDOW: &'static str = r#"select e.src_address from raw_events e
+                       where e.created_at >= to_timestamp($1::double precision)
+                         and e.src_address is not null"#;
+    /// Shared WHERE-clause fragment for "this book carries no verdict": not
+    /// visible, not superseded, and not failing **with a reason**. The first
+    /// three states are exactly `MARKET_STATE_COUNTS_SELECT`'s
+    /// `discovering`/`visible`/`failing` buckets; the one difference is that a
+    /// failure stamp without text does not count as failing here, because
+    /// IX-SEQ-10 asks for the reason and the observer cannot read the pod's logs.
+    const NO_VERDICT_WHERE: &'static str = r#"m.last_reconciled_at is null
+                  and m.superseded_at is null
+                  and (m.last_reconcile_failed_at is null or m.last_reconcile_error is null)"#;
 
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -880,15 +924,12 @@ impl IndexerRepository {
     /// count reflects exactly what the loop will pick up. Cheap thanks to
     /// `raw_events_pending_chain_order_idx`.
     pub async fn count_pending_projection(&self) -> anyhow::Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            r#"select count(*) from raw_events
-                where processed_at is null
-                  and event_type is not null
-                  and decoded is not null"#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("count pending projection")?;
+        let sql =
+            format!("select count(*) from raw_events where {}", Self::PENDING_PROJECTION_WHERE);
+        let count: i64 = sqlx::query_scalar(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .context("count pending projection")?;
         Ok(count)
     }
 
@@ -902,16 +943,15 @@ impl IndexerRepository {
     /// 0 lag while pending work exists. Preferred over `now() - max(processed_at)`,
     /// which under-reports lag while the loop is busy projecting old rows.
     pub async fn projection_lag_seconds(&self) -> anyhow::Result<i64> {
-        let secs: Option<i64> = sqlx::query_scalar(
-            r#"select extract(epoch from now() - min(coalesce(created_at_chain, created_at)))::bigint
-                 from raw_events
-                where processed_at is null
-                  and event_type is not null
-                  and decoded is not null"#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("projection lag seconds")?;
+        let sql = format!(
+            "select extract(epoch from now() - min(coalesce(created_at_chain, created_at)))::bigint \
+               from raw_events where {}",
+            Self::PENDING_PROJECTION_WHERE
+        );
+        let secs: Option<i64> = sqlx::query_scalar(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .context("projection lag seconds")?;
         Ok(secs.unwrap_or(0))
     }
 
@@ -1079,6 +1119,179 @@ impl IndexerRepository {
             .fetch_all(&self.pool)
             .await
             .context("inference wedged book addresses")?;
+        Ok(addrs)
+    }
+
+    /// Breakdown of the unprojected backlog by event type, over rows **ingested**
+    /// inside the run window. Predicate is `PENDING_PROJECTION_WHERE`, the same
+    /// one `count_pending_projection` uses; only the window is added.
+    ///
+    /// The window keys on ingest time, not chain time, so that both it and the
+    /// column it is compared against come from the same clock (the Postgres of
+    /// the host the indexer runs on) — the CI runner's clock offset never enters
+    /// the comparison.
+    pub async fn pending_projection_since(
+        &self,
+        since: i64,
+    ) -> anyhow::Result<Vec<(String, i64)>> {
+        let sql = format!(
+            "select event_type, count(*) from raw_events \
+              where {} and created_at >= to_timestamp($1::double precision) \
+              group by event_type order by event_type",
+            Self::PENDING_PROJECTION_WHERE
+        );
+        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+            .bind(since as f64)
+            .fetch_all(&self.pool)
+            .await
+            .context("pending projection since")?;
+        Ok(rows)
+    }
+
+    /// How many rows ingested inside the window the projection loop will NOT pick
+    /// up. This is the variant the observer calls: an undecodable row can come
+    /// from any contract, and scoping it by address would mean "count some of
+    /// them".
+    pub async fn count_undecodable_since(&self, since: i64) -> anyhow::Result<i64> {
+        let sql = format!(
+            "select count(*) from raw_events \
+              where {} and created_at >= to_timestamp($1::double precision)",
+            Self::UNDECODABLE_WHERE
+        );
+        let count: i64 = sqlx::query_scalar(&sql)
+            .bind(since as f64)
+            .fetch_one(&self.pool)
+            .await
+            .context("count undecodable since")?;
+        Ok(count)
+    }
+
+    /// The addresses among `scope` carrying such a row inside the window. Exists
+    /// for exactly what `inference_wedged_book_addresses` exists for: a test has
+    /// to assert WHICH rows the predicate selected, and a whole-table count can
+    /// only report a delta — which, in the shared test DB, breaks on an unrelated
+    /// writer (`capture.rs` inserts an undecodable row and then purges it, moving
+    /// two successive reads by different amounts).
+    ///
+    /// `distinct` is required, and not as decoration. The analogy with
+    /// `inference_wedged_book_addresses` only half holds: that one selects from
+    /// `inference_markets`, where the address is unique and the result is a set by
+    /// construction, whereas `raw_events` yields a row per EVENT. Without
+    /// `distinct` this would return a bag, and a second undecodable event under
+    /// the same address would break an `assert_eq!` for a reason that has nothing
+    /// to do with the window.
+    pub async fn undecodable_addresses_since(
+        &self,
+        since: i64,
+        scope: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let sql = format!(
+            "select distinct src_address from raw_events \
+              where {} and created_at >= to_timestamp($1::double precision) \
+                and src_address = any($2) \
+              order by src_address",
+            Self::UNDECODABLE_WHERE
+        );
+        let addrs: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(since as f64)
+            .bind(scope)
+            .fetch_all(&self.pool)
+            .await
+            .context("undecodable addresses since")?;
+        Ok(addrs)
+    }
+
+    /// Books that had at least one `raw_events` row under their address inside the
+    /// run window. This is IX-SEQ-10's "book with events", narrowed to the current
+    /// run: the stand's database outlives pipelines, and a book abandoned by a
+    /// cancelled run would otherwise fail the next one for a foreign reason.
+    pub async fn inference_books_with_events_since(
+        &self,
+        since: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let sql = format!(
+            "select m.orderbook_address from inference_markets m \
+              where m.orderbook_address in ({}) \
+              order by m.orderbook_address",
+            Self::EVENTS_IN_WINDOW
+        );
+        let addrs: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(since as f64)
+            .fetch_all(&self.pool)
+            .await
+            .context("inference books with events since")?;
+        Ok(addrs)
+    }
+
+    /// The addresses among `scope` carrying no verdict. The scope is mandatory:
+    /// the observer feeds this the current run's books, and a whole-table variant
+    /// would mean "fail the run over someone else's leftovers".
+    pub async fn inference_books_without_verdict(
+        &self,
+        scope: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        let sql = format!(
+            "select m.orderbook_address from inference_markets m \
+              where m.orderbook_address = any($1) and {} \
+              order by m.orderbook_address",
+            Self::NO_VERDICT_WHERE
+        );
+        let addrs: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(scope)
+            .fetch_all(&self.pool)
+            .await
+            .context("inference books without verdict")?;
+        Ok(addrs)
+    }
+
+    /// `(address, reason)` for the failing books among `scope`. The observer
+    /// prints these even when it passes: `NoBoc` is a benign outcome that also
+    /// stamps a failure, and without the distribution of reasons "failing with a
+    /// reason" reads stricter than it actually is.
+    pub async fn inference_failing_books(
+        &self,
+        scope: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"select m.orderbook_address, m.last_reconcile_error
+                 from inference_markets m
+                where m.orderbook_address = any($1)
+                  and m.last_reconcile_failed_at is not null
+                  and m.last_reconcile_error is not null
+                  and m.superseded_at is null
+                order by m.orderbook_address"#,
+        )
+        .bind(scope)
+        .fetch_all(&self.pool)
+        .await
+        .context("inference failing books")?;
+        Ok(rows)
+    }
+
+    /// Visible books carrying at least one projected order AND at least one event
+    /// ingested inside the run window — IX-SEQ-11's positive anchor. It does NOT
+    /// prove the book is the one a particular scenario deployed (scenario
+    /// addresses are recorded nowhere a database-tail step could read them), and
+    /// it does not prove the order itself was projected during this run.
+    pub async fn inference_anchored_books_since(
+        &self,
+        since: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let sql = format!(
+            "select distinct m.orderbook_address \
+               from inference_markets m \
+               join inference_orders o on o.orderbook_address = m.orderbook_address \
+              where m.last_reconciled_at is not null \
+                and m.superseded_at is null \
+                and m.orderbook_address in ({}) \
+              order by m.orderbook_address",
+            Self::EVENTS_IN_WINDOW
+        );
+        let addrs: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(since as f64)
+            .fetch_all(&self.pool)
+            .await
+            .context("inference anchored books since")?;
         Ok(addrs)
     }
 

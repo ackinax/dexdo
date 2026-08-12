@@ -40,6 +40,20 @@ test-group = 'serial-capture-cursor'
 filter = 'binary(inference_reconciler)'
 test-group = 'serial-inference-reconciler'
 
+# `observer_queries` holds globally visible pending `raw_events` rows for the
+# duration of its window test — without them there is nothing to test the window
+# with. `reprojection` is the only binary in this crate that calls
+# `reproject_pending` WITHOUT `chain_order` bounds, i.e. it drains everything it
+# can see. Run in parallel it would not merely move somebody's counter: it would
+# project and mark processed the rows `observer_queries` seeded
+# (`InferenceOrderBook.ObsWindowProbe` goes to `Unknown`), and the window test
+# would fail having said nothing about the window. Skipping when two snapshots
+# disagree — the trick used by `projection_lag_seconds_*` — therefore does not
+# apply here: only a reader has nothing to lose, and this test writes.
+[[profile.default.overrides]]
+filter = 'binary(observer_queries)'
+test-group = 'serial-reprojection'
+
 [test-groups]
 serial-reprojection = { max-threads = 1 }
 serial-capture-cursor = { max-threads = 1 }
