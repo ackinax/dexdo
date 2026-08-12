@@ -259,7 +259,9 @@ indexer only:
 
 - `indexer.dapp_id` (optional): when set, scopes ingestion to the DEXDO dapp
   whose `src_dapp_id` matches — foreign chain events are dropped before decode.
-  Edges with no `src_dapp_id` are kept. Omit the key (or leave it commented) to
+  Edges with no `src_dapp_id` are kept, and so are self-rooted edges (`src_dapp_id`
+  equal to the edge's own `src`): that is how a contract deployed by an external
+  message is reported, and the entire inference settlement path looks that way. Omit the key (or leave it commented) to
   disable scoping. An empty string is rejected at startup — it would otherwise
   deserialize to `Some("")` and drop every edge with a real `src_dapp_id`.
 - `indexer.ignored_event_types` may list only known droppable no-op types

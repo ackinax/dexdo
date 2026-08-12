@@ -58,15 +58,31 @@ Two filters run against the raw message edge — before any ABI decode — and d
 
 #### Scope filter: `indexer.dapp_id`
 
-`indexer.dapp_id` (optional string; omit or leave unset to disable) scopes ingestion to one DEXDO application. When set, only edges whose `src_dapp_id` matches the configured value are kept; edges with no `src_dapp_id` field are also kept (so a gateway that omits the field does not silently drop everything); edges with a mismatching `src_dapp_id` are dropped before decode. When unset (the local default), the filter is inert and every edge is processed. Each per-tick log line includes a `foreign_skipped` count of edges dropped by this filter, and any nonzero `foreign_skipped` emits a `warn!` with the tick drop rate because a correctly scoped single-dapp deployment should see effectively no foreign traffic.
+`indexer.dapp_id` (optional string; omit or leave unset to disable) scopes ingestion to one DEXDO application. When set, an edge is kept when its `src_dapp_id` matches the configured value, when it is **self-rooted** (`src_dapp_id` equal to its own `src` — see [Self-rooted edges](#self-rooted-edges-are-in-scope)), or when it carries no `src_dapp_id`; edges with no `src_dapp_id` field are also kept (so a gateway that omits the field does not silently drop everything); edges with a mismatching `src_dapp_id` are dropped before decode. When unset (the local default), the filter is inert and every edge is processed. Each per-tick log line includes a `foreign_skipped` count of edges dropped by this filter, and any nonzero `foreign_skipped` emits a `warn!` with the tick drop rate because a correctly scoped single-dapp deployment should see effectively no foreign traffic.
 
 Setting `dapp_id` to an empty string is rejected at startup by `IndexerConfig::validate` (it would otherwise deserialize to `Some("")` and treat every edge with a real `src_dapp_id` as foreign); omit the key to disable scoping.
+
+#### Self-rooted edges are in scope
+
+An `airegistry` `TokenContract` is deployed by an external message, so the gateway
+reports its `src_dapp_id` as the contract's own account id — never the configured
+`dapp_id`. A strict equality check would drop the entire settlement path
+(`inference_deals`, `inference_ticks`) before the `raw_events` insert, which is
+outside the recovery boundary: neither a replay nor a reprojection can bring back an
+edge that was never stored. `edge_in_scope` therefore keeps an edge whose
+`src_dapp_id` equals its own `src`.
+
+This admits a *foreign* self-rooted contract as well — self-rootedness says how a
+contract was deployed, not who owns it. That edge is stored and then dropped by the
+decoder, since none of its events are in a loaded ABI, so the cost is one stored row
+against the alternative of losing settlement entirely. A foreign edge that is neither
+in our dapp nor self-rooted is still dropped at ingest.
 
 #### No-op filter: `indexer.ignored_event_types`
 
 `indexer.ignored_event_types` accepts a list of event-type names (e.g. `"OrderBook.Queued"`). An edge whose external `dst` matches a configured entry is dropped before decode. The `dst` of an external event is `makeAddrExtern(EVENT_ID, 256)`, rendered as `:` followed by 64 lowercase hex digits; because the width is fixed, each `EVENT_ID` yields one stable `dst` string that acts as a 1:1 discriminator of event type — readable from the message header before the body is decoded. See [dex-events-routing.md](../contract-specs/dex-events-routing.md) for the full `dst` derivation and per-event values.
 
-Matching is by `dst` alone — it is not namespaced by contract or dapp — so a foreign contract that emits an event with the same `EVENT_ID` produces the same `dst` and is dropped too (no `raw_events` row). This is intentional: only DEXDO events are of interest, and our own non-no-op events use distinct EVENT_IDs outside the no-op set, so a wanted event is never dropped by this filter. To confine dropping to your own contracts, pair it with the `indexer.dapp_id` scope filter, which runs first.
+Matching is by `dst` alone — it is not namespaced by contract or dapp — so a foreign contract that emits an event with the same `EVENT_ID` produces the same `dst` and is dropped too (no `raw_events` row). This is intentional: only DEXDO events are of interest, and our own non-no-op events use distinct EVENT_IDs outside the no-op set, so a wanted event is never dropped by this filter. To confine dropping to your own contracts, pair it with the `indexer.dapp_id` scope filter, which runs first (note that it no longer confines this in one case: a self-rooted foreign contract passes the scope filter, so its events reach the decoder and are dropped there instead).
 
 Each per-tick log line includes a `type_ignored` count of edges dropped by this filter. A high `type_ignored` rate is not warned by itself because this filter is deliberately used to shed observability-only floods such as `OrderBook.Queued`.
 
@@ -80,7 +96,7 @@ Intended use: shed confirmed observability-only floods (e.g. `OrderBook.Queued`,
 
 ### Ingestion sequence per edge
 
-1. If `indexer.dapp_id` is set and the edge's `src_dapp_id` does not match (and is not absent), drop the edge. The page cursor still advances (step 4). `foreign_skipped` is incremented.
+1. If `indexer.dapp_id` is set, drop the edge unless one of three holds: its `src_dapp_id` matches, it is self-rooted (`src_dapp_id == src`), or it has no `src_dapp_id`. The page cursor still advances (step 4). `foreign_skipped` is incremented.
 2. If the edge's `dst` matches a configured `indexer.ignored_event_types` entry, drop the edge. The page cursor still advances (step 4). `type_ignored` is incremented.
 3. Try to decode the message body against the ABI bundle (`crates/infrastructure/src/decoder.rs`). The decoder is **route-aware**: when an event id is ambiguous it resolves `event_type` by the message's `dst` address (the external `makeAddrExtern(EVENT_ID, 256)` in the message header) rather than a flat event-name scan. **One loaded pair does collide, by construction:** `RootModel.ContractDeployed(address self)` and `TokenContract.ContractDeployed(address self)` are byte-identical in their ABIs, so they share a body id and only `dst` tells them apart (`ContractDeployedEmit` = 703 for the root model, `DealDeployedEmit` = 732 for a deal). Both routes are pinned and both are mandatory: with `RootModel` unloaded the id looked unique and every root-model deploy decoded as a deal deploy, seeding a phantom [`inference_deals`](data-schema.md#inference_deals) row keyed on the root model's address — silently, because `indexer_decode_ambiguous_collisions` only fires when two *loaded* ABIs collide. The `InferenceOrderBook` events, by contrast, carry an `Inference` prefix, so `InferenceOrderBook.InferenceOrderCancelled` no longer shares an event id with `OrderBook.OrderCancelled`; the two `OrderCancelled` dsts stay pinned defensively to keep the path exercised. The id index tolerates collisions (one id may map to several `(contract, event)` entries) and reports an unrouted collision as ambiguous rather than guessing the first ABI. Each route records the event's expected id, so a decoded body whose own id does not match its route is left undecoded with a warning rather than mis-attributed. `RootModel` is loaded for disambiguation only — neither of its two events is projected; both carry explicit no-op arms so they cannot fall through to `Unknown`, which would mark them processed and lose them forever. On success, store the decoded JSON payload alongside `event_type`.
 4. Persist the row in `raw_events` with `processed_at = NULL`. The unique `msg_id` constraint deduplicates overlapping page fetches.

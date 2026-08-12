@@ -250,9 +250,23 @@ struct FilterStats {
 /// Whether an event edge belongs to the configured DEXDO dapp. Edges with no
 /// `src_dapp_id` are kept (treated as in-scope) so a gateway that omits the
 /// field never costs us our own events.
+///
+/// A **self-rooted** edge is kept too, and that is the whole settlement path: a
+/// `TokenContract` is deployed by an external message, so the gateway reports its
+/// `src_dapp_id` as its own account id — which can never equal the configured
+/// `dapp_id`. Comparing strictly would drop every `inference_deals` /
+/// `inference_ticks` event BEFORE the `raw_events` insert, i.e. outside the
+/// recovery boundary: no replay and no reprojection brings it back.
+///
+/// The rule admits a foreign self-rooted contract too, and that is a deliberate
+/// trade rather than an oversight: self-rootedness is a property of how a contract
+/// was deployed, not of who owns it. Such an edge reaches `raw_events` and is then
+/// dropped by the decoder — none of its events are in any loaded ABI — so the cost
+/// is a stored row, against the alternative cost of losing settlement entirely.
 fn edge_in_scope(edge: &EventEdge, dapp_id: &str) -> bool {
     match edge.node.src_dapp_id.as_deref() {
-        Some(d) => d == dapp_id,
+        Some(d) if d == dapp_id => true,
+        Some(d) => Some(d) == edge.node.src.as_deref(),
         None => true,
     }
 }
@@ -385,6 +399,35 @@ mod tests {
     use dodex_infrastructure::graphql::EventNode;
 
     use super::*;
+
+    #[test]
+    fn a_self_rooted_settlement_edge_survives_the_dapp_filter() {
+        // TokenContract разворачивается внешним сообщением, поэтому его
+        // `src_dapp_id` равен его же адресу и НИКОГДА не совпадёт с настроенным
+        // dapp_id. Строгое сравнение выбрасывает весь сеттлемент до raw_events —
+        // вне границы восстановления: реплей его не вернёт.
+        let edge = edge_with_all(Some("0:deadbeef"), Some("0:deadbeef"), None);
+        assert!(edge_in_scope(&edge, "0:our_dapp"), "self-rooted edge обязан оставаться в скоупе");
+    }
+
+    #[test]
+    fn a_foreign_non_self_rooted_edge_is_still_dropped() {
+        let edge = edge_with_all(Some("0:their_contract"), Some("0:someone_else"), None);
+        assert!(!edge_in_scope(&edge, "0:our_dapp"), "чужой edge обязан отбрасываться");
+    }
+
+    #[test]
+    fn a_foreign_self_rooted_edge_is_admitted_and_that_is_the_trade() {
+        // ЭТО ЦЕНА ПОСЛАБЛЕНИЯ, и тест существует, чтобы она была записана, а не
+        // обнаружена потом. `src_dapp_id == src` не отличает наш self-rooted
+        // контракт от чужого: признак — способ развёртывания, а не принадлежность.
+        // Такой edge дойдёт до `raw_events` и будет отброшен уже декодером (его
+        // событий нет ни в одном загруженном ABI) — то есть ценой лишней строки,
+        // а не неверной read-модели. Обратный размен — потеря всего сеттлемента —
+        // хуже на порядок.
+        let edge = edge_with_all(Some("0:foreign_self_rooted"), Some("0:foreign_self_rooted"), None);
+        assert!(edge_in_scope(&edge, "0:our_dapp"));
+    }
 
     fn edge_with(src_dapp_id: Option<&str>, dst: Option<&str>) -> EventEdge {
         edge_with_all(None, src_dapp_id, dst)
