@@ -403,6 +403,48 @@ fn event_address_roundtrips_through_try_from() {
 
 // ── Event payload decoders (field names vs ABI event inputs) ───────────────
 
+/// Имена всех событий ABI.
+fn abi_event_names(abi: &str) -> BTreeSet<String> {
+    let v: Value = serde_json::from_str(abi).expect("abi json");
+    let events = v["events"].as_array().expect("abi.events array");
+    // Пустой массив сделал бы любое утверждение о нём верным всегда — так гард
+    // слепнет от переименования ключа.
+    assert!(!events.is_empty(), "events пуст — ключ ABI изменился");
+    events.iter().map(|e| e["name"].as_str().expect("event name").to_string()).collect()
+}
+
+#[test]
+fn inference_order_book_enum_covers_every_abi_event() {
+    use super::inference_order_book_events::InferenceOrderBookEvent as E;
+    let declared: BTreeSet<String> = E::ALL
+        .iter()
+        .map(|v| {
+            let n = format!("{v:?}");
+            if n.starts_with("Inference") { n } else { format!("Inference{n}") }
+        })
+        .collect();
+    let in_abi = abi_event_names(INFERENCE_ORDER_BOOK_ABI);
+    assert_eq!(
+        declared, in_abi,
+        "лишние в enum: {:?}; отсутствующие: {:?}",
+        declared.difference(&in_abi).collect::<Vec<_>>(),
+        in_abi.difference(&declared).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn token_contract_enum_covers_every_abi_event() {
+    use super::token_contract_events::TokenContractEvent as E;
+    let declared: BTreeSet<String> = E::ALL.iter().map(|v| format!("{v:?}")).collect();
+    let in_abi = abi_event_names(TOKEN_CONTRACT_ABI);
+    assert_eq!(
+        declared, in_abi,
+        "лишние в enum: {:?}; отсутствующие: {:?}",
+        declared.difference(&in_abi).collect::<Vec<_>>(),
+        in_abi.difference(&declared).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn event_payloads_decode_abi_shape() {
     use super::inference_order_book_events as iob;
@@ -432,6 +474,11 @@ fn event_payloads_decode_abi_shape() {
         INFERENCE_ORDER_BOOK_ABI,
         "InferenceOrderCancelRejected"
     );
+    decodes!(iob::OrderExpiredData, INFERENCE_ORDER_BOOK_ABI, "InferenceOrderExpired");
+    decodes!(iob::OrderRejectedData, INFERENCE_ORDER_BOOK_ABI, "InferenceOrderRejected");
+    decodes!(tc::TicksClaimedData, TOKEN_CONTRACT_ABI, "TicksClaimed");
+    decodes!(tc::EndpointSetData, TOKEN_CONTRACT_ABI, "EndpointSet");
+    decodes!(tc::BuyerBondFundedData, TOKEN_CONTRACT_ABI, "BuyerBondFunded");
 
     // TokenContract (700-range streaming).
     decodes!(tc::StreamFundedData, TOKEN_CONTRACT_ABI, "StreamFunded");

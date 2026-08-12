@@ -30,6 +30,9 @@ pub enum TokenContractEvent {
     DisputeResolved = 725,
     SellerBondFunded = 727,
     ProbeAccepted = 728,
+    TicksClaimed = 730,
+    EndpointSet = 731,
+    BuyerBondFunded = 733,
     ProbeBurned = 729,
     /// Деплой СДЕЛКИ, `DealDeployedEmit` (732). Не `ContractDeployedEmit` (703):
     /// та константа принадлежит `RootModel`, и обе стороны объявляют побайтово
@@ -53,6 +56,9 @@ impl TokenContractEvent {
         Self::DisputeResolved,
         Self::SellerBondFunded,
         Self::ProbeAccepted,
+        Self::TicksClaimed,
+        Self::EndpointSet,
+        Self::BuyerBondFunded,
         Self::ProbeBurned,
         Self::ContractDeployed,
     ];
@@ -83,6 +89,9 @@ impl TryFrom<String> for TokenContractEvent {
             725 => Ok(TokenContractEvent::DisputeResolved),
             727 => Ok(TokenContractEvent::SellerBondFunded),
             728 => Ok(TokenContractEvent::ProbeAccepted),
+            730 => Ok(TokenContractEvent::TicksClaimed),
+            731 => Ok(TokenContractEvent::EndpointSet),
+            733 => Ok(TokenContractEvent::BuyerBondFunded),
             729 => Ok(TokenContractEvent::ProbeBurned),
             _ => Err(KitError::new(
                 KitModule::Event,
@@ -112,6 +121,9 @@ pub enum DecodedTokenContractEvent {
     SellerBondFunded { event: Event, kind: TokenContractEvent, data: SellerBondFundedData },
     StreamOpened { event: Event, kind: TokenContractEvent, data: StreamOpenedData },
     ProbeAccepted { event: Event, kind: TokenContractEvent, data: ProbeAcceptedData },
+    TicksClaimed { event: Event, kind: TokenContractEvent, data: TicksClaimedData },
+    EndpointSet { event: Event, kind: TokenContractEvent, data: EndpointSetData },
+    BuyerBondFunded { event: Event, kind: TokenContractEvent, data: BuyerBondFundedData },
     ProbeBurned { event: Event, kind: TokenContractEvent, data: ProbeBurnedData },
     TickFinalized { event: Event, kind: TokenContractEvent, data: TickFinalizedData },
     StreamStopped { event: Event, kind: TokenContractEvent, data: StreamStoppedData },
@@ -144,6 +156,18 @@ impl FromEvent for DecodedTokenContractEvent {
             TokenContractEvent::ProbeAccepted => {
                 let data = decode_or_err::<ProbeAcceptedData>(event, contract)?;
                 Ok(DecodedTokenContractEvent::ProbeAccepted { event: event.clone(), kind, data })
+            }
+            TokenContractEvent::TicksClaimed => {
+                let data = decode_or_err::<TicksClaimedData>(event, contract)?;
+                Ok(DecodedTokenContractEvent::TicksClaimed { event: event.clone(), kind, data })
+            }
+            TokenContractEvent::EndpointSet => {
+                let data = decode_or_err::<EndpointSetData>(event, contract)?;
+                Ok(DecodedTokenContractEvent::EndpointSet { event: event.clone(), kind, data })
+            }
+            TokenContractEvent::BuyerBondFunded => {
+                let data = decode_or_err::<BuyerBondFundedData>(event, contract)?;
+                Ok(DecodedTokenContractEvent::BuyerBondFunded { event: event.clone(), kind, data })
             }
             TokenContractEvent::ProbeBurned => {
                 let data = decode_or_err::<ProbeBurnedData>(event, contract)?;
@@ -197,6 +221,7 @@ where
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::ContractDeployed`.
 pub struct ContractDeployedData {
     #[serde(rename = "self")]
@@ -205,6 +230,7 @@ pub struct ContractDeployedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::StreamFunded`.
 pub struct StreamFundedData {
     pub buyer: String,
@@ -214,6 +240,7 @@ pub struct StreamFundedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::SellerBondFunded`.
 pub struct SellerBondFundedData {
     #[serde(deserialize_with = "deserialize_u128")]
@@ -222,6 +249,7 @@ pub struct SellerBondFundedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::StreamOpened`.
 pub struct StreamOpenedData {
     pub buyer: String,
@@ -231,6 +259,7 @@ pub struct StreamOpenedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::ProbeAccepted`.
 pub struct ProbeAcceptedData {
     pub buyer: String,
@@ -242,6 +271,7 @@ pub struct ProbeAcceptedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::ProbeBurned`.
 pub struct ProbeBurnedData {
     pub buyer: String,
@@ -255,6 +285,7 @@ pub struct ProbeBurnedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::TickFinalized`.
 pub struct TickFinalizedData {
     #[serde(deserialize_with = "deserialize_u128")]
@@ -265,6 +296,7 @@ pub struct TickFinalizedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::StreamStopped`.
 pub struct StreamStoppedData {
     pub buyer: String,
@@ -276,6 +308,7 @@ pub struct StreamStoppedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::StreamDisputed`.
 pub struct StreamDisputedData {
     pub buyer: String,
@@ -285,6 +318,7 @@ pub struct StreamDisputedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::DisputeResolved`.
 pub struct DisputeResolvedData {
     #[serde(deserialize_with = "deserialize_u128")]
@@ -296,6 +330,7 @@ pub struct DisputeResolvedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::ShellWithdrawn`.
 pub struct ShellWithdrawnData {
     pub recipient: String,
@@ -305,8 +340,38 @@ pub struct ShellWithdrawnData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::ContractDestroyed`.
 pub struct ContractDestroyedData {
     #[serde(rename = "self")]
     pub self_address: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
+/// Payload of `TokenContractEvent::TicksClaimed`.
+pub struct TicksClaimedData {
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub trusted: u128,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub claimed: u128,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
+/// Payload of `TokenContractEvent::EndpointSet`.
+pub struct EndpointSetData {
+    /// ABI-тип `bytes` — приезжает hex-строкой, конвертировать нечего.
+    pub endpoint_cipher: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
+/// Payload of `TokenContractEvent::BuyerBondFunded`.
+pub struct BuyerBondFundedData {
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub amount: u128,
 }

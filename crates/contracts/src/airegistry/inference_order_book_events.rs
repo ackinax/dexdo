@@ -31,6 +31,8 @@ pub enum InferenceOrderBookEvent {
     // `modifiers.sol`, but the contract no longer declares or emits the matching
     // events, so there is nothing to decode into.
     InferenceOrderBookDeployed = 1008,
+    OrderExpired = 1010,
+    OrderRejected = 1011,
     OrderCancelRejected = 1009,
 }
 
@@ -45,6 +47,8 @@ impl InferenceOrderBookEvent {
         Self::Filled,
         Self::Executed,
         Self::InferenceOrderBookDeployed,
+        Self::OrderExpired,
+        Self::OrderRejected,
         Self::OrderCancelRejected,
     ];
 }
@@ -69,6 +73,8 @@ impl TryFrom<String> for InferenceOrderBookEvent {
             1003 => Ok(InferenceOrderBookEvent::Filled),
             1004 => Ok(InferenceOrderBookEvent::Executed),
             1008 => Ok(InferenceOrderBookEvent::InferenceOrderBookDeployed),
+            1010 => Ok(InferenceOrderBookEvent::OrderExpired),
+            1011 => Ok(InferenceOrderBookEvent::OrderRejected),
             1009 => Ok(InferenceOrderBookEvent::OrderCancelRejected),
             _ => Err(KitError::new(
                 KitModule::Event,
@@ -123,6 +129,16 @@ pub enum DecodedInferenceOrderBookEvent {
         kind: InferenceOrderBookEvent,
         data: OrderBookDeployedData,
     },
+    OrderExpired {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: OrderExpiredData,
+    },
+    OrderRejected {
+        event: Event,
+        kind: InferenceOrderBookEvent,
+        data: OrderRejectedData,
+    },
     OrderCancelRejected {
         event: Event,
         kind: InferenceOrderBookEvent,
@@ -166,6 +182,22 @@ impl FromEvent for DecodedInferenceOrderBookEvent {
                     data,
                 })
             }
+            InferenceOrderBookEvent::OrderExpired => {
+                let data = decode_or_err::<OrderExpiredData>(event, contract)?;
+                Ok(DecodedInferenceOrderBookEvent::OrderExpired {
+                    event: event.clone(),
+                    kind,
+                    data,
+                })
+            }
+            InferenceOrderBookEvent::OrderRejected => {
+                let data = decode_or_err::<OrderRejectedData>(event, contract)?;
+                Ok(DecodedInferenceOrderBookEvent::OrderRejected {
+                    event: event.clone(),
+                    kind,
+                    data,
+                })
+            }
             InferenceOrderBookEvent::OrderCancelRejected => {
                 let data = decode_or_err::<OrderCancelRejectedData>(event, contract)?;
                 Ok(DecodedInferenceOrderBookEvent::OrderCancelRejected {
@@ -194,6 +226,7 @@ where
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::InferenceOrderBookDeployed`.
 pub struct OrderBookDeployedData {
     /// Deployer note address; not stored as model identity.
@@ -206,6 +239,7 @@ pub struct OrderBookDeployedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::OrderPlaced`.
 pub struct OrderPlacedData {
     #[serde(deserialize_with = "deserialize_u128")]
@@ -229,6 +263,7 @@ pub struct OrderPlacedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::OrderCancelled`.
 pub struct OrderCancelledData {
     #[serde(deserialize_with = "deserialize_u128")]
@@ -240,8 +275,14 @@ pub struct OrderCancelledData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::Refunded`.
 pub struct RefundedData {
+    /// Ордер, которого касается возврат. Приехал с v4.0.33 и до волны 0 не читался
+    /// ничем: без него рефанд нельзя привязать к строке, и continuation-истечение —
+    /// единственный путь, где других событий не бывает, — не закрывало ордер вовсе.
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub order_id: u128,
     pub note: String,
     #[serde(deserialize_with = "deserialize_u128")]
     pub amount: u128,
@@ -249,6 +290,7 @@ pub struct RefundedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::Filled`.
 pub struct FilledData {
     #[serde(deserialize_with = "deserialize_u128")]
@@ -269,6 +311,7 @@ pub struct FilledData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::Executed`.
 pub struct ExecutedData {
     #[serde(deserialize_with = "deserialize_u128")]
@@ -281,6 +324,7 @@ pub struct ExecutedData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::OrderCancelRejected`. Emitted by
 /// `_doCancel` so a cancel that changes nothing still has an owner-observable
 /// outcome: `reason` is 0 when no such order rests on the book (already filled
@@ -291,4 +335,29 @@ pub struct OrderCancelRejectedData {
     #[serde(deserialize_with = "deserialize_u8")]
     pub reason: u8,
     pub note: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
+/// Payload of `InferenceOrderBookEvent::OrderExpired`.
+pub struct OrderExpiredData {
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub order_id: u128,
+    pub is_buy: bool,
+    pub note: String,
+    pub token_contract: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
+/// Payload of `InferenceOrderBookEvent::OrderRejected`.
+pub struct OrderRejectedData {
+    #[serde(deserialize_with = "deserialize_u8")]
+    pub reason: u8,
+    pub note: String,
+    pub token_contract: String,
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub refund: u128,
 }
