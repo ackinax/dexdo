@@ -425,7 +425,8 @@ mod tests {
         // событий нет ни в одном загруженном ABI) — то есть ценой лишней строки,
         // а не неверной read-модели. Обратный размен — потеря всего сеттлемента —
         // хуже на порядок.
-        let edge = edge_with_all(Some("0:foreign_self_rooted"), Some("0:foreign_self_rooted"), None);
+        let edge =
+            edge_with_all(Some("0:foreign_self_rooted"), Some("0:foreign_self_rooted"), None);
         assert!(edge_in_scope(&edge, "0:our_dapp"));
     }
 

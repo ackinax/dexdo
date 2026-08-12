@@ -267,6 +267,41 @@ arm, and this table is the record of why.
 | `RootPN.DealWriteOffReported` | Reporting event; no read-model column corresponds to it. |
 | `RootModel.ContractDeployed` / `TokenContractRegistered` | The `RootModel` ABI is loaded **only** to disambiguate the `ContractDeployed` id collision by `dst` (see [Ingestion](#ingestion-sequence-per-edge)); neither event feeds the read model. `ContractDeployed` in particular must write nothing: attributing it to a deal is exactly the bug the route fixes. |
 
+## Payload-shape guard
+
+Four assertions tie the code to the contract sources. None is a hand-maintained
+list, and the fourth is not a test at all:
+
+| Guard | Source of truth | Where |
+|---|---|---|
+| Event ids of the typed enums | `modifiers.sol`, via the emit sites | `airegistry_event_manifest.rs` |
+| Enum variants == ABI events | `contracts/**/*.abi.json` | `crates/contracts/src/airegistry/tests.rs` |
+| DTO fields == ABI inputs, both ways | same, via `deny_unknown_fields` | same |
+| Routed set covers every in-scope event | same | `routed_events_manifest.rs` |
+
+The projectors route on the typed enum variant rather than a string literal, so an
+arm naming an event the ABI does not declare is not expressible — the variant would
+have to exist, and the second guard forbids that. They read payloads by destructuring
+the DTOs exhaustively, so a field that arrives and is consumed by nobody is a compile
+error rather than a silent loss. A field deliberately unused is bound to `_` with the
+reason next to it. A round-trip test walks every declared variant through
+`Display` → `TryFrom`, because that conversion matches on the numeric id with a
+catch-all `_` arm: adding a variant does not break it, and without the arm the
+variant's decoder path is dead on arrival.
+
+**One conversion stays outside the DTOs on purpose.** `uint256` values arrive as
+`"0x"` + 64 hex; the DTO holds the raw ABI string and the projector converts via
+`uint256_maybe_hex`. Four fields are affected — `InferenceFilled.clearingPrice`,
+`InferenceOrderPlaced.price`, `RangeEventAdded.eventId` and `.bounds`. Fixtures that
+use decimal strings cannot tell a correct conversion from a missing one, so the
+affected projectors carry hex-payload tests.
+
+`deny_unknown_fields` is `cfg(test)`-gated. It makes the guard two-way while leaving
+production lenient: a field added by a contract upgrade would otherwise fail the
+projection, leave the row pending forever, and from there wedge the phantom sweep and
+fail-close the read gate for that book. Contract drift must go red in CI, not in the
+market.
+
 ## Reconciliation
 
 Three reconcilers (market, OracleEventList, inference) fill metadata that the event stream alone does not carry. All run on a fixed cadence (configured under `indexer:` in `config/indexer.<env>.yaml`) and share a failure-backoff pattern (`last_reconcile_failed_at`, `reconcile_attempts` on the parent row) so a permanently broken contract cannot starve the queue. The inference reconciler additionally exposes three cadence knobs (`inference_reference_price_refresh_ms`, `inference_sweep_interval_ms`, `inference_orphan_cutoff_ms`) beyond its base interval; see [Inference reconciler](#inference-reconciler) for the full table.

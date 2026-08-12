@@ -3,6 +3,7 @@
 
 use anyhow::anyhow;
 use anyhow::Context;
+use dodex_contracts::dex::oracle_event_list_events::RangeEventAddedData;
 use num_bigint::BigUint;
 use serde_json::Value;
 use sqlx::Postgres;
@@ -10,8 +11,6 @@ use sqlx::Transaction;
 use tracing::debug;
 use tracing::error;
 use tracing::warn;
-
-use dodex_contracts::dex::oracle_event_list_events::RangeEventAddedData;
 
 use crate::decoder::DecodedEvent;
 use crate::graphql::EventNode;
@@ -356,9 +355,8 @@ async fn apply_range_event_added(
     let eventlist_address =
         node.src.as_deref().context("RangeEventAdded: src missing on event message")?;
     // Исчерпывающая деструктуризация: каждое поле ABI обязано быть названо.
-    let RangeEventAddedData { event_id, ob, bounds } =
-        serde_json::from_value(event.value.clone())
-            .context("RangeEventAdded: payload не разбирается по ABI")?;
+    let RangeEventAddedData { event_id, ob, bounds } = serde_json::from_value(event.value.clone())
+        .context("RangeEventAdded: payload не разбирается по ABI")?;
     // `eventId` и `bounds` — uint256 и uint256[]; DTO держит СЫРЫЕ значения ABI
     // ("0x"+64 hex), поэтому конверсия остаётся здесь. Хранимая форма — то, что
     // отдаёт API: десятичные строки.

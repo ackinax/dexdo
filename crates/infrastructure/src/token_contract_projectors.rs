@@ -10,14 +10,13 @@
 // buyerNote together).
 
 use anyhow::Context;
-use sqlx::Postgres;
-use sqlx::Transaction;
-
 use dodex_contracts::airegistry::token_contract_events::StreamFundedData;
 use dodex_contracts::airegistry::token_contract_events::StreamOpenedData;
 use dodex_contracts::airegistry::token_contract_events::TickFinalizedData;
 use dodex_contracts::airegistry::token_contract_events::TicksClaimedData;
 use dodex_contracts::airegistry::token_contract_events::TokenContractEvent;
+use sqlx::Postgres;
+use sqlx::Transaction;
 
 use crate::decoder::DecodedEvent;
 use crate::graphql::EventNode;
@@ -63,7 +62,10 @@ pub async fn project_token_contract_event(
         // the bond two-sided — and belongs here for the same reason. `EndpointSet`
         // carries the buyer's endpoint as ciphertext only the two parties can read, so
         // there is nothing in it a read model could serve.
-        E::SellerBondFunded | E::BuyerBondFunded | E::ProbeAccepted | E::ShellWithdrawn
+        E::SellerBondFunded
+        | E::BuyerBondFunded
+        | E::ProbeAccepted
+        | E::ShellWithdrawn
         | E::EndpointSet => Ok(ProjectionOutcome::Applied),
     }
 }

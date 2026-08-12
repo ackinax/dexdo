@@ -430,12 +430,17 @@ fn inference_order_book_enum_covers_every_abi_event() {
         .iter()
         .map(|v| {
             let n = format!("{v:?}");
-            if n.starts_with("Inference") { n } else { format!("Inference{n}") }
+            if n.starts_with("Inference") {
+                n
+            } else {
+                format!("Inference{n}")
+            }
         })
         .collect();
     let in_abi = abi_event_names(INFERENCE_ORDER_BOOK_ABI);
     assert_eq!(
-        declared, in_abi,
+        declared,
+        in_abi,
         "лишние в enum: {:?}; отсутствующие: {:?}",
         declared.difference(&in_abi).collect::<Vec<_>>(),
         in_abi.difference(&declared).collect::<Vec<_>>()
@@ -448,7 +453,8 @@ fn token_contract_enum_covers_every_abi_event() {
     let declared: BTreeSet<String> = E::ALL.iter().map(|v| format!("{v:?}")).collect();
     let in_abi = abi_event_names(TOKEN_CONTRACT_ABI);
     assert_eq!(
-        declared, in_abi,
+        declared,
+        in_abi,
         "лишние в enum: {:?}; отсутствующие: {:?}",
         declared.difference(&in_abi).collect::<Vec<_>>(),
         in_abi.difference(&declared).collect::<Vec<_>>()

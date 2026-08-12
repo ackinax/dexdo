@@ -6,15 +6,14 @@
 // batch tx even on Deferred — see indexer_repo.rs).
 
 use anyhow::Context;
-use sqlx::Postgres;
-use sqlx::Transaction;
-use tracing::error;
-use tracing::warn;
-
 use dodex_contracts::airegistry::inference_order_book_events::FilledData;
 use dodex_contracts::airegistry::inference_order_book_events::InferenceOrderBookEvent;
 use dodex_contracts::airegistry::inference_order_book_events::OrderPlacedData;
 use dodex_contracts::airegistry::inference_order_book_events::RefundedData;
+use sqlx::Postgres;
+use sqlx::Transaction;
+use tracing::error;
+use tracing::warn;
 
 use crate::decoder::DecodedEvent;
 use crate::graphql::EventNode;
@@ -80,10 +79,9 @@ pub async fn project_inference_event(
         // before anything rested, so there is no row to key on, same as
         // `InferenceOrderCancelRejected`.
         E::Refunded => apply_inference_refunded(tx, event, node).await,
-        E::Executed
-        | E::OrderCancelRejected
-        | E::OrderRejected
-        | E::InferenceOrderBookDeployed => Ok(ProjectionOutcome::Applied),
+        E::Executed | E::OrderCancelRejected | E::OrderRejected | E::InferenceOrderBookDeployed => {
+            Ok(ProjectionOutcome::Applied)
+        }
     }
 }
 
@@ -255,9 +253,16 @@ impl FilledFields {
         // приехавшее и никому не нужное нельзя молча проигнорировать. Сверка
         // ключей DTO с ABI этого НЕ доказывает — она зелёная и тогда, когда поле
         // объявлено, но выброшено (так и потерялся `sellerNote`).
-        let FilledData { maker_id, taker_id, ticks, clearing_price, seller_tc, buyer_note, seller_note } =
-            serde_json::from_value(event.value.clone())
-                .context("InferenceFilled: payload не разбирается по ABI")?;
+        let FilledData {
+            maker_id,
+            taker_id,
+            ticks,
+            clearing_price,
+            seller_tc,
+            buyer_note,
+            seller_note,
+        } = serde_json::from_value(event.value.clone())
+            .context("InferenceFilled: payload не разбирается по ABI")?;
 
         let maker_id = maker_id.to_string();
         let taker_id = taker_id.to_string();
