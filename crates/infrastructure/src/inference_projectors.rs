@@ -544,6 +544,17 @@ pub enum ExpiredOrphanOutcome {
     /// `OrderPlaced` was dropped), so the authoritative cancel is lost. If a late
     /// placement re-opens the order the phantom sweep reconciles it.
     CancelLost,
+    /// Истечение, чей `InferenceOrderPlaced` так и не приехал: закрывать нечего,
+    /// но статус ордера потерян — он не станет `EXPIRED` никогда.
+    ExpiryLost,
+    /// Рефанд без родителя: возврат состоялся на цепи, а ордера, которого он
+    /// касается, в read-модели нет. Что именно потеряно — сказать НЕЛЬЗЯ, и
+    /// формулировка обязана это уважать: до дедлайна тот же тип события шлёт
+    /// `_finalizeTaker` по тейкеру, в том числе полностью исполненному, и сам
+    /// по себе не закрывает ничего (см. `apply_inference_refunded`). Без строки
+    /// не виден и дедлайн, то есть неизвестно даже, истечение это или конец
+    /// жизни тейкера. Потеряна привязка возврата к ордеру — не более.
+    RefundLost,
     /// Any other inference event past cutoff with no resting row to repair.
     Nothing,
 }
@@ -591,6 +602,8 @@ pub async fn repair_expired_inference_orphan(
             outcome
         }
         "InferenceOrderCancelled" => ExpiredOrphanOutcome::CancelLost,
+        "InferenceOrderExpired" => ExpiredOrphanOutcome::ExpiryLost,
+        "InferenceRefunded" => ExpiredOrphanOutcome::RefundLost,
         _ => ExpiredOrphanOutcome::Nothing,
     };
 
@@ -606,6 +619,14 @@ pub async fn repair_expired_inference_orphan(
         ExpiredOrphanOutcome::CancelLost => warn!(
             msg_id = %node.msg_id, event_type = %event.event_type,
             "inference OrderCancelled orphan past cutoff: authoritative cancel lost (its OrderPlaced was dropped); the phantom sweep reconciles it if a late placement re-opens the order"
+        ),
+        ExpiredOrphanOutcome::ExpiryLost => warn!(
+            msg_id = %node.msg_id, event_type = %event.event_type,
+            "inference OrderExpired orphan past cutoff: the order will never reach EXPIRED (its OrderPlaced was dropped at capture); the phantom sweep is what reconciles the row if a late placement re-opens it"
+        ),
+        ExpiredOrphanOutcome::RefundLost => warn!(
+            msg_id = %node.msg_id, event_type = %event.event_type,
+            "inference Refunded orphan past cutoff: the refund happened on chain but its order was never projected, so the refund cannot be attributed; whether the order expired or was a taker ending its life is unknowable without the row's deadline"
         ),
         ExpiredOrphanOutcome::Nothing => warn!(
             msg_id = %node.msg_id, event_type = %event.event_type,

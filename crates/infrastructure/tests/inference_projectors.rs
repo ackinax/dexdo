@@ -10,6 +10,7 @@ use dodex_infrastructure::database;
 use dodex_infrastructure::decoder::DecodedEvent;
 use dodex_infrastructure::graphql::EventNode;
 use dodex_infrastructure::inference_projectors::project_inference_event;
+use dodex_infrastructure::inference_projectors::ExpiredOrphanOutcome;
 use dodex_infrastructure::inference_projectors::repair_expired_inference_orphan;
 use dodex_infrastructure::projectors::ProjectionOutcome;
 use sqlx::postgres::PgPoolOptions;
@@ -379,6 +380,30 @@ fn expired_ev(order_id: &str) -> DecodedEvent {
 
 // Конъюнкт 1: `deadline is not null`. GTC-бид приходит с нулём, проектор размещения
 // нормализует его в SQL NULL.
+#[tokio::test]
+async fn expired_orphans_name_all_four_deferrable_types() {
+    // Отложиться без родителя умеют Filled, Cancelled, Expired и Refunded.
+    // Каждый обязан иметь собственный исход: `Nothing` означает «мы не знаем, что
+    // потеряли», и в логе от него нет пользы.
+    for (name, value) in [
+        ("InferenceOrderExpired", serde_json::json!({"orderId": "9"})),
+        ("InferenceRefunded", serde_json::json!({"orderId": "9", "note": "0:b", "amount": "1"})),
+    ] {
+        let Some(pool) = setup().await else { return };
+        let ob = "0:orphan_types";
+        clean(&pool, ob).await;
+        let mut tx = pool.begin().await.unwrap();
+        let outcome =
+            repair_expired_inference_orphan(&mut tx, &ev(name, value), &node(ob, "a1")).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_ne!(
+            outcome,
+            ExpiredOrphanOutcome::Nothing,
+            "{name}: сирота этого типа обязан быть назван, а не списан молча"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_refund_on_a_gtc_order_leaves_it_open() {
     let Some(pool) = setup().await else { return };
@@ -901,7 +926,7 @@ async fn order_amount_status(
 }
 
 #[tokio::test]
-async fn expired_orphans_dropped_both_types_using_ingest_age_not_chain_time() {
+async fn expired_orphans_dropped_all_four_types_using_ingest_age_not_chain_time() {
     let Some(pool) = setup().await else { return };
     let ob = "0:t_orphan_ob";
     sqlx::query("delete from raw_events where chain_order like '00orphan-%'")
@@ -915,7 +940,15 @@ async fn expired_orphans_dropped_both_types_using_ingest_age_not_chain_time() {
         .unwrap();
     let filled = serde_json::json!({"makerId":"900","takerId":"901","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b"});
     let cancel = serde_json::json!({"orderId":"902","refunded":"0"});
-    // (a) aged-ingest Filled orphan => dropped.        (b) aged-ingest OrderCancelled orphan => dropped (BOTH types).
+    let expired = serde_json::json!({"orderId":"903","isBuy":true,"note":"0:b","tokenContract":ZERO_ADDRESS});
+    let refunded = serde_json::json!({"orderId":"904","note":"0:b","amount":"1"});
+    // (a)-(b'') aged-ingest orphans of ALL FOUR deferrable types => dropped.
+    //
+    // ЭТО ЗЕЛЁНЫЙ ГАРД, а не red-first тест. Гейт `is_expired_inference_orphan`
+    // пропускает любой `InferenceOrderBook.*`, а оба пути дренажа матчат `Ok(_)`,
+    // то есть помечают строку processed даже при исходе `Nothing`. Значит новые
+    // типы дренируются и без арм'ов. Ценность в другом: тест покраснеет, если гейт
+    // когда-нибудь сузят обратно до Filled/Cancelled — строки станут pending навсегда.
     insert_raw(
         &pool,
         "orphan-fill",
@@ -936,6 +969,28 @@ async fn expired_orphans_dropped_both_types_using_ingest_age_not_chain_time() {
         ob,
         "InferenceOrderBook.InferenceOrderCancelled",
         cancel.clone(),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        "orphan-expired",
+        "00orphan-b1",
+        3600,
+        0,
+        ob,
+        "InferenceOrderBook.InferenceOrderExpired",
+        expired.clone(),
+    )
+    .await;
+    insert_raw(
+        &pool,
+        "orphan-refund",
+        "00orphan-b2",
+        3600,
+        0,
+        ob,
+        "InferenceOrderBook.InferenceRefunded",
+        refunded.clone(),
     )
     .await;
     // (c) FRESH ingest but ANCIENT created_at_chain (1 day) => NOT dropped — cutoff uses ingest age, not chain time.
@@ -977,6 +1032,14 @@ async fn expired_orphans_dropped_both_types_using_ingest_age_not_chain_time() {
     assert!(
         raw_processed(&pool, "orphan-cancel").await,
         "aged OrderCancelled orphan must be dropped"
+    );
+    assert!(
+        raw_processed(&pool, "orphan-expired").await,
+        "aged OrderExpired orphan must be dropped — сужение гейта оставило бы строку pending навсегда"
+    );
+    assert!(
+        raw_processed(&pool, "orphan-refund").await,
+        "aged Refunded orphan must be dropped — сужение гейта оставило бы строку pending навсегда"
     );
     assert!(!raw_processed(&pool, "orphan-oldchain").await,
         "old created_at_chain but fresh ingest => NOT dropped (proves raw_events.created_at, not chain time)");
