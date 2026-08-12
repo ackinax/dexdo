@@ -1130,7 +1130,7 @@ async fn failure_stamps_backoff_and_excludes_from_reselection() {
     assert!(before.contains(&ob.to_string()), "price-due book must be selected before failure");
 
     // Stamp a failure.
-    r.stamp_failure(ob).await.unwrap();
+    r.stamp_failure(ob, "probe: stamped by the attempts test").await.unwrap();
 
     // Within backoff window ⇒ must be excluded.
     let after = r.select_refresh_candidates_within(&scope).await.unwrap();
@@ -1699,4 +1699,32 @@ async fn sweep_still_cancels_phantoms_and_partially_filled_buy_takers() {
     .await
     .unwrap();
     assert_eq!(statuses, vec!["CANCELLED", "CANCELLED"]);
+}
+
+#[tokio::test]
+async fn a_reconcile_failure_records_its_reason() {
+    // Наблюдатель — DB-tail шаг и логов не читает. Если причина живёт только в
+    // логах, «failing с причиной» (IX-SEQ-10) проверяемо лишь как «стоит отметка»,
+    // то есть строка матрицы закрывается ослабленной версией молча.
+    let Some(pool) = setup().await else { return };
+    let ob = "0:reconcile_err";
+    seed_market(&pool, ob, false).await;
+
+    let r = InferenceReconciler::for_test(pool.clone());
+    r.stamp_failure(ob, "getModelName reverted: exit code 78").await.unwrap();
+
+    let (failed_at, err): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) = sqlx::query_as(
+        "select last_reconcile_failed_at, last_reconcile_error
+               from inference_markets where orderbook_address = $1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(failed_at.is_some(), "отметка времени отказа обязана стоять");
+    assert_eq!(
+        err.as_deref(),
+        Some("getModelName reverted: exit code 78"),
+        "причина обязана лежать рядом с отметкой, а не только в логах"
+    );
 }

@@ -230,13 +230,15 @@ impl InferenceReconciler {
                 Ok(DiscoveryOutcome::Superseded) => stats.superseded += 1,
                 Ok(DiscoveryOutcome::NoBoc) => {
                     stats.skipped += 1;
-                    self.stamp_failure_logged(&book.orderbook_address).await;
+                    self.stamp_failure_logged(&book.orderbook_address, Self::NO_BOC_REASON).await;
                 }
                 Err(err) => {
                     stats.failed += 1;
                     self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
                     warn!(ob = %book.orderbook_address, ?err, "discovery failed");
-                    self.stamp_failure_logged(&book.orderbook_address).await;
+                    // `{err:#}` — вся цепочка `anyhow`, а не только верхний слой:
+                    // колонка заводится ровно чтобы отличать причины.
+                    self.stamp_failure_logged(&book.orderbook_address, &format!("{err:#}")).await;
                 }
             }
         }
@@ -247,14 +249,14 @@ impl InferenceReconciler {
             match self.reconcile_refresh(book).await {
                 Ok(DiscoveryOutcome::NoBoc) => {
                     stats.skipped += 1;
-                    self.stamp_failure_logged(&book.orderbook_address).await;
+                    self.stamp_failure_logged(&book.orderbook_address, Self::NO_BOC_REASON).await;
                 }
                 Ok(_) => stats.refreshed += 1,
                 Err(err) => {
                     stats.failed += 1;
                     self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
                     warn!(ob = %book.orderbook_address, ?err, "refresh failed");
-                    self.stamp_failure_logged(&book.orderbook_address).await;
+                    self.stamp_failure_logged(&book.orderbook_address, &format!("{err:#}")).await;
                 }
             }
         }
@@ -833,11 +835,24 @@ impl InferenceReconciler {
         Ok(stamp && res.rows_affected() == 1)
     }
 
-    pub async fn stamp_failure(&self, ob: &str) -> anyhow::Result<()> {
+    /// Reason recorded for the benign `NoBoc` outcome. Named as a constant rather
+    /// than inlined so the decision stays visible: `NoBoc` is a BENIGN outcome —
+    /// IX-REC-27 keeps it out of the hard-failure counter — yet it does stamp a
+    /// failure. "Failing with a reason" is therefore routinely satisfied by this
+    /// text, and the observer proves the reason is NAMED, not that it is severe.
+    pub const NO_BOC_REASON: &'static str =
+        "account BOC not served yet (book announced, account state not returned by the gateway)";
+
+    /// Stamps the reconcile failure for a book. `error` is stored next to the
+    /// timestamp: the e2e observer and the operator both read the database, not
+    /// the pod logs, and without the text "the book is failing" cannot be told
+    /// apart from "the book is failing for an unknown reason".
+    pub async fn stamp_failure(&self, ob: &str, error: &str) -> anyhow::Result<()> {
         sqlx::query(
-            "update inference_markets set last_reconcile_failed_at=now(), reconcile_attempts=reconcile_attempts+1 where orderbook_address=$1",
+            "update inference_markets set last_reconcile_failed_at=now(), reconcile_attempts=reconcile_attempts+1, last_reconcile_error=$2 where orderbook_address=$1",
         )
         .bind(ob)
+        .bind(error)
         .execute(&self.pool)
         .await
         .context("stamp inference reconcile failure")?;
@@ -849,8 +864,8 @@ impl InferenceReconciler {
     /// queue every tick with no cooldown, so a silent drop would hide a book
     /// spinning without backoff. Used by `run_once` where the outcome is already
     /// a failure and there is nothing further to propagate.
-    async fn stamp_failure_logged(&self, ob: &str) {
-        if let Err(e) = self.stamp_failure(ob).await {
+    async fn stamp_failure_logged(&self, ob: &str, error: &str) {
+        if let Err(e) = self.stamp_failure(ob, error).await {
             warn!(ob = %ob, ?e, "failed to stamp inference reconcile backoff");
         }
     }
