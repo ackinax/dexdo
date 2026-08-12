@@ -26,7 +26,7 @@ test-group = 'serial-reprojection'
 # `inference_order_status_counts_for`), so the test no longer needs exclusive access to
 # the table and runs fully parallel.
 [[profile.default.overrides]]
-filter = 'binary(inference_orders_repo) | binary(inference_orders_http)'
+filter = 'binary(inference_orders_repo) | binary(inference_orders_http) | binary(read_model_polling)'
 test-group = 'serial-capture-cursor'
 
 # `inference_reconciler`'s at-head gate tests read a single shared `indexer_cursors`

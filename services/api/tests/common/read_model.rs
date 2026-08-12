@@ -1,0 +1,180 @@
+// 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
+//
+//! Polling the read model through the production router brought up in-process.
+//!
+//! Two rules this module is built around.
+//!
+//! **Poll for presence, assert content.** `poll_read_with` returns a value as
+//! soon as a row appears, and all field-level checks are the caller's job. A
+//! loop that spun until VALUES matched would turn a wrong remaining order
+//! quantity into an expired budget — a read-model defect would be masked as
+//! a slow indexer.
+//!
+//! **Never panic.** Every outcome comes back as a `Result`: panicking
+//! mid-scenario would leave a deposit stranded on a note, because order
+//! settlement happens further down the test. The caller puts the `Err` into
+//! its own `failures` and proceeds to settlement.
+
+use std::time::Duration;
+use std::time::Instant;
+
+use salvo::http::StatusCode;
+use salvo::test::ResponseExt;
+use salvo::test::TestClient;
+use salvo::Service;
+use serde_json::Value;
+
+/// The result of a single probe.
+pub enum Probe<T> {
+    /// The fact is in place. Checking its fields is the caller's job.
+    Ready(T),
+    /// The fact is not there yet. The string is what is visible RIGHT NOW: it
+    /// lands in the expired-budget message, so it must name the observation,
+    /// not the intent ("book is discovering", not "waiting for the book").
+    Pending(String),
+    /// Retrying is pointless: a test defect or a service refusal.
+    Fatal(String),
+}
+
+/// Wait budget for the WHOLE binary, not per fact. Capture ticks once every
+/// 3s, the inference reconciler once every 15s, book visibility is stamped
+/// after a full sweep cycle; the matrix rates such a fact at "order of a
+/// minute".
+///
+/// Why shared rather than per-fact: `e2e_inference` carries four polls on top
+/// of 270s of chained on-chain waits, and the `ci-e2e` profile kills a test at
+/// `60s × terminate-after 10` = 600s. A per-fact budget of 90s would give
+/// 630s — and in the "read model is stuck" scenario, where every budget burns
+/// out, nextest would kill the test BEFORE the final `assert!`, losing the
+/// collected `failures`. A shared budget keeps the worst case at 270 + 240 =
+/// 510s; if it burns out on the first phase, the remaining phases return
+/// `Err` immediately, and the binary still reaches order settlement and its
+/// own `assert!`.
+pub const DEFAULT_READ_BUDGET: Duration = Duration::from_secs(240);
+
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The remaining shared budget. Created once per binary; each phase gets
+/// `left()`. Waiting for visibility is paid for once, not once per request.
+pub struct ReadBudget {
+    started: Instant,
+    total: Duration,
+}
+
+impl ReadBudget {
+    pub fn start() -> Self {
+        Self::with_total(DEFAULT_READ_BUDGET)
+    }
+
+    pub fn with_total(total: Duration) -> Self {
+        Self { started: Instant::now(), total }
+    }
+
+    /// How much is left. Zero is a legitimate value: `poll_read_with` with a
+    /// zero budget still makes one probe (the probe runs BEFORE the deadline
+    /// check) and returns `Err` — the phase reports rather than hangs, and
+    /// does not skip a fact that has already arrived by that point.
+    pub fn left(&self) -> Duration {
+        self.total.saturating_sub(self.started.elapsed())
+    }
+}
+
+/// The single entry point: the budget is passed explicitly, and that is
+/// deliberate. There is no "take the default" wrapper here — it would smuggle
+/// a per-fact budget back in through the back door, exactly what decision E
+/// moves away from.
+pub async fn poll_read_with<T, F, Fut>(
+    label: &str,
+    budget: Duration,
+    mut probe: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Probe<T>>,
+{
+    let started = Instant::now();
+    // The placeholder is unreachable by construction: every path that reads
+    // `last` runs after the `Probe::Pending` arm below has already
+    // overwritten it in the same iteration (the other two arms return
+    // early). Kept anyway so the type does not need an `Option`, and
+    // `#[allow]`ed rather than restructured because the dead store is the
+    // simplest honest expression of that invariant.
+    #[allow(unused_assignments)]
+    let mut last = String::from("(no probe made yet)");
+    loop {
+        match probe().await {
+            Probe::Ready(v) => return Ok(v),
+            Probe::Fatal(why) => return Err(format!("{label}: terminal refusal: {why}")),
+            Probe::Pending(why) => last = why,
+        }
+        // Exit when the NEXT round would not fit, not when the budget has
+        // already expired. The difference shows up in the window `0 < budget
+        // < POLL_INTERVAL`: with a check of `elapsed >= budget`, the first
+        // probe would not exceed the remainder, the loop would go to sleep
+        // for the full interval, and the phase would make a second probe,
+        // overrunning its remainder. The message below about a "single
+        // probe" would then be a lie exactly in that window.
+        if started.elapsed() + POLL_INTERVAL >= budget {
+            // The budget did not stretch to even one interval — not the same
+            // as expired: it means the binary's shared budget was spent
+            // EARLIER, including on chained waits (they share a clock,
+            // decision E). Phrasing this as "did not arrive within 0s" would
+            // send the reader looking for an instant check that does not
+            // exist.
+            if budget <= POLL_INTERVAL {
+                return Err(format!(
+                    "{label}: no retries happened — the binary's shared budget was spent \
+                     earlier (chain waits run on the same clock). Observation from the single \
+                     probe: {last}"
+                ));
+            }
+            return Err(format!(
+                "{label}: the fact did not reach the read model within {}s. Last observation: \
+                 {last}. \"book not visible\" — check the reconciler; \"empty\" — check capture \
+                 and projection",
+                budget.as_secs()
+            ));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Full URL for a public inference endpoint.
+pub fn api(path: &str) -> String {
+    format!("http://test/api/v1/inference/{path}")
+}
+
+/// The outcome of a single GET through the production router.
+pub enum GetOutcome {
+    Ok(Value),
+    /// A legitimate answer from a healthy system: retry.
+    Retry(String),
+    /// Not retryable.
+    Fatal(String),
+}
+
+/// GET with response classification.
+///
+/// `404` (`-1121`) — the book is not `visible` yet; `503` (`-1500`) — the read
+/// path refused fail-closed. Both are legitimate and retryable. Everything
+/// else is terminal: `400` means a bad URL in the test itself, and a silent
+/// retry would turn a typo into an expired budget.
+pub async fn get_json(service: &Service, url: &str) -> GetOutcome {
+    let mut resp = TestClient::get(url).send(service).await;
+    match resp.status_code {
+        Some(StatusCode::OK) => match resp.take_json::<Value>().await {
+            Ok(v) => GetOutcome::Ok(v),
+            Err(e) => GetOutcome::Fatal(format!("{url}: the 200 body does not parse as JSON: {e}")),
+        },
+        Some(StatusCode::SERVICE_UNAVAILABLE) => {
+            GetOutcome::Retry(format!("503 (-1500) on {url} — legitimate refusal, retrying"))
+        }
+        Some(StatusCode::NOT_FOUND) => {
+            GetOutcome::Retry(format!("404 (-1121) on {url} — book not visible yet, retrying"))
+        }
+        other => GetOutcome::Fatal(format!(
+            "{url}: status {other:?} is not \"not there yet\" — 400 is a test defect, any 5xx \
+             other than 503 is a service refusal"
+        )),
+    }
+}
