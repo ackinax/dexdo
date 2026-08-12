@@ -351,7 +351,14 @@ fn event_ids_match_modifiers() {
     assert_eq!(Rm::TokenContractRegistered as u128, 702);
     assert_eq!(Rm::ContractDeployed as u128, 703);
 
-    assert_eq!(Tc::ContractDeployed as u128, 703);
+    // Реликт. Утверждения об id ниже дублируют
+    // `typed_event_enums_carry_the_ids_the_contracts_emit_on`
+    // (`crates/infrastructure/tests/airegistry_event_manifest.rs`), который выводит те
+    // же числа из `modifiers.sol` вместо того, чтобы повторять их здесь. Новые
+    // варианты сюда НЕ дописываются: расхождение этой таблицы с контрактом и было
+    // дефектом 703 — деплой сделки переехал на `DealDeployedEmit`, манифест это
+    // записал, а enum и эта строка — нет.
+    assert_eq!(Tc::ContractDeployed as u128, 732);
     assert_eq!(Tc::ContractDestroyed as u128, 709);
     assert_eq!(Tc::ShellWithdrawn as u128, 710);
     assert_eq!(Tc::StreamFunded as u128, 720);

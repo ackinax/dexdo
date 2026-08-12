@@ -269,6 +269,87 @@ fn parse_emit(rest: &str) -> Option<(&str, &str)> {
 
 // ────────────────────────────────── checks ──────────────────────────────────
 
+/// `"Kind.EventName" -> routing id`, выведенное из уже разобранных строк манифеста.
+fn id_by_event_type() -> BTreeMap<String, u32> {
+    let mut out = BTreeMap::new();
+    for e in MANIFEST {
+        for emit in e.emits {
+            out.insert((*emit).to_string(), e.id);
+        }
+    }
+    out
+}
+
+/// Дискриминант Rust-enum'а обязан равняться id, на который контракт реально
+/// эмитит это событие. Соответствие «вариант -> событие» берётся из правила,
+/// которое пинит `crates/contracts`: имя варианта совпадает с именем события ABI,
+/// книга дополнительно префиксуется словом `Inference`.
+///
+/// Рукописной таблицы здесь нет намеренно: она была бы третьим списком id после
+/// `modifiers.sol` и `MANIFEST`, и именно дублирование развело
+/// `TokenContractEvent::ContractDeployed` с контрактом.
+#[test]
+fn typed_event_enums_carry_the_ids_the_contracts_emit_on() {
+    use dodex_contracts::airegistry::inference_order_book_events::InferenceOrderBookEvent as Iob;
+    use dodex_contracts::airegistry::token_contract_events::TokenContractEvent as Tc;
+
+    let ids = id_by_event_type();
+    let mut checked = 0usize;
+
+    for v in Tc::ALL {
+        let event_type = format!("TokenContract.{v:?}");
+        let expected = ids
+            .get(&event_type)
+            .unwrap_or_else(|| panic!("{event_type} не эмитится ни на один id в modifiers.sol"));
+        assert_eq!(
+            *v as u32, *expected,
+            "TokenContractEvent::{v:?} объявлен на {}, а контракт эмитит его на {expected}",
+            *v as u32
+        );
+        checked += 1;
+    }
+
+    for v in Iob::ALL {
+        let name = format!("{v:?}");
+        let name = if name.starts_with("Inference") { name } else { format!("Inference{name}") };
+        let event_type = format!("InferenceOrderBook.{name}");
+        let expected = ids
+            .get(&event_type)
+            .unwrap_or_else(|| panic!("{event_type} не эмитится ни на один id в modifiers.sol"));
+        assert_eq!(*v as u32, *expected, "{v:?} расходится с {event_type}");
+        checked += 1;
+    }
+
+    assert!(checked >= 19, "проверено {checked} вариантов — ALL опустел, гард ослеп");
+}
+
+/// Круг `вариант -> Display -> TryFrom -> вариант` по КАЖДОМУ варианту.
+///
+/// Нужен потому, что `TryFrom` матчит по числу с `_ => Err`, а не по варианту:
+/// добавление варианта в enum его не ломает, файл собирается, тесты проходят —
+/// и `try_from` продолжает отвергать новый id. Тогда арм в `Decoded*Event::from_event`
+/// становится НЕДОСТИЖИМЫМ, то есть мёртвой веткой, которую ничто не краснит.
+#[test]
+fn every_declared_variant_round_trips_through_try_from() {
+    use dodex_contracts::airegistry::inference_order_book_events::InferenceOrderBookEvent as Iob;
+    use dodex_contracts::airegistry::token_contract_events::TokenContractEvent as Tc;
+
+    for v in Tc::ALL {
+        assert_eq!(
+            Tc::try_from(v.to_string()).unwrap_or_else(|e| panic!("{v:?}: {e}")),
+            *v,
+            "{v:?} объявлен вариантом, но TryFrom его id не знает — арм в from_event недостижим"
+        );
+    }
+    for v in Iob::ALL {
+        assert_eq!(
+            Iob::try_from(v.to_string()).unwrap_or_else(|e| panic!("{v:?}: {e}")),
+            *v,
+            "{v:?} объявлен вариантом, но TryFrom его id не знает — арм в from_event недостижим"
+        );
+    }
+}
+
 #[test]
 fn the_manifest_lists_exactly_the_declared_event_ids() {
     let declared: Vec<(String, u32)> = declared_event_ids();

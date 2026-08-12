@@ -34,6 +34,21 @@ pub enum InferenceOrderBookEvent {
     OrderCancelRejected = 1009,
 }
 
+impl InferenceOrderBookEvent {
+    /// Каждый вариант, ровно один раз. Rust не умеет перечислять варианты сам, а
+    /// рукописный список ЗДЕСЬ безопасен именно потому, что тест сверяет его с
+    /// ABI: забытый вариант ловится, а не переносится дальше.
+    pub const ALL: &'static [Self] = &[
+        Self::OrderPlaced,
+        Self::OrderCancelled,
+        Self::Refunded,
+        Self::Filled,
+        Self::Executed,
+        Self::InferenceOrderBookDeployed,
+        Self::OrderCancelRejected,
+    ];
+}
+
 impl TryFrom<String> for InferenceOrderBookEvent {
     type Error = KitError;
 

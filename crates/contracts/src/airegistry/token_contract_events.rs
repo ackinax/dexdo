@@ -31,7 +31,31 @@ pub enum TokenContractEvent {
     SellerBondFunded = 727,
     ProbeAccepted = 728,
     ProbeBurned = 729,
-    ContractDeployed = 703,
+    /// Деплой СДЕЛКИ, `DealDeployedEmit` (732). Не `ContractDeployedEmit` (703):
+    /// та константа принадлежит `RootModel`, и обе стороны объявляют побайтово
+    /// одинаковое `ContractDeployed(address self)`, то есть делят body-id.
+    /// Различить их может только внешний `dst` — таблица маршрутов в
+    /// `crates/infrastructure/src/decoder.rs`.
+    ContractDeployed = 732,
+}
+
+impl TokenContractEvent {
+    /// См. `InferenceOrderBookEvent::ALL`: список сверяется с ABI тестом, поэтому
+    /// забытый вариант краснеет, а не расходится молча.
+    pub const ALL: &'static [Self] = &[
+        Self::ContractDestroyed,
+        Self::ShellWithdrawn,
+        Self::StreamFunded,
+        Self::StreamOpened,
+        Self::TickFinalized,
+        Self::StreamStopped,
+        Self::StreamDisputed,
+        Self::DisputeResolved,
+        Self::SellerBondFunded,
+        Self::ProbeAccepted,
+        Self::ProbeBurned,
+        Self::ContractDeployed,
+    ];
 }
 
 impl TryFrom<String> for TokenContractEvent {
@@ -48,7 +72,7 @@ impl TryFrom<String> for TokenContractEvent {
         })?;
 
         match number {
-            703 => Ok(TokenContractEvent::ContractDeployed),
+            732 => Ok(TokenContractEvent::ContractDeployed),
             709 => Ok(TokenContractEvent::ContractDestroyed),
             710 => Ok(TokenContractEvent::ShellWithdrawn),
             720 => Ok(TokenContractEvent::StreamFunded),
