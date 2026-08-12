@@ -225,6 +225,116 @@ async fn placement_without_the_flag_is_not_a_subscription() {
 }
 
 #[tokio::test]
+async fn a_placement_replay_does_not_resurrect_an_expired_order() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:exp_replay";
+    clean(&pool, ob).await;
+    let placed = ev(
+        "InferenceOrderPlaced",
+        serde_json::json!({
+            "orderId": "1", "isBuy": true, "price": "5", "ticks": "10",
+            "note": "0:b", "tokenContract": "0:0", "deadline": "0", "flags": "0"
+        }),
+    );
+    let mut tx = pool.begin().await.unwrap();
+    project(&mut tx, &placed, &node(ob, "a1")).await;
+    let expired = ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"}));
+    project(&mut tx, &expired, &node(ob, "a2")).await;
+    // Тот же placement приходит повторно (перекрытие страниц захвата).
+    project(&mut tx, &placed, &node(ob, "a1")).await;
+    tx.commit().await.unwrap();
+
+    let (status, rem) = status_rem(&pool, ob, 1).await;
+    assert_eq!(status, "EXPIRED", "реплей размещения не имеет права открыть истёкший ордер");
+    assert_eq!(rem, "10", "остаток не восстанавливается");
+}
+
+#[tokio::test]
+async fn a_late_cancel_does_not_demote_an_expired_order() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:exp_cancel";
+    clean(&pool, ob).await;
+    let mut tx = pool.begin().await.unwrap();
+    project(
+        &mut tx,
+        &ev(
+            "InferenceOrderPlaced",
+            serde_json::json!({
+                "orderId": "1", "isBuy": true, "price": "5", "ticks": "10",
+                "note": "0:b", "tokenContract": "0:0", "deadline": "0", "flags": "0"
+            }),
+        ),
+        &node(ob, "a1"),
+    )
+    .await;
+    project(&mut tx, &ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"})), &node(ob, "a2")).await;
+    project(
+        &mut tx,
+        &ev("InferenceOrderCancelled", serde_json::json!({"orderId": "1", "refunded": "0", "note": "0:b"})),
+        &node(ob, "a3"),
+    )
+    .await;
+    tx.commit().await.unwrap();
+
+    let (status, _) = status_rem(&pool, ob, 1).await;
+    assert_eq!(status, "EXPIRED", "истечение уже терминально; отмена его не переписывает");
+}
+
+#[tokio::test]
+async fn a_late_fill_does_not_revive_an_expired_order() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:exp_fill";
+    clean(&pool, ob).await;
+    let mut tx = pool.begin().await.unwrap();
+    project(
+        &mut tx,
+        &ev(
+            "InferenceOrderPlaced",
+            serde_json::json!({
+                "orderId": "1", "isBuy": true, "price": "5", "ticks": "10",
+                "note": "0:b", "tokenContract": "0:0", "deadline": "0", "flags": "0"
+            }),
+        ),
+        &node(ob, "a1"),
+    )
+    .await;
+    // ВТОРАЯ НОГА ОБЯЗАТЕЛЬНА: `apply_inference_filled` возвращает Deferred, пока
+    // хоть одна названная строка отсутствует. Без неё дефектный код тоже оставил бы
+    // EXPIRED и остаток 10 — тест был бы зелёным, не дойдя до apply_filled_decrement.
+    project(
+        &mut tx,
+        &ev(
+            "InferenceOrderPlaced",
+            serde_json::json!({
+                "orderId": "2", "isBuy": false, "price": "5", "ticks": "10",
+                "note": "0:s", "tokenContract": "0:tc", "deadline": "1", "flags": "0"
+            }),
+        ),
+        &node(ob, "a2"),
+    )
+    .await;
+    project(&mut tx, &ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"})), &node(ob, "a3")).await;
+    let outcome = project(
+        &mut tx,
+        &ev(
+            "InferenceFilled",
+            serde_json::json!({
+                "makerId": "1", "takerId": "2", "ticks": "4", "clearingPrice": "5",
+                "sellerTC": "0:tc_expfill", "buyerNote": "0:b", "sellerNote": "0:s"
+            }),
+        ),
+        &node(ob, "co-expfill-4"),
+    )
+    .await;
+    assert_eq!(outcome, ProjectionOutcome::Applied, "обе ноги на месте — филл обязан примениться");
+    tx.commit().await.unwrap();
+
+    let (status, rem) = status_rem(&pool, ob, 1).await;
+    assert_eq!(status, "EXPIRED", "истечение терминально и для филла");
+    assert_eq!(rem, "10", "остаток истёкшей строки филл не уменьшает");
+}
+
+#[tokio::test]
 async fn order_cancelled_is_terminal_and_defers_when_absent() {
     let Some(pool) = setup().await else { return };
     let ob = "0:t_cancel_ob";

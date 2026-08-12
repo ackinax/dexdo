@@ -134,7 +134,7 @@ async fn upsert_resting_order(
                    chain_created_at = coalesce(inference_orders.chain_created_at, excluded.chain_created_at),
                    chain_updated_at = greatest(inference_orders.chain_updated_at, excluded.chain_updated_at),
                    updated_at = now()
-               where inference_orders.status not in ('FILLED','CANCELLED')
+               where inference_orders.status not in ('FILLED','CANCELLED','EXPIRED')
                  and inference_orders.amount_remaining = inference_orders.amount_initial"#,
     )
     .bind(ob).bind(order_id).bind(is_buy).bind(price).bind(ticks)
@@ -308,11 +308,16 @@ async fn apply_filled_decrement(
         r#"update inference_orders o
               set amount_remaining = case
                       when o.status = 'FILLED' then o.amount_remaining
+                      when o.status = 'EXPIRED' then o.amount_remaining
                       when o.status = 'CANCELLED' and o.swept_at is null then o.amount_remaining
                       else greatest(o.amount_remaining - $3::numeric, 0::numeric)
                   end,
                   status = case
                       when o.status = 'FILLED' then 'FILLED'
+                      -- Истечение терминально: поздний филл не воскрешает строку.
+                      -- Возвращается СВОЙ статус, не 'FILLED' — исход другой. Арм стоит
+                      -- ВЫШЕ `is_buy = false`, иначе истёкший SELL перехватился бы им.
+                      when o.status = 'EXPIRED' then 'EXPIRED'
                       when o.status = 'CANCELLED' and o.swept_at is null then 'CANCELLED'
                       when o.is_buy = false then 'FILLED'
                       when greatest(o.amount_remaining - $3::numeric, 0::numeric) = 0 then 'FILLED'
@@ -320,6 +325,7 @@ async fn apply_filled_decrement(
                   end,
                   swept_at = case
                       when o.status = 'FILLED' then o.swept_at
+                      when o.status = 'EXPIRED' then o.swept_at
                       when o.status = 'CANCELLED' and o.swept_at is null then o.swept_at
                       else null
                   end,
@@ -328,15 +334,18 @@ async fn apply_filled_decrement(
                   -- columns either (mirrors projectors::apply_order_filled). Only OPEN rows
                   -- and provisional sweep-cancels (swept_at NOT NULL, being overridden) mutate.
                   last_chain_order = case
-                      when o.status = 'FILLED' or (o.status = 'CANCELLED' and o.swept_at is null) then o.last_chain_order
+                      when o.status = 'FILLED' or o.status = 'EXPIRED'
+                           or (o.status = 'CANCELLED' and o.swept_at is null) then o.last_chain_order
                       else greatest(o.last_chain_order, $4)
                   end,
                   chain_updated_at = case
-                      when o.status = 'FILLED' or (o.status = 'CANCELLED' and o.swept_at is null) then o.chain_updated_at
+                      when o.status = 'FILLED' or o.status = 'EXPIRED'
+                           or (o.status = 'CANCELLED' and o.swept_at is null) then o.chain_updated_at
                       else greatest(o.chain_updated_at, to_timestamp($5::double precision))
                   end,
                   updated_at = case
-                      when o.status = 'FILLED' or (o.status = 'CANCELLED' and o.swept_at is null) then o.updated_at
+                      when o.status = 'FILLED' or o.status = 'EXPIRED'
+                           or (o.status = 'CANCELLED' and o.swept_at is null) then o.updated_at
                       else now()
                   end
             where o.orderbook_address = $1 and o.order_id = any($2::numeric[])"#,
@@ -668,14 +677,18 @@ async fn apply_inference_order_cancelled(
     // makes this an authoritative event-cancel (overriding any provisional sweep).
     let prior: Option<(String,)> = sqlx::query_as(
         r#"with prior as (
-               select status from inference_orders
+               select status,
+                      -- Истечение терминально наравне с исполнением: поздняя отмена
+                      -- не имеет права понизить EXPIRED до CANCELLED.
+                      status in ('FILLED','EXPIRED') as terminal
+                 from inference_orders
                 where orderbook_address = $1 and order_id = $2::numeric for update)
            update inference_orders o
-              set status = case when prior.status = 'FILLED' then 'FILLED' else 'CANCELLED' end,
-                  swept_at = case when prior.status = 'FILLED' then o.swept_at else null end,
-                  last_chain_order = case when prior.status = 'FILLED' then o.last_chain_order
+              set status = case when prior.terminal then prior.status else 'CANCELLED' end,
+                  swept_at = case when prior.terminal then o.swept_at else null end,
+                  last_chain_order = case when prior.terminal then o.last_chain_order
                                           else greatest(o.last_chain_order, $3) end,
-                  chain_updated_at = case when prior.status = 'FILLED' then o.chain_updated_at
+                  chain_updated_at = case when prior.terminal then o.chain_updated_at
                                           else greatest(o.chain_updated_at, to_timestamp($4::double precision)) end,
                   updated_at = now()
              from prior
