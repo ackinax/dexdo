@@ -334,6 +334,281 @@ async fn a_late_fill_does_not_revive_an_expired_order() {
     assert_eq!(rem, "10", "остаток истёкшей строки филл не уменьшает");
 }
 
+// `place` (:721) хардкодит `deadline: "0"`, поэтому дедлайновым тестам нужен свой посев.
+// `is_buy` параметром, а не константой: последовательный тест ниже ставит SELL-ногу, и
+// у неё дедлайн обязан быть ненулевым (контракт отвергает GTC-оффер, `:1600`).
+async fn place_with_deadline(
+    pool: &sqlx::PgPool,
+    ob: &str,
+    order_id: &str,
+    is_buy: bool,
+    deadline: &str,
+    chain_order: &str,
+) {
+    let mut tx = pool.begin().await.unwrap();
+    let e = ev(
+        "InferenceOrderPlaced",
+        serde_json::json!({
+            "orderId": order_id, "isBuy": is_buy, "price": "5", "ticks": "10",
+            "note": "0:b", "tokenContract": if is_buy { ZERO_ADDRESS } else { "0:tc" },
+            "deadline": deadline, "flags": "0"
+        }),
+    );
+    project(&mut tx, &e, &node(ob, chain_order)).await;
+    tx.commit().await.unwrap();
+}
+
+fn refunded(order_id: &str) -> DecodedEvent {
+    ev("InferenceRefunded", serde_json::json!({"orderId": order_id, "note": "0:b", "amount": "7"}))
+}
+
+fn expired_ev(order_id: &str) -> DecodedEvent {
+    ev(
+        "InferenceOrderExpired",
+        serde_json::json!({"orderId": order_id, "isBuy": true, "note": "0:n", "tokenContract": ZERO_ADDRESS}),
+    )
+}
+
+// ДВА ГАРДА, оба зелёные до правки, и оба обязательны: предикат «закрывать можно»
+// состоит из двух конъюнктов, и каждый нужно прижать своим тестом.
+//
+// Общий смысл — ОТКАЗ закрывать строку: `_finalizeTaker` (`:1183`, `:1223`) шлёт
+// рефанд тейкеру, чей дедлайн ещё не прошёл, и что с ордером случилось на самом
+// деле, знает `InferenceFilled`, а не рефанд. Остаток IOC/MARKET закрывает phantom
+// sweep, сверяясь с цепью.
+
+// Конъюнкт 1: `deadline is not null`. GTC-бид приходит с нулём, проектор размещения
+// нормализует его в SQL NULL.
+#[tokio::test]
+async fn a_refund_on_a_gtc_order_leaves_it_open() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_gtc";
+    clean(&pool, ob).await;
+    place_with_deadline(&pool, ob, "1", true, "0", "a1").await;
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let (status, rem) = status_rem(&pool, ob, 1).await;
+    assert_eq!(
+        (status.as_str(), rem.as_str()),
+        ("OPEN", "10"),
+        "рефанд по GTC не различает исполненного тейкера и остаток IOC — угадывать нельзя"
+    );
+}
+
+// Конъюнкт 2: `deadline <= chain_seconds`. БЕЗ ЭТОГО ТЕСТА реализация, проверяющая
+// только `is not null`, проходит весь набор и при этом помечает `EXPIRED` живые
+// ордера с будущим дедлайном. Случай не синтетический, а ровно вся SELL-сторона:
+// оффер обязан нести ненулевой дедлайн (`InferenceOrderBook.sol:1600` отвергает
+// нулевой как malformed), значит taker-only SELL из `:1223` всегда попадает сюда.
+#[tokio::test]
+async fn a_refund_before_a_future_deadline_leaves_the_order_open() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_future";
+    clean(&pool, ob).await;
+    // node() ставит created_at = 1_700_000_000; дедлайн заведомо позже.
+    place_with_deadline(&pool, ob, "1", false, "1700009999", "a1").await;
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let (status, rem) = status_rem(&pool, ob, 1).await;
+    assert_eq!(
+        (status.as_str(), rem.as_str()),
+        ("OPEN", "10"),
+        "ордер с ненаступившим дедлайном живой: закрыть его по рефанду — выдумать истечение"
+    );
+}
+
+#[tokio::test]
+async fn a_refund_past_the_deadline_expires_the_order() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_exp";
+    clean(&pool, ob).await;
+    // node() ставит created_at = 1_700_000_000; дедлайн на секунду раньше.
+    place_with_deadline(&pool, ob, "1", true, "1699999999", "a1").await;
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let (status, _) = status_rem(&pool, ob, 1).await;
+    assert_eq!(
+        status, "EXPIRED",
+        "continuation, истёкший до возобновления, эмитит только рефанд — статус выводится из дедлайна"
+    );
+}
+
+// ГАРД, а не red-first тест: сегодня `InferenceRefunded` уходит в observability-арм
+// и строку не трогает, поэтому проверка зелёная и до правки. Она существует, чтобы
+// НОВЫЙ проектор не начал трогать терминальную строку — включая `updated_at`.
+#[tokio::test]
+async fn a_refund_over_a_filled_row_changes_nothing_at_all() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_filled";
+    clean(&pool, ob).await;
+    place_with_deadline(&pool, ob, "1", true, "0", "a1").await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("update inference_orders set status='FILLED', amount_remaining=0 where orderbook_address=$1")
+        .bind(ob)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "select updated_at from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let (status, _) = status_rem(&pool, ob, 1).await;
+    assert_eq!(status, "FILLED", "рефанд обслуживает и удаление dust — исполненную строку он не трогает");
+    let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "select updated_at from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before, "no-op обязан быть полным: даже updated_at не двигается");
+}
+
+#[tokio::test]
+async fn a_refund_without_its_parent_defers() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_orphan";
+    clean(&pool, ob).await;
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a1")).await, ProjectionOutcome::Deferred);
+    tx.commit().await.unwrap();
+}
+
+// ГАРД, зелёный и до правки — и ЕДИНСТВЕННЫЙ тест, который краснеет, если кто-нибудь
+// вернёт проектору ветку `CANCELLED` для непрошедшего дедлайна. Это ровно тот сценарий,
+// из-за которого её здесь нет; расширение существующего
+// `filled_defers_zero_writes_when_one_side_absent_then_applies_once` вставкой
+// рефанда между `Deferred` и повтором.
+//
+// На цепи полностью исполненный тейкер-BUY даёт `Placed(2)` -> `Filled(1,2)` ->
+// `Refunded(2, leftover)` (`:1183`; событие уходит даже при `leftover == 0`). Мейкерская
+// нога потеряна на capture, поэтому fill откладывается, а дренаж идёт дальше
+// (`indexer_repo.rs:522` строку не помечает и берёт следующую) — рефанд применяется
+// РАНЬШЕ своего же fill'а.
+#[tokio::test]
+async fn a_refund_between_a_deferred_fill_and_its_retry_does_not_steal_the_terminal_status() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_seq";
+    clean(&pool, ob).await;
+    // Тейкер (id 2) спроецирован; мейкерская SELL-нога (id 1) — ещё нет.
+    place_with_deadline(&pool, ob, "2", true, "0", "a1").await;
+    let f = ev(
+        "InferenceFilled",
+        // sellerTC уникален по репозиторию: clean() не чистит inference_deals (PK — адрес TC).
+        serde_json::json!({"makerId":"1","takerId":"2","ticks":"10","clearingPrice":"5",
+                           "sellerTC":"0:tc_refseq","buyerNote":"0:b","sellerNote":"0:s"}),
+    );
+
+    // 1. Fill откладывается — нулевые записи.
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &f, &node(ob, "co-refseq-9")).await, ProjectionOutcome::Deferred);
+    tx.commit().await.unwrap();
+
+    // 2. Рефанд тейкера дренируется следующим и обязан ничего не решить.
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("2"), &node(ob, "a3")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+    let (status, _) = status_rem(&pool, ob, 2).await;
+    assert_eq!(status, "OPEN", "рефанд закрыл строку, у которой висит неприменённый fill");
+
+    // 3. Мейкерская нога приезжает, fill повторяется.
+    place_with_deadline(&pool, ob, "1", false, "1700009999", "a4").await;
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &f, &node(ob, "co-refseq-9")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    assert_eq!(
+        status_rem(&pool, ob, 2).await,
+        ("FILLED".into(), "0".into()),
+        "исполненный тейкер обязан прийти в FILLED: рефанд лишь вернул неистраченный escrow"
+    );
+}
+
+// ГАРД на ПРЯМОЙ порядок — тот, что бывает на цепи. `_removeExpiredBid`
+// (`InferenceOrderBook.sol:1143-1146`) зовёт `_refundAndRemove` и лишь ПОТОМ эмитит
+// `InferenceOrderExpired`, то есть по `chain_order` рефанд всегда первый.
+//
+// Зубы у теста конкретные: закрой рефанд строку любым статусом, кроме `EXPIRED`
+// (например `CANCELLED`, как в первой редакции этой задачи), — и пришедшее следом
+// истечение уже ничего не поправит.
+#[tokio::test]
+async fn a_refund_before_its_expiry_event_leaves_expired_standing() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_then_exp";
+    clean(&pool, ob).await;
+    place_with_deadline(&pool, ob, "1", true, "1699999999", "a1").await;
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    assert_eq!(project(&mut tx, &expired_ev("1"), &node(ob, "a3")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let (status, swept_null): (String, bool) = sqlx::query_as(
+        "select status, swept_at is null from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (status.as_str(), swept_null),
+        ("EXPIRED", true),
+        "рефанд обязан закрыть просроченную строку ИМЕННО в EXPIRED — иначе истечение её не подберёт"
+    );
+}
+
+// ГАРД на ОБРАТНЫЙ порядок: реплей и перестановка внутри батча. Здесь `updated_at`
+// проверяется намеренно и не для красоты — статус-ассерт тут беззубый: строка уже
+// `EXPIRED`, и предикат вида «не FILLED и не настоящая отмена» перезаписал бы её в
+// тот же `EXPIRED`, оставив ассерт зелёным. Ловит подмену только полный no-op.
+#[tokio::test]
+async fn a_refund_after_its_expiry_event_changes_nothing_at_all() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:exp_then_ref";
+    clean(&pool, ob).await;
+    place_with_deadline(&pool, ob, "1", true, "1699999999", "a1").await;
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &expired_ev("1"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+    let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "select updated_at from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a3")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let (status, after): (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "select status, updated_at from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "EXPIRED");
+    assert_eq!(after, before, "`EXPIRED` обязан быть вне предиката рефанда: строка не тронута вовсе");
+}
+
 #[tokio::test]
 async fn order_cancelled_is_terminal_and_defers_when_absent() {
     let Some(pool) = setup().await else { return };
@@ -374,6 +649,9 @@ async fn order_cancelled_is_terminal_and_defers_when_absent() {
 // The chain decides expiry, not the reader: a resting order whose deadline has
 // passed keeps its OPEN status until InferenceOrderExpired arrives, and only then
 // becomes EXPIRED. Nothing derives the status from `deadline` vs wall-clock.
+// The one exception is a Refunded whose chain time is past this deadline: there the
+// chain has already removed the order, and the deadline only says the cause was
+// expiry — continuation expiry emits no InferenceOrderExpired at all.
 #[tokio::test]
 async fn order_expired_is_terminal_and_defers_when_absent() {
     let Some(pool) = setup().await else { return };
@@ -498,7 +776,11 @@ async fn observability_event_seeds_market_only() {
         .await
         .unwrap();
     let mut tx = pool.begin().await.unwrap();
-    let r = ev("InferenceRefunded", serde_json::json!({"note":"0:n","amount":"1"}));
+    // Раньше здесь стоял `InferenceRefunded` БЕЗ `orderId` — событие, которого не
+    // бывает. Теперь у рефанда есть свой проектор со строгим разбором id, и такой
+    // payload уронил бы `project`. Смысл теста (любое inference-событие сеет скелет
+    // рынка) держит любой из оставшихся observability-типов.
+    let r = ev("InferenceExecuted", serde_json::json!({"ticks":"1","clearingPrice":"1","cost":"1"}));
     assert_eq!(project(&mut tx, &r, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
     let m: i64 =

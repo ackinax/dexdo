@@ -61,8 +61,8 @@ pub async fn project_inference_event(
         // `InferenceOrderRejected` carries no `orderId` — the placement was refused
         // before anything rested, so there is no row to key on, same as
         // `InferenceOrderCancelRejected`.
+        "InferenceRefunded" => apply_inference_refunded(tx, event, node).await,
         "InferenceExecuted"
-        | "InferenceRefunded"
         | "InferenceOrderCancelRejected"
         | "InferenceOrderRejected"
         | "InferenceOrderBookDeployed" => Ok(ProjectionOutcome::Applied),
@@ -661,6 +661,115 @@ async fn apply_inference_order_expired(
         None => Ok(ProjectionOutcome::Deferred), // parent OrderPlaced not seen yet
         Some(_) => Ok(ProjectionOutcome::Applied),
     }
+}
+
+/// `InferenceRefunded(orderId, note, amount)` — деньги вернулись владельцу, и с
+/// v4.0.33 событие несёт id, то есть говорит про КОНКРЕТНУЮ строку. Оно НЕ является
+/// общим сигналом закрытия: контракт шлёт его с четырёх мест, и только два из них
+/// про исчезновение ордера по времени (`InferenceOrderBook.sol`):
+///   * `:1368` — continuation возобновился после дедлайна: ЕДИНСТВЕННОЕ событие,
+///     `InferenceOrderExpired` для этого пути не эмитится вообще;
+///   * `:1135` — `_removeExpiredBid` -> `_refundAndRemove`: следом придёт
+///     `InferenceOrderExpired`, так что здесь это лишь ранний дубль;
+///   * `:1183` — `_finalizeTaker` для BUY: конец жизни тейкера, в том числе
+///     ПОЛНОСТЬЮ ИСПОЛНЕННОГО (`remaining < 2` покрывает и ноль, событие уходит
+///     даже при нулевом `leftover`);
+///   * `:1223` — `_finalizeTaker` для taker-only SELL, который не сматчился.
+///
+/// Разделяет их дедлайн, и разделяет ТОЧНО: `:1643` требует при submit
+/// `deadline == 0 || deadline > block.timestamp`, а повторная проверка на входе в
+/// `_doPlaceHead` (`:1355`) уводит просроченный continuation в ветку рефанда ДО
+/// матчинга. Значит `_finalizeTaker` недостижим с прошедшим дедлайном, а обе
+/// ветки истечения — с непрошедшим.
+///
+/// Поэтому строка закрывается ТОЛЬКО с прошедшим дедлайном и только в `EXPIRED`.
+/// Ветки `CANCELLED` здесь нет намеренно. Про тейкера рефанд не знает, исполнился
+/// тот или нет — знает `InferenceFilled`, и если он отложен из-за недостающей ноги,
+/// дренаж всё равно идёт дальше (`indexer_repo.rs:522`), так что рефанд применился
+/// бы РАНЬШЕ своего же fill'а. Закрыв строку, он навсегда оставил бы исполненный
+/// ордер отменённым: при повторе fill'а терминальный гард `apply_filled_decrement`
+/// запретит и декремент, и переход в `FILLED`.
+///
+/// Остаток IOC/MARKET и dust закрывает phantom sweep — сверкой с самой цепью,
+/// а не догадкой по payload'у. Это и есть его работа.
+async fn apply_inference_refunded(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &DecodedEvent,
+    node: &EventNode,
+) -> anyhow::Result<ProjectionOutcome> {
+    let ob = node.src.as_deref().context("Refunded: src missing")?;
+    let order_id = uint_field_to_decimal(&event.value, "orderId")?;
+    let chain_order = node_chain_order(node, "InferenceRefunded")?;
+    let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
+
+    // РОДИТЕЛЬ ПРОВЕРЯЕТСЯ ПЕРВЫМ и независимо от того, известно ли время. Сирота
+    // обязана уйти в Deferred и дальше — в dead-letter по возрасту. Ранний выход по
+    // отсутствию времени пометил бы её Applied, и поздний placement открыл бы ордер,
+    // который рефанд уже никогда не закроет.
+    let parent: Option<(String,)> = sqlx::query_as(
+        r#"select status from inference_orders
+            where orderbook_address = $1 and order_id = $2::numeric for update"#,
+    )
+    .bind(ob)
+    .bind(&order_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("lock inference row for Refunded")?;
+    if parent.is_none() {
+        return Ok(ProjectionOutcome::Deferred);
+    }
+
+    // Родитель есть, но времени события нет: выбрать между «истекло» и «тейкер
+    // закончился» НЕЛЬЗЯ, а угадать — значит записать неверный терминальный статус
+    // навсегда. Строка остаётся как есть, событие помечается Applied, а закрытие
+    // достаётся sweep'у — тому самому, который эта волна сохранила именно как
+    // сверку с состоянием цепи.
+    let Some(chain_seconds) = chain_seconds else {
+        warn!(
+            orderbook_address = ob, order_id = %order_id, chain_order = %chain_order,
+            "inference Refunded without chain time: status left to the phantom sweep rather than guessed"
+        );
+        return Ok(ProjectionOutcome::Applied);
+    };
+
+    // Строка уже заблокирована SELECT'ом выше, поэтому решение можно принять
+    // предикатом в WHERE: не подошла — не тронута ВООБЩЕ, включая `updated_at`.
+    // Иначе «no-op» врёт наблюдателю и churn'ит метку на каждом dust-рефанде по
+    // уже исполненному ордеру.
+    //
+    // Предикат «кому можно проставить истечение» — тот же, что у
+    // `apply_inference_order_expired`: `OPEN` или ПРОВИЗОРНАЯ sweep-отметка
+    // (`swept_at` NOT NULL). Sweep угадал `CANCELLED` только потому, что ордер
+    // исчез из книги, а это ровно то, что делает истечение, — событие его
+    // поправляет и снимает `swept_at`. `FILLED`, `EXPIRED` и НАСТОЯЩАЯ отмена
+    // (`swept_at` NULL) стоят.
+    sqlx::query(
+        r#"update inference_orders o
+              set status = 'EXPIRED',
+                  swept_at = null,
+                  last_chain_order = greatest(o.last_chain_order, $3),
+                  chain_updated_at = greatest(o.chain_updated_at, to_timestamp($4::double precision)),
+                  updated_at = now()
+            where o.orderbook_address = $1
+              and o.order_id = $2::numeric
+              -- Закрывать по рефанду можно ТОЛЬКО просроченный ордер: с непрошедшим
+              -- дедлайном это `_finalizeTaker`, где судьбу ордера решает `Filled`.
+              and o.deadline is not null
+              and o.deadline <= $4::numeric
+              and (o.status = 'OPEN' or (o.status = 'CANCELLED' and o.swept_at is not null))"#,
+    )
+    .bind(ob)
+    .bind(&order_id)
+    .bind(&chain_order)
+    .bind(chain_seconds)
+    .execute(&mut **tx)
+    .await
+    .context("inference Refunded update")?;
+
+    // Applied независимо от числа затронутых строк: существование родителя уже
+    // доказано блокирующим SELECT'ом, а «не подошёл по дедлайну» — это ответ, а не
+    // отсрочка. Deferred здесь означал бы «жди», и событие крутилось бы вечно.
+    Ok(ProjectionOutcome::Applied)
 }
 
 async fn apply_inference_order_cancelled(
