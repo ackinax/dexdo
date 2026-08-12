@@ -30,6 +30,14 @@ const ABI_INFERENCE_ORDER_BOOK: &str =
     include_str!("../../../contracts/airegistry/InferenceOrderBook.abi.json");
 const ABI_TOKEN_CONTRACT: &str =
     include_str!("../../../contracts/airegistry/TokenContract.abi.json");
+// Загружается НЕ ради проекции — ни одно его событие в read-модель не идёт. Ради
+// разрешения коллизии: `RootModel.ContractDeployed(address self)` побайтово совпадает
+// с `TokenContract.ContractDeployed`, значит совпадает и body-id. Пока этот ABI не
+// загружен, id уникален, декодер молча отдаёт его TokenContract'у, и деплой
+// root-модели заводит фантомную строку `inference_deals` по её адресу — без единого
+// сигнала оператору: счётчик неоднозначных id не срабатывает, потому что с одним
+// загруженным ABI неоднозначности нет.
+const ABI_ROOT_MODEL: &str = include_str!("../../../contracts/airegistry/RootModel.abi.json");
 
 const DEX_ABIS: &[(&str, &str)] = &[
     ("RootOracle", ABI_ROOT_ORACLE),
@@ -42,8 +50,11 @@ const DEX_ABIS: &[(&str, &str)] = &[
     ("Nullifier", ABI_NULLIFIER),
 ];
 
-const INFERENCE_ABIS: &[(&str, &str)] =
-    &[("InferenceOrderBook", ABI_INFERENCE_ORDER_BOOK), ("TokenContract", ABI_TOKEN_CONTRACT)];
+const INFERENCE_ABIS: &[(&str, &str)] = &[
+    ("InferenceOrderBook", ABI_INFERENCE_ORDER_BOOK),
+    ("TokenContract", ABI_TOKEN_CONTRACT),
+    ("RootModel", ABI_ROOT_MODEL),
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodedEvent {
@@ -124,13 +135,15 @@ impl Decoder {
             contracts.insert(kind, contract);
         }
 
-        // Route table: dst-based disambiguation for colliding event ids. No loaded
-        // ABI currently introduces a collision — the InferenceOrderBook events carry
-        // an `Inference` prefix, so InferenceOrderCancelled no longer shares an id with
-        // OrderBook.OrderCancelled, and every event resolves by unique id. These two
-        // OrderCancelled dsts are pinned defensively to keep the path exercised; add
-        // more here if a future ABI reintroduces a collision. `expected_id` is looked
-        // up from the loaded contract, never hardcoded.
+        // Route table: dst-based disambiguation for colliding event ids. The two
+        // OrderCancelled dsts are pinned defensively — the InferenceOrderBook events
+        // carry an `Inference` prefix, so they no longer share an id with
+        // OrderBook.OrderCancelled — while the two ContractDeployed dsts resolve a
+        // REAL collision: RootModel and TokenContract declare byte-identical events,
+        // so only `dst` tells a root-model deploy from a deal deploy. Both routes are
+        // mandatory: with either missing, that side falls through to the id lookup,
+        // which now reports AmbiguousCollision instead of guessing. `expected_id` is
+        // looked up from the loaded contract, never hardcoded.
         let mut routes = HashMap::new();
         Self::add_route(&mut routes, &contracts, 144, "OrderBook", "OrderCancelled")?;
         Self::add_route(
@@ -140,6 +153,9 @@ impl Decoder {
             "InferenceOrderBook",
             "InferenceOrderCancelled",
         )?;
+        // `ContractDeployedEmit` = 703 — RootModel; `DealDeployedEmit` = 732 — сделка.
+        Self::add_route(&mut routes, &contracts, 703, "RootModel", "ContractDeployed")?;
+        Self::add_route(&mut routes, &contracts, 732, "TokenContract", "ContractDeployed")?;
 
         Ok(Self { contracts, event_index, routes })
     }
@@ -260,7 +276,10 @@ mod tests {
             assert!(decoder.contracts.contains_key(kind), "missing contract {kind}");
         }
 
-        // 57 DEX unique ids + 9 InferenceOrderBook ids + 15 TokenContract ids = 81
+        // 57 DEX unique ids + 9 InferenceOrderBook ids + 15 TokenContract ids
+        // + 1 RootModel id = 82. RootModel объявляет ДВА события, но `ContractDeployed`
+        // побайтово совпадает с TokenContract'ским и делит с ним id — новый id
+        // приносит только `TokenContractRegistered`.
         // distinct ids. (The InferenceOrderBook events carry an `Inference` prefix, so
         // none collides with the DEX OrderBook events.) The DEX side gained seven
         // PrivateNote events (DealCredited, BookCredited, InferenceOrderRemoved,
@@ -273,7 +292,7 @@ mod tests {
         // id without changing the count — a signature id is a hash of the name AND the
         // input types, so a reshaped event is a different id, not an extra one. Nothing
         // decodes the old id any more; rows carrying it stay undecoded.
-        assert_eq!(decoder.known_events(), 81, "unexpected total event id count");
+        assert_eq!(decoder.known_events(), 82, "unexpected total event id count");
 
         // sample lookups — find entries for PMP
         let pmp_event_ids: Vec<_> = decoder
@@ -313,12 +332,57 @@ mod tests {
         );
     }
 
+    // Сигнатуры RootModel.ContractDeployed и TokenContract.ContractDeployed
+    // ПОБАЙТОВО совпадают — `{"name":"ContractDeployed","inputs":[{"name":"self",
+    // "type":"address"}],"outputs":[]}` в обоих ABI, — значит совпадает и body-id.
+    // Различить их может только `dst`, и проверять это надо на том пути, который
+    // работает в бою: таблицу маршрутов можно прочесть и напрямую, но тогда тест
+    // переживёт и игнорирование `dst` в `decode_event_body`, и маршрут, указывающий
+    // на не то событие того же ABI.
+    #[test]
+    fn contract_deployed_body_decodes_per_dst_route() {
+        use crate::config::event_type_dst;
+        let d = Decoder::new().unwrap();
+        let zero = "0:0000000000000000000000000000000000000000000000000000000000000000";
+        // Тело одно на оба маршрута — в этом и состоит коллизия.
+        let body = encode_event_body_b64(
+            &d,
+            "TokenContract",
+            "ContractDeployed",
+            serde_json::json!({ "self": zero }),
+        );
+
+        // `ContractDeployedEmit` = 703 (RootModel), `DealDeployedEmit` = 732 (сделка).
+        let by_root =
+            d.decode_event_body(&body, Some(&event_type_dst(703))).unwrap().decoded().unwrap();
+        assert_eq!(
+            by_root.event_type, "RootModel.ContractDeployed",
+            "деплой root-модели обязан перестать заводить строку inference_deals"
+        );
+
+        let by_deal =
+            d.decode_event_body(&body, Some(&event_type_dst(732))).unwrap().decoded().unwrap();
+        assert_eq!(by_deal.event_type, "TokenContract.ContractDeployed");
+
+        // Без dst id теперь неоднозначен, и это обязано быть ВИДНО. Молчаливый
+        // резолв в первый ABI — ровно тот дефект, из-за которого фантомные строки
+        // и заводились: счётчик коллизий не срабатывал, потому что коллизии не было.
+        assert!(
+            matches!(
+                d.decode_event_body(&body, None).unwrap(),
+                DecodeOutcome::AmbiguousCollision { .. }
+            ),
+            "общий id без dst обязан считаться коллизией, а не разрешаться молча"
+        );
+    }
+
     #[test]
     fn registers_inference_orderbook_and_counts_unique_ids() {
         let decoder = Decoder::new().unwrap();
         assert!(decoder.contracts.contains_key("InferenceOrderBook"), "inference abi missing");
-        // 57 DEX + 9 inference + 15 TokenContract = 81.
-        assert_eq!(decoder.unique_event_ids(), 81, "unexpected unique event-id count");
+        // 57 DEX + 9 inference + 15 TokenContract + 1 RootModel = 82 (см. выше:
+        // RootModel.ContractDeployed делит id с TokenContract.ContractDeployed).
+        assert_eq!(decoder.unique_event_ids(), 82, "unexpected unique event-id count");
     }
 
     #[test]
@@ -448,6 +512,23 @@ mod tests {
         for (name, event) in tc.events() {
             let entries =
                 decoder.event_index.get(&event.get_id()).map(Vec::as_slice).unwrap_or(&[]);
+            if name == "ContractDeployed" {
+                // Коллизия НАМЕРЕННАЯ: RootModel объявляет событие с той же
+                // сигнатурой, и различает их только dst. Обе стороны обязаны быть
+                // в индексе и обе — иметь маршрут, иначе разрешение сведётся к
+                // порядку загрузки ABI и деплой root-модели заведёт фантомную сделку.
+                assert_eq!(
+                    entries.len(),
+                    2,
+                    "ContractDeployed обязан коллидировать с RootModel: {entries:?}"
+                );
+                let kinds: Vec<_> = entries.iter().map(|(k, _)| *k).collect();
+                assert!(kinds.contains(&"TokenContract") && kinds.contains(&"RootModel"));
+                // `routes` приватно, но тест живёт в том же модуле — аксессор не нужен.
+                assert!(decoder.routes.contains_key(&crate::config::event_type_dst(732)));
+                assert!(decoder.routes.contains_key(&crate::config::event_type_dst(703)));
+                continue;
+            }
             assert_eq!(
                 entries.len(),
                 1,

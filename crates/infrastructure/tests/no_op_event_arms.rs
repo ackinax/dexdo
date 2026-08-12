@@ -26,7 +26,7 @@ use sqlx::PgPool;
 /// none of these are in `IGNORABLE_EVENT_TYPES` — that list is permission to
 /// drop an event at ingest, before `raw_events` is written, and dropping these
 /// would cut rewards off from the payload it settles on.
-const UNPERSISTED_DEX_EVENTS: [&str; 9] = [
+const UNPERSISTED_DEX_EVENTS: [&str; 11] = [
     "PMP.StakeForfeited",
     "PrivateNote.StakeForfeitConfirmed",
     "PrivateNote.StakeDroppedLocally",
@@ -36,6 +36,8 @@ const UNPERSISTED_DEX_EVENTS: [&str; 9] = [
     "PrivateNote.InferenceOrderRejectedMirror",
     "PrivateNote.InferenceDealClosed",
     "RootPN.DealWriteOffReported",
+    "RootModel.ContractDeployed",
+    "RootModel.TokenContractRegistered",
 ];
 
 async fn setup() -> Option<PgPool> {

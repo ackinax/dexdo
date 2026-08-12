@@ -98,7 +98,14 @@ pub async fn project_event(
         | "PrivateNote.InferenceOrderRemoved"
         | "PrivateNote.InferenceOrderRejectedMirror"
         | "PrivateNote.InferenceDealClosed"
-        | "RootPN.DealWriteOffReported" => Ok(ProjectionOutcome::Applied),
+        | "RootPN.DealWriteOffReported"
+        // ABI RootModel загружен ради разрешения коллизии `ContractDeployed` по `dst`
+        // (см. decoder.rs), а не ради проекции — в read-модель ни одно его событие не
+        // идёт. Арм'ы обязаны быть явными: без них оба уходят в `_ => Unknown`, где
+        // строка помечается processed и теряется НАВСЕГДА. Для `ContractDeployed` это
+        // ещё и суть починки: событие деплоя root-модели не должно заводить сделку.
+        | "RootModel.ContractDeployed"
+        | "RootModel.TokenContractRegistered" => Ok(ProjectionOutcome::Applied),
         et if et.starts_with("TokenContract.") => {
             crate::token_contract_projectors::project_token_contract_event(tx, event, node)
                 .await
