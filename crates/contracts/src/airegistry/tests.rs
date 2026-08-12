@@ -18,6 +18,8 @@ const SUPER_ROOT_ABI: &str = include_str!("../../../../contracts/airegistry/Supe
 const ROOT_MODEL_ABI: &str = include_str!("../../../../contracts/airegistry/RootModel.abi.json");
 const TOKEN_CONTRACT_ABI: &str =
     include_str!("../../../../contracts/airegistry/TokenContract.abi.json");
+const ORACLE_EVENT_LIST_ABI: &str =
+    include_str!("../../../../contracts/dex/OracleEventList.abi.json");
 const INFERENCE_ORDER_BOOK_ABI: &str =
     include_str!("../../../../contracts/airegistry/InferenceOrderBook.abi.json");
 
@@ -395,6 +397,14 @@ fn event_address_roundtrips_through_try_from() {
     );
     assert_eq!(Tc::try_from(Tc::ProbeAccepted.to_string()).unwrap(), Tc::ProbeAccepted);
     assert_eq!(Iob::try_from(Iob::Filled.to_string()).unwrap(), Iob::Filled);
+    // Тот же круг, что `every_declared_variant_round_trips_through_try_from` делает
+    // по `ALL`: без арма в `TryFrom` вариант объявлен, а декодер его не знает.
+    use crate::dex::oracle_event_list_events::OracleEventListEvent as Oel;
+    assert_eq!(
+        Oel::try_from(Oel::RangeEventAdded.to_string()).unwrap(),
+        Oel::RangeEventAdded,
+        "RangeEventAdded объявлен вариантом, но TryFrom его id (162) не знает"
+    );
     assert!(Iob::try_from(
         ":0000000000000000000000000000000000000000000000000000000000000063".to_string()
     )
@@ -479,6 +489,11 @@ fn event_payloads_decode_abi_shape() {
     decodes!(tc::TicksClaimedData, TOKEN_CONTRACT_ABI, "TicksClaimed");
     decodes!(tc::EndpointSetData, TOKEN_CONTRACT_ABI, "EndpointSet");
     decodes!(tc::BuyerBondFundedData, TOKEN_CONTRACT_ABI, "BuyerBondFunded");
+
+    // Алиасы выше идут через `use super::… as …`, где `super` — `airegistry`.
+    // Для чужого модуля нужен полный путь от корня крейта.
+    use crate::dex::oracle_event_list_events as oel;
+    decodes!(oel::RangeEventAddedData, ORACLE_EVENT_LIST_ABI, "RangeEventAdded");
 
     // TokenContract (700-range streaming).
     decodes!(tc::StreamFundedData, TOKEN_CONTRACT_ABI, "StreamFunded");

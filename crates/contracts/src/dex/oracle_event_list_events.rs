@@ -19,6 +19,10 @@ pub enum OracleEventListEvent {
     EventConfirmed = 106,
     DescriptionUpdated = 107,
     EventAdded = 133,
+    /// `ORACLE_RANGE_EVENT_ADDED` (`contracts/dex/modifiers/modifiers.sol:88`).
+    /// Тот же id уже запинен манифестом (`dex_event_manifest.rs:295`) вместе с
+    /// emit-сайтом; здесь он не вводится заново, а догоняет уже выведенный факт.
+    RangeEventAdded = 162,
 }
 
 impl TryFrom<String> for OracleEventListEvent {
@@ -38,6 +42,7 @@ impl TryFrom<String> for OracleEventListEvent {
             106 => Ok(OracleEventListEvent::EventConfirmed),
             107 => Ok(OracleEventListEvent::DescriptionUpdated),
             133 => Ok(OracleEventListEvent::EventAdded),
+            162 => Ok(OracleEventListEvent::RangeEventAdded),
             _ => Err(KitError::new(
                 KitModule::Event,
                 KitErrorCode::UnknownEvent,
@@ -63,6 +68,7 @@ impl OracleEventListEvent {
 pub enum DecodedOracleEventListEvent {
     EventAdded { event: Event, kind: OracleEventListEvent, data: EventAddedData },
     EventConfirmed { event: Event, kind: OracleEventListEvent, data: EventConfirmedData },
+    RangeEventAdded { event: Event, kind: OracleEventListEvent, data: RangeEventAddedData },
     DescriptionUpdated { event: Event, kind: OracleEventListEvent, data: DescriptionUpdatedData },
 }
 
@@ -83,6 +89,24 @@ impl FromEvent for DecodedOracleEventListEvent {
                     )
                 })?;
                 Ok(DecodedOracleEventListEvent::EventAdded { event: event.clone(), kind, data })
+            }
+            OracleEventListEvent::RangeEventAdded => {
+                let decoded = event.decode::<RangeEventAddedData>(contract)?;
+                let data = decoded.ok_or_else(|| {
+                    KitError::new(
+                        KitModule::Event,
+                        KitErrorCode::EmptyData,
+                        format!(
+                            "Unexpected empty data for oracle event list event `{}`",
+                            event.dst
+                        ),
+                    )
+                })?;
+                Ok(DecodedOracleEventListEvent::RangeEventAdded {
+                    event: event.clone(),
+                    kind,
+                    data,
+                })
             }
             OracleEventListEvent::EventConfirmed => {
                 let decoded = event.decode::<EventConfirmedData>(contract)?;
@@ -144,4 +168,17 @@ pub struct EventConfirmedData {
 /// Payload of `OracleEventListEvent::DescriptionUpdated`.
 pub struct DescriptionUpdatedData {
     pub description: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(test, serde(deny_unknown_fields))]
+/// Payload of `OracleEventListEvent::RangeEventAdded`.
+pub struct RangeEventAddedData {
+    /// uint256 — приезжает "0x"+64 hex, конверсию делает потребитель
+    /// (`uint256_maybe_hex`). `u128` здесь не годится в принципе.
+    pub event_id: String,
+    pub ob: String,
+    /// uint256[] — массив hex-строк, конверсия поэлементная.
+    pub bounds: Vec<String>,
 }

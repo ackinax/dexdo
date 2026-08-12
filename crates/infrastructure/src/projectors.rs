@@ -11,6 +11,8 @@ use tracing::debug;
 use tracing::error;
 use tracing::warn;
 
+use dodex_contracts::dex::oracle_event_list_events::RangeEventAddedData;
+
 use crate::decoder::DecodedEvent;
 use crate::graphql::EventNode;
 use crate::indexer_repo::parse_unix_seconds;
@@ -353,23 +355,21 @@ async fn apply_range_event_added(
 ) -> anyhow::Result<ProjectionOutcome> {
     let eventlist_address =
         node.src.as_deref().context("RangeEventAdded: src missing on event message")?;
-    let event_id_hex = field_str(&event.value, "eventId")?;
-    let event_id_decimal = uint256_hex_to_decimal(event_id_hex)?;
-    let range_ob_address = field_str(&event.value, "ob")?;
-
-    // `bounds` is a `uint256[]` — detokenised to an array of hex strings.
-    // Store the API-facing shape: a JSON array of decimal strings.
-    let bounds_raw = event
-        .value
-        .get("bounds")
-        .and_then(Value::as_array)
-        .context("RangeEventAdded: `bounds` missing or not an array")?;
-    let mut bounds_decimal = Vec::with_capacity(bounds_raw.len());
-    for bound in bounds_raw {
-        let hex = bound.as_str().context("RangeEventAdded: `bounds` entry is not a string")?;
-        bounds_decimal.push(Value::String(uint256_hex_to_decimal(hex)?));
-    }
-    let bounds_json = Value::Array(bounds_decimal);
+    // Исчерпывающая деструктуризация: каждое поле ABI обязано быть названо.
+    let RangeEventAddedData { event_id, ob, bounds } =
+        serde_json::from_value(event.value.clone())
+            .context("RangeEventAdded: payload не разбирается по ABI")?;
+    // `eventId` и `bounds` — uint256 и uint256[]; DTO держит СЫРЫЕ значения ABI
+    // ("0x"+64 hex), поэтому конверсия остаётся здесь. Хранимая форма — то, что
+    // отдаёт API: десятичные строки.
+    let event_id_decimal = uint256_maybe_hex(&event_id)?;
+    let range_ob_address = ob.as_str();
+    let bounds_json = Value::Array(
+        bounds
+            .iter()
+            .map(|b| uint256_maybe_hex(b).map(Value::String))
+            .collect::<anyhow::Result<Vec<_>>>()?,
+    );
 
     let parent: Option<(i64,)> =
         sqlx::query_as("select id from oracle_event_lists where address = $1")
