@@ -111,8 +111,9 @@ async fn the_pending_window_excludes_rows_ingested_before_the_run() {
 
     let repo = IndexerRepository::new(pool.clone());
     let now = chrono::Utc::now().timestamp();
-    let count_of =
-        |rows: &[(String, i64)]| -> i64 { rows.iter().filter(|(t, _)| t == ty).map(|(_, n)| *n).sum() };
+    let count_of = |rows: &[(String, i64)]| -> i64 {
+        rows.iter().filter(|(t, _)| t == ty).map(|(_, n)| *n).sum()
+    };
 
     let narrow = repo.pending_projection_since(now - 60).await.unwrap();
     assert_eq!(count_of(&narrow), 1, "в узкое окно обязана попасть ровно свежая строка");

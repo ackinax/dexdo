@@ -128,6 +128,54 @@ struct PendingRow {
 }
 
 impl IndexerRepository {
+    /// Event types whose deferral is allowed to end in a dead letter, and why
+    /// each one is here. This is an ALLOW-LIST on purpose: the cutoff asserts
+    /// "this parent will never arrive", which is a claim about a specific parent,
+    /// not a property of deferral in general. `projectors.rs` defers in fourteen
+    /// places and nearly all of them wait for something that legitimately arrives
+    /// later — `PMPDeployed` waits for its `token_type` to show up in
+    /// `ref_tokens`, and `TimingsSet`, `PoolsFrozen`, `Resolved` and the
+    /// cancellation events wait for their own `PMPDeployed`. At the 30-minute
+    /// production cutoff (`indexer.yaml.j2`), dead-lettering those would kill a
+    /// market silently and permanently: the row is marked processed and never
+    /// re-asked (IX-FAIL-06).
+    const DEAD_LETTERABLE: &'static [&'static str] = &[
+        // The book's own events. The parent `InferenceOrderPlaced` is captured
+        // from the same address in the same stream, so if it has not arrived by
+        // the cutoff with capture at head, it was dropped and is not coming.
+        // `repair_expired_inference_orphan` fixes depth on whichever leg is
+        // present before the row is dropped.
+        "InferenceOrderBook.",
+        // The range binding. `RangeEventAdded` annotates an `oracle_events` row
+        // it does not create, and its parents (`OracleEventListDeployed`,
+        // `EventAdded`) come from an oracle list that may have been deployed
+        // BEFORE this deployment's capture cursor ever started — in which case
+        // they are not late, they lie outside the captured history. Nothing in
+        // the read model to repair; the row is dropped with a `warn!` naming the
+        // loss.
+        //
+        // Matched by FULL name, not by contract prefix: `OracleEventList.EventAdded`
+        // from the same contract is deliberately absent — its parent arrives
+        // legitimately later.
+        "OracleEventList.RangeEventAdded",
+    ];
+    /// Shared subquery for "addresses that emitted at least one event inside the
+    /// run window". Shared by `inference_books_with_events_since` and
+    /// `inference_anchored_books_since`: their window predicate must be
+    /// identical, or the anchor and the diagnostic would be talking about
+    /// different runs.
+    ///
+    /// Written as `in (subquery)` rather than a per-book `exists(...)` for the
+    /// query plan: `exists` with `src_address = m.orderbook_address` is covered
+    /// by NO existing index — both `src_address` indices are partial on
+    /// `processed_at is null` (`raw_events_pending_src_idx`,
+    /// `raw_events_unprocessed_src_idx`), and processed rows are exactly what a
+    /// run window needs (at the tail of a run they are the majority). This way
+    /// the window is scanned once via `raw_events_created_at_idx` (migration
+    /// 0007) instead of once per book on every poll.
+    const EVENTS_IN_WINDOW: &'static str = r#"select e.src_address from raw_events e
+                       where e.created_at >= to_timestamp($1::double precision)
+                         and e.src_address is not null"#;
     /// Shared `count(*) filter (...)` projection for the three inference-market
     /// lifecycle buckets, in `(discovering, visible, failing)` order. Both
     /// `inference_market_state_counts` (whole-table) and
@@ -144,6 +192,15 @@ impl IndexerRepository {
         count(*) filter (where last_reconciled_at is null
                            and last_reconcile_failed_at is not null
                            and superseded_at is null) as failing"#;
+    /// Shared WHERE-clause fragment for "this book carries no verdict": not
+    /// visible, not superseded, and not failing **with a reason**. The first
+    /// three states are exactly `MARKET_STATE_COUNTS_SELECT`'s
+    /// `discovering`/`visible`/`failing` buckets; the one difference is that a
+    /// failure stamp without text does not count as failing here, because
+    /// IX-SEQ-10 asks for the reason and the observer cannot read the pod's logs.
+    const NO_VERDICT_WHERE: &'static str = r#"m.last_reconciled_at is null
+                  and m.superseded_at is null
+                  and (m.last_reconcile_failed_at is null or m.last_reconcile_error is null)"#;
     /// Shared `count(*) filter (...)` projection for the three inference-order
     /// status buckets, in `(open, filled, cancelled)` order. Shared by
     /// `inference_order_status_counts` (whole-table) and
@@ -153,20 +210,6 @@ impl IndexerRepository {
         count(*) filter (where status = 'OPEN') as open,
         count(*) filter (where status = 'FILLED') as filled,
         count(*) filter (where status = 'CANCELLED') as cancelled"#;
-    /// Shared WHERE-clause fragment for the "wedged inference book" predicate:
-    /// visible, not superseded, and with at least one still-unprocessed
-    /// `raw_events` row under the book's `orderbook_address`. Both
-    /// `inference_wedged_books_count` (whole-table) and
-    /// `inference_wedged_book_addresses` (scoped to a caller-supplied address
-    /// set) below build their query from this one constant, so the whole-table
-    /// production count and the scoped query a test exercises can never drift
-    /// apart — edit the predicate here only, never duplicate it.
-    const WEDGED_BOOKS_WHERE: &'static str = r#"m.last_reconciled_at is not null
-                  and m.superseded_at is null
-                  and exists(
-                      select 1 from raw_events e
-                       where e.src_address = m.orderbook_address
-                         and e.processed_at is null)"#;
     /// Shared WHERE-clause fragment for "a `raw_events` row the projection loop
     /// will pick up": unprocessed, typed and decoded. `count_pending_projection`
     /// (whole-table), `projection_lag_seconds` (age of the oldest such row) and
@@ -185,32 +228,20 @@ impl IndexerRepository {
     /// `undecodable_addresses_since` (scoped) both build from it.
     const UNDECODABLE_WHERE: &'static str = r#"processed_at is null
                   and (event_type is null or decoded is null)"#;
-    /// Shared subquery for "addresses that emitted at least one event inside the
-    /// run window". Shared by `inference_books_with_events_since` and
-    /// `inference_anchored_books_since`: their window predicate must be
-    /// identical, or the anchor and the diagnostic would be talking about
-    /// different runs.
-    ///
-    /// Written as `in (subquery)` rather than a per-book `exists(...)` for the
-    /// query plan: `exists` with `src_address = m.orderbook_address` is covered
-    /// by NO existing index — both `src_address` indices are partial on
-    /// `processed_at is null` (`raw_events_pending_src_idx`,
-    /// `raw_events_unprocessed_src_idx`), and processed rows are exactly what a
-    /// run window needs (at the tail of a run they are the majority). This way
-    /// the window is scanned once via `raw_events_created_at_idx` (migration
-    /// 0007) instead of once per book on every poll.
-    const EVENTS_IN_WINDOW: &'static str = r#"select e.src_address from raw_events e
-                       where e.created_at >= to_timestamp($1::double precision)
-                         and e.src_address is not null"#;
-    /// Shared WHERE-clause fragment for "this book carries no verdict": not
-    /// visible, not superseded, and not failing **with a reason**. The first
-    /// three states are exactly `MARKET_STATE_COUNTS_SELECT`'s
-    /// `discovering`/`visible`/`failing` buckets; the one difference is that a
-    /// failure stamp without text does not count as failing here, because
-    /// IX-SEQ-10 asks for the reason and the observer cannot read the pod's logs.
-    const NO_VERDICT_WHERE: &'static str = r#"m.last_reconciled_at is null
+    /// Shared WHERE-clause fragment for the "wedged inference book" predicate:
+    /// visible, not superseded, and with at least one still-unprocessed
+    /// `raw_events` row under the book's `orderbook_address`. Both
+    /// `inference_wedged_books_count` (whole-table) and
+    /// `inference_wedged_book_addresses` (scoped to a caller-supplied address
+    /// set) below build their query from this one constant, so the whole-table
+    /// production count and the scoped query a test exercises can never drift
+    /// apart — edit the predicate here only, never duplicate it.
+    const WEDGED_BOOKS_WHERE: &'static str = r#"m.last_reconciled_at is not null
                   and m.superseded_at is null
-                  and (m.last_reconcile_failed_at is null or m.last_reconcile_error is null)"#;
+                  and exists(
+                      select 1 from raw_events e
+                       where e.src_address = m.orderbook_address
+                         and e.processed_at is null)"#;
 
     pub fn new(pool: PgPool) -> Self {
         Self {
@@ -774,38 +805,6 @@ impl IndexerRepository {
         Ok(stats)
     }
 
-    /// Event types whose deferral is allowed to end in a dead letter, and why
-    /// each one is here. This is an ALLOW-LIST on purpose: the cutoff asserts
-    /// "this parent will never arrive", which is a claim about a specific parent,
-    /// not a property of deferral in general. `projectors.rs` defers in fourteen
-    /// places and nearly all of them wait for something that legitimately arrives
-    /// later — `PMPDeployed` waits for its `token_type` to show up in
-    /// `ref_tokens`, and `TimingsSet`, `PoolsFrozen`, `Resolved` and the
-    /// cancellation events wait for their own `PMPDeployed`. At the 30-minute
-    /// production cutoff (`indexer.yaml.j2`), dead-lettering those would kill a
-    /// market silently and permanently: the row is marked processed and never
-    /// re-asked (IX-FAIL-06).
-    const DEAD_LETTERABLE: &'static [&'static str] = &[
-        // The book's own events. The parent `InferenceOrderPlaced` is captured
-        // from the same address in the same stream, so if it has not arrived by
-        // the cutoff with capture at head, it was dropped and is not coming.
-        // `repair_expired_inference_orphan` fixes depth on whichever leg is
-        // present before the row is dropped.
-        "InferenceOrderBook.",
-        // The range binding. `RangeEventAdded` annotates an `oracle_events` row
-        // it does not create, and its parents (`OracleEventListDeployed`,
-        // `EventAdded`) come from an oracle list that may have been deployed
-        // BEFORE this deployment's capture cursor ever started — in which case
-        // they are not late, they lie outside the captured history. Nothing in
-        // the read model to repair; the row is dropped with a `warn!` naming the
-        // loss.
-        //
-        // Matched by FULL name, not by contract prefix: `OracleEventList.EventAdded`
-        // from the same contract is deliberately absent — its parent arrives
-        // legitimately later.
-        "OracleEventList.RangeEventAdded",
-    ];
-
     /// Returns `true` when a deferred row has reached the dead-letter cutoff: its
     /// type is in [`Self::DEAD_LETTERABLE`], its **ingest** age
     /// (`now() - raw_events.created_at`) exceeds the configured cutoff, AND the
@@ -1130,10 +1129,7 @@ impl IndexerRepository {
     /// column it is compared against come from the same clock (the Postgres of
     /// the host the indexer runs on) — the CI runner's clock offset never enters
     /// the comparison.
-    pub async fn pending_projection_since(
-        &self,
-        since: i64,
-    ) -> anyhow::Result<Vec<(String, i64)>> {
+    pub async fn pending_projection_since(&self, since: i64) -> anyhow::Result<Vec<(String, i64)>> {
         let sql = format!(
             "select event_type, count(*) from raw_events \
               where {} and created_at >= to_timestamp($1::double precision) \
@@ -1273,10 +1269,7 @@ impl IndexerRepository {
     /// prove the book is the one a particular scenario deployed (scenario
     /// addresses are recorded nowhere a database-tail step could read them), and
     /// it does not prove the order itself was projected during this run.
-    pub async fn inference_anchored_books_since(
-        &self,
-        since: i64,
-    ) -> anyhow::Result<Vec<String>> {
+    pub async fn inference_anchored_books_since(&self, since: i64) -> anyhow::Result<Vec<String>> {
         let sql = format!(
             "select distinct m.orderbook_address \
                from inference_markets m \

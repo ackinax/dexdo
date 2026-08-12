@@ -302,6 +302,58 @@ projection, leave the row pending forever, and from there wedge the phantom swee
 fail-close the read gate for that book. Contract drift must go red in CI, not in the
 market.
 
+## Run-level observer
+
+The e2e pipeline ends with a step that creates no traffic and reads only the database
+(`crates/infrastructure/tests/e2e_observer.rs`). It lives in the infrastructure crate
+rather than the api one for two reasons: it calls `IndexerRepository` directly — it
+writes no SQL of its own, because `PENDING_PROJECTION_WHERE` and `WEDGED_BOOKS_WHERE`
+are the single source of the gauges it checks (IX-MET-03) — and its dev-dependencies
+are four light crates rather than `ackinacki-kit` + `dodex-chain[test-helpers]` +
+`salvo/test`, which matters because it compiles on the stand host inside the pipeline
+budget.
+
+Two properties make it usable as a blocking step:
+
+- it **polls to convergence** with a deadline (`OBSERVER_DEADLINE_SECS`; the default
+  lives in one place, `DEFAULT_DEADLINE_SECS` in the test, and the step prints the
+  effective value) rather than taking one snapshot. Capture ticks at 3s, the inference
+  reconciler at 15s, and visibility is stamped only after a full sweep cycle, so a book
+  seeded seconds before the tail is legitimately still `discovering`;
+- every assertion is scoped to the **run window**. The stand's Postgres outlives
+  pipelines, so a book abandoned in `discovering` by a cancelled run would otherwise
+  fail the next one for a foreign reason. The window is compared against
+  `raw_events.created_at` — ingest time, stamped by the same host's Postgres — and the
+  window's start is reconstructed on the host as `now - elapsed`, where `elapsed` is a
+  difference taken entirely on the CI runner's clock, so the two clocks' offset cancels.
+
+What it asserts about the run:
+
+- the projectable backlog converged to zero for rows ingested in the window — same
+  predicate as `count_pending_projection`. Undecodable rows are counted and **printed**
+  separately: their growth diagnoses ABI drift, but an event from a contract we do not
+  know is not our failure;
+- every book with events in the window carries a verdict — `visible`, `superseded`, or
+  `failing` **with a reason in `last_reconcile_error`**. A failure timestamp without
+  text is not a verdict. `superseded` is a correction, not a concession: a superseded
+  book is by construction neither visible nor failing, and a two-way check would fail
+  every run that redeploys a book. Note that the benign `NoBoc` outcome also stamps a
+  failure and supplies its own text, so this assertion proves the reason is *recorded*,
+  not that it is severe — which is why the step prints the failing books and their
+  reasons even when it passes;
+- no visible book of the run holds unprocessed events (the wedged-books predicate,
+  scoped to the run's books).
+
+A separate assertion anchors the run positively: at least one visible book carries a
+projected order and at least one event ingested inside the window. Without it an empty
+database passes every diagnostic above. The anchor cannot name a specific book —
+addresses deployed by scenarios are not recorded anywhere a database-tail step could
+read them — so it proves that projection happened for a book this run touched, not that
+a particular scenario's book is the one it found, and not that the order itself was
+projected during this run. When it fails it prints the diagnostic line first: "books in
+window = 0" means traffic never reached the indexer at all, a non-zero count means it
+arrived but nothing became visible.
+
 ## Reconciliation
 
 Three reconcilers (market, OracleEventList, inference) fill metadata that the event stream alone does not carry. All run on a fixed cadence (configured under `indexer:` in `config/indexer.<env>.yaml`) and share a failure-backoff pattern (`last_reconcile_failed_at`, `reconcile_attempts` on the parent row) so a permanently broken contract cannot starve the queue. The inference reconciler additionally exposes three cadence knobs (`inference_reference_price_refresh_ms`, `inference_sweep_interval_ms`, `inference_orphan_cutoff_ms`) beyond its base interval; see [Inference reconciler](#inference-reconciler) for the full table.

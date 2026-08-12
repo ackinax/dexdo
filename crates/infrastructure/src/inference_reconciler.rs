@@ -123,6 +123,14 @@ pub enum SweepStep {
 }
 
 impl InferenceReconciler {
+    /// Reason recorded for the benign `NoBoc` outcome. Named as a constant rather
+    /// than inlined so the decision stays visible: `NoBoc` is a BENIGN outcome —
+    /// IX-REC-27 keeps it out of the hard-failure counter — yet it does stamp a
+    /// failure. "Failing with a reason" is therefore routinely satisfied by this
+    /// text, and the observer proves the reason is NAMED, not that it is severe.
+    pub const NO_BOC_REASON: &'static str =
+        "account BOC not served yet (book announced, account state not returned by the gateway)";
+
     pub fn new(
         pool: PgPool,
         graphql: GraphqlClient,
@@ -834,14 +842,6 @@ impl InferenceReconciler {
         .context("advance sweep / stamp")?;
         Ok(stamp && res.rows_affected() == 1)
     }
-
-    /// Reason recorded for the benign `NoBoc` outcome. Named as a constant rather
-    /// than inlined so the decision stays visible: `NoBoc` is a BENIGN outcome —
-    /// IX-REC-27 keeps it out of the hard-failure counter — yet it does stamp a
-    /// failure. "Failing with a reason" is therefore routinely satisfied by this
-    /// text, and the observer proves the reason is NAMED, not that it is severe.
-    pub const NO_BOC_REASON: &'static str =
-        "account BOC not served yet (book announced, account state not returned by the gateway)";
 
     /// Stamps the reconcile failure for a book. `error` is stored next to the
     /// timestamp: the e2e observer and the operator both read the database, not

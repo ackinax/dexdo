@@ -190,8 +190,10 @@ async fn at_least_one_visible_book_carries_an_order_and_events_from_this_run() {
     // в законном `discovering`.
     let started = Instant::now();
     loop {
-        let anchored =
-            repo.inference_anchored_books_since(since).await.expect("observer: anchor query failed");
+        let anchored = repo
+            .inference_anchored_books_since(since)
+            .await
+            .expect("observer: anchor query failed");
         if !anchored.is_empty() {
             eprintln!("observer: якорь — {} видимых книг с ордерами: {anchored:?}", anchored.len());
             break;
