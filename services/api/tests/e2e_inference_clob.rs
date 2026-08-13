@@ -1,8 +1,9 @@
 // End-to-end CLOB-coverage smoke for the AI Registry inference market against a
 // real shellnet, driven through `dodex_chain::Dex`, with a read-model phase
 // over the production router (`common::setup()`) added to the partial-fill
-// flow. Fast (no timed windows) — complements `e2e_inference_match` /
-// `e2e_inference_stream`.
+// flow. Fast (no timed windows) — complements `e2e_inference_match`. There is
+// no `e2e_inference_stream` binary: no inference scenario opens a stream yet —
+// that is wave 5's subject.
 //
 // The chain phases assert what the BOOK holds; the read phase in the
 // partial-fill flow asserts that the match reached the read model and the

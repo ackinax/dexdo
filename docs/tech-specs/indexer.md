@@ -115,6 +115,48 @@ How much history that query reaches is a property of the deployment, not of the 
 `deploy/sql/prune_raw_events.sql` deletes *processed* rows past its retention (three days by
 default) and never touches un-projected ones. A rare event's body can therefore be gone.
 
+## Replay: what the bytes prove
+
+Fixtures under `crates/infrastructure/tests/fixtures/chain_bodies.rs` are real event bodies
+captured from chain. Tests built on them confirm the payload layout by observation, not by
+intention — the distinction that matters, because a hand-built `DecodedEvent` asserts only that
+the test and the projector agree with each other.
+
+Three layers are separate claims, and each fails differently: the decoder turns bytes into fields;
+capture stores the row with the right `event_type` and the body verbatim; the projector puts those
+fields in the right columns.
+
+Getter output is proved the same way, against a real account BOC, run locally — and through the
+runner the indexer itself uses, `tvm_runner::run_getter`, not the contract wrapper. That distinction
+is the point of the row: the reconciler's getters are mocked behind the `OrderBookGetter` seam, and
+`run_getter` is what sits behind it in production. It does three things a mock cannot exercise — it
+pins the `expire` header (the ABI default trips replay protection on any real account), it accepts
+the reply under either ext-out header tag, and it decodes the output.
+
+What it does not prove: fetching an account (covered separately by `account_boc.rs` against a mock
+gateway), and the two-line `DecoderGetter` wrapper, which has no public constructor.
+
+What replay does not cover, and the reasons differ per event.
+
+`StreamReclaimed` and `ProbeCommissionFunded` are absent from the current ABI, so the decoder does
+not know their ids; historical rows carrying them were decoded by an earlier build. The two got
+there differently, and the difference matters to anyone reading the census. `StreamReclaimed` was
+deleted: its projector arm and the `close_kind='RECLAIMED'` projection went with it, and a guard
+test pins its absence (`decoder.rs`) so that its return is loud rather than silent.
+`ProbeCommissionFunded` was **renamed** — `ProbeCommissionFunded → SellerBondFunded`, part of the
+seller-bond terminology change with no compatibility alias (`CHANGELOG.md`). So its behaviour is not
+uncovered at all; it is covered under the new name, whose bodies are current and plentiful. Only the
+old name's historical rows are unusable.
+
+`TickFinalized` is still in the ABI and still emitted. What is established about it is narrower than
+it looks: no body newer than the 2026-07-30 upgrade was found. Whether its layout changed is not
+known, and a fixture built on an older body would be unverifiable either way — so it is left out for
+lack of a current sample, not for a proven incompatibility.
+
+"A body exists in the database" is therefore not the same claim as "a body can be pinned by a
+test". Replay is bounded twice over: by the ABI in the tree, and by whether a sample exists on this
+side of the last upgrade.
+
 ## Projection — lifecycle events
 
 Lifecycle events drive transitions on [`markets`](data-schema.md#prediction-markets) and the [`oracles`](data-schema.md#oracles) / [`oracle_event_lists`](data-schema.md#oracle_event_lists) / [`oracle_events`](data-schema.md#oracle_events) hierarchy. Each projector identifies its row by `pmp_address` (or the relevant parent address); if that row does not exist yet, the projector returns `Deferred` so the projection loop will retry once the parent event has landed.
