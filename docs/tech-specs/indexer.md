@@ -354,6 +354,42 @@ projected during this run. When it fails it prints the diagnostic line first: "b
 window = 0" means traffic never reached the indexer at all, a non-zero count means it
 arrived but nothing became visible.
 
+## In-scene end-to-end assertions
+
+The observer above proves the pipeline drained; it cannot prove that a *particular*
+chain action arrived, because a database-tail step cannot know which addresses the
+scenarios deployed. That gap is closed inside the scenario binaries themselves: the
+inference e2e binaries run after `deploy_dexdo`, i.e. against a live indexer, and three
+of them carry read-model phases over the production router built in-process
+(`common::setup()`), asserting on the exact book and order they created.
+
+Two rules govern those phases, both in `common::read_model`:
+
+- **Poll for presence, assert on content.** `poll_read_with` returns as soon as the row
+  appears; the field checks run once, outside the loop. A loop that retried until the
+  *values* matched would turn a wrong remaining amount into an expired budget reading
+  "not yet" — a read-model defect disguised as a slow indexer.
+- **Never panic mid-scenario.** Every outcome comes back as a `Result` and joins the
+  binary's `failures` vector. The scenarios cancel their resting orders before the
+  single closing assertion; a panic before that point would leave escrow locked on the
+  note for the rest of the stand's life.
+
+What counts as "not yet" and is retried: an empty result set while projection catches
+up, `404` (`-1121`) while the book is not yet visible, and `503` (`-1500`) from the
+read path. Everything else is terminal: a `400` is a wrong URL in the test, and
+retrying it would turn a typo into an expired budget.
+
+One clarification about that `503`, because the obvious reading is wrong: the
+fail-closed gate over unprojected rows only fires for queries that name a
+`tokenContract` and scope live SELLs. None of these phases do, so for them a `503` can
+only come from the scale guard — a visible book whose precision columns the reconciler
+has not filled yet. The arm is kept for that case.
+
+What these phases do **not** prove: that the deployed `dodex-api` serves the same
+bytes. The router is the production one and reads the stand's database, so the read
+path — visibility gate, scaling, filters — is genuinely exercised; the deployment is
+not.
+
 ## Reconciliation
 
 Three reconcilers (market, OracleEventList, inference) fill metadata that the event stream alone does not carry. All run on a fixed cadence (configured under `indexer:` in `config/indexer.<env>.yaml`) and share a failure-backoff pattern (`last_reconcile_failed_at`, `reconcile_attempts` on the parent row) so a permanently broken contract cannot starve the queue. The inference reconciler additionally exposes three cadence knobs (`inference_reference_price_refresh_ms`, `inference_sweep_interval_ms`, `inference_orphan_cutoff_ms`) beyond its base interval; see [Inference reconciler](#inference-reconciler) for the full table.
