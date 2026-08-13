@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use dodex_infrastructure::database;
 use dodex_infrastructure::decoder::DecodedEvent;
+use dodex_infrastructure::decoder::Decoder;
 use dodex_infrastructure::graphql::EventNode;
 use dodex_infrastructure::inference_projectors::project_inference_event;
 use dodex_infrastructure::inference_projectors::repair_expired_inference_orphan;
@@ -17,6 +18,10 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use sqlx::Postgres;
 use sqlx::Transaction;
+
+mod fixtures;
+
+use fixtures::chain_bodies::INFERENCE_ORDER_PLACED;
 
 // Call sites pass the full on-wire event name (e.g. "InferenceOrderPlaced");
 // since v4.0.10 the inference book emits every event with an `Inference` prefix.
@@ -2236,4 +2241,108 @@ async fn deferred_filled_writes_no_tape_row() {
     assert!(tape_rows(&pool, ob).await.is_empty());
 
     clean(&pool, ob).await;
+}
+
+#[tokio::test]
+async fn a_real_order_placed_body_projects_into_inference_orders() {
+    // IX-OB-25. Every other projector test in this file builds `DecodedEvent` through
+    // `ev(...)`, so the field layout was asserted by intention: the test and the
+    // projector agreed with each other and neither consulted the chain. Here the event
+    // comes out of the decoder applied to real bytes, so the mapping is checked against
+    // what the book actually emits.
+    let Some(pool) = setup().await else { return };
+    let src = "0:proj_real_inference_book";
+    sqlx::query("delete from inference_orders where orderbook_address = $1")
+        .bind(src)
+        .execute(&pool)
+        .await
+        .expect("purge");
+
+    let decoded = Decoder::new()
+        .expect("decoder")
+        .decode_event_body(INFERENCE_ORDER_PLACED, None)
+        .expect("a real body must decode")
+        .decoded()
+        .expect("the event id must be known");
+    // The projector routes on the `event_type` SUFFIX, not on `event_name`
+    // (`inference_projectors.rs:53-56`): the reprojection path rebuilds `DecodedEvent`
+    // with an empty `event_name`, so an arm matching the name would send every live
+    // captured row to the seed-only branch. The decoder sets `event_type`, so this
+    // routes the same way a live row does.
+    assert_eq!(decoded.event_type, "InferenceOrderBook.InferenceOrderPlaced");
+
+    let n = node(src, "5f80projreal0000000000000001");
+    let mut tx = pool.begin().await.expect("begin");
+    let outcome = project(&mut tx, &decoded, &n).await;
+    tx.commit().await.expect("commit");
+    assert!(
+        matches!(outcome, ProjectionOutcome::Applied),
+        "a placement must project, got {outcome:?}"
+    );
+
+    // Read back what the projector wrote. Columns cast to text so the numerics come
+    // out in one predictable form and the assertions below compare strings, the same
+    // way the read model serves them.
+    let row: (
+        String,
+        bool,
+        String,
+        String,
+        String,
+        bool,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = sqlx::query_as(
+        "select order_id::text, is_buy, price::text, amount_initial::text,
+                    amount_remaining::text, is_subscription, note_address,
+                    token_contract, deadline::text, status
+               from inference_orders where orderbook_address = $1",
+    )
+    .bind(src)
+    .fetch_one(&pool)
+    .await
+    .expect("the projected order row");
+
+    // Expected values below are taken from the harvest journal's `decoded` snapshot
+    // for this exact body (`fixtures::chain_bodies::HARVESTED_ORDER_PLACED_DECODED`):
+    // {"note":"0:e730606f31613da5133259bc1617e1cb0ddcb9f4ea6c73d7c5a00a5326f32aea",
+    //  "flags":"0","isBuy":false,
+    //  "price":"0x00000000000000000000000000000000000000000000000000000000b2d05e00",
+    //  "ticks":"4","orderId":"534","deadline":"1786648380",
+    //  "tokenContract":"0:970f10070ec4126eb34653072328555f58c307629612a15377df66555748a646"}
+    // — NOT pasted from the first green run, which would only prove the projector
+    // agrees with itself.
+    assert_eq!(row.0, "534", "order_id <- orderId");
+    assert_eq!(row.1, false, "is_buy <- isBuy");
+    // price <- price, a uint256 hex in the payload (uint256_maybe_hex converts it to
+    // decimal): 0x...b2d05e00 = 3_000_000_000.
+    assert_eq!(row.2, "3000000000", "price <- price (hex uint256, decoded to decimal)");
+    // amount_initial / amount_remaining <- ticks, both from the same payload field.
+    assert_eq!(row.3, "4", "amount_initial <- ticks");
+    assert_eq!(row.4, "4", "amount_remaining <- ticks");
+    // is_subscription <- flags & FLAG_SUBSCRIPTION (0x40) != 0. The snapshot's flags
+    // is "0", so the bit is clear and the row is not a subscription.
+    assert_eq!(row.5, false, "is_subscription <- flags(0) & 0x40 != 0");
+    assert_eq!(
+        row.6, "0:e730606f31613da5133259bc1617e1cb0ddcb9f4ea6c73d7c5a00a5326f32aea",
+        "note_address <- note"
+    );
+    // token_contract <- tokenContract, through non_zero_address. The snapshot's
+    // tokenContract is a real (non-zero) address, so it must survive as Some, not
+    // collapse to NULL.
+    assert_eq!(
+        row.7.as_deref(),
+        Some("0:970f10070ec4126eb34653072328555f58c307629612a15377df66555748a646"),
+        "token_contract <- tokenContract (non-zero in the snapshot, must not collapse to NULL)"
+    );
+    // deadline <- deadline, through non_zero_uint. The snapshot's deadline is
+    // "1786648380", non-zero, so it must survive as Some, not collapse to NULL.
+    assert_eq!(
+        row.8.as_deref(),
+        Some("1786648380"),
+        "deadline <- deadline (non-zero in the snapshot)"
+    );
+    assert_eq!(row.9, "OPEN", "status <- constant 'OPEN' on placement");
 }
