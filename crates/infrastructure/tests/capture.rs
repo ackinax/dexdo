@@ -96,7 +96,12 @@ async fn persist_page_stores_a_real_inference_body_as_a_decoded_row() {
     )
     .await;
 
-    let edges = vec![edge(msg_id, Some("5f80capreal0000000000000001"), orderbook, Some(INFERENCE_ORDER_PLACED))];
+    let edges = vec![edge(
+        msg_id,
+        Some("5f80capreal0000000000000001"),
+        orderbook,
+        Some(INFERENCE_ORDER_PLACED),
+    )];
     let result = repo
         .persist_page(INFERENCE_BODY_TEST_STREAM, &edges, Some("cursor-1"), &decoder, false)
         .await
@@ -124,7 +129,11 @@ async fn persist_page_stores_a_real_inference_body_as_a_decoded_row() {
     // capture stores the body verbatim, so real bodies can be harvested from any
     // populated indexer database with a SQL query. If that ever changes, the next
     // harvest would silently come up empty; this fails first instead.
-    assert_eq!(body.as_deref(), Some(INFERENCE_ORDER_PLACED), "body_json must hold the base64 verbatim");
+    assert_eq!(
+        body.as_deref(),
+        Some(INFERENCE_ORDER_PLACED),
+        "body_json must hold the base64 verbatim"
+    );
 
     purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
 }
