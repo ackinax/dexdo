@@ -2283,7 +2283,7 @@ async fn a_real_order_placed_body_projects_into_inference_orders() {
     // Read back what the projector wrote. Columns cast to text so the numerics come
     // out in one predictable form and the assertions below compare strings, the same
     // way the read model serves them.
-    let row: (
+    type PlacedOrderRow = (
         String,
         bool,
         String,
@@ -2294,7 +2294,8 @@ async fn a_real_order_placed_body_projects_into_inference_orders() {
         Option<String>,
         Option<String>,
         String,
-    ) = sqlx::query_as(
+    );
+    let row: PlacedOrderRow = sqlx::query_as(
         "select order_id::text, is_buy, price::text, amount_initial::text,
                     amount_remaining::text, is_subscription, note_address,
                     token_contract, deadline::text, status
@@ -2315,7 +2316,7 @@ async fn a_real_order_placed_body_projects_into_inference_orders() {
     // — NOT pasted from the first green run, which would only prove the projector
     // agrees with itself.
     assert_eq!(row.0, "534", "order_id <- orderId");
-    assert_eq!(row.1, false, "is_buy <- isBuy");
+    assert!(!row.1, "is_buy <- isBuy");
     // price <- price, a uint256 hex in the payload (uint256_maybe_hex converts it to
     // decimal): 0x...b2d05e00 = 3_000_000_000.
     assert_eq!(row.2, "3000000000", "price <- price (hex uint256, decoded to decimal)");
@@ -2324,7 +2325,7 @@ async fn a_real_order_placed_body_projects_into_inference_orders() {
     assert_eq!(row.4, "4", "amount_remaining <- ticks");
     // is_subscription <- flags & FLAG_SUBSCRIPTION (0x40) != 0. The snapshot's flags
     // is "0", so the bit is clear and the row is not a subscription.
-    assert_eq!(row.5, false, "is_subscription <- flags(0) & 0x40 != 0");
+    assert!(!row.5, "is_subscription <- flags(0) & 0x40 != 0");
     assert_eq!(
         row.6, "0:e730606f31613da5133259bc1617e1cb0ddcb9f4ea6c73d7c5a00a5326f32aea",
         "note_address <- note"
