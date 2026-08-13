@@ -227,18 +227,31 @@ async fn a_fail_closed_503_is_retryable_and_a_bad_request_is_not() {
     let url = api(&format!(
         "orders?inferenceOrderBookAddress={ob}&tokenContract=0:rmp_unknown&status=LIVE"
     ));
+
+    // Collected, not asserted in place, and `purge` below runs unconditionally
+    // after every check — the same discipline the on-chain scenario binaries
+    // use (`common::read_model`). This test seeds a book AND an undecodable
+    // `raw_events` row under `ob`; a `panic!` before cleanup would leave both
+    // behind in whatever database `TEST_DATABASE_URL` names. On the stand
+    // that is the live indexer database, and wave 2's observer counts books
+    // and events inside the run window — a leaked row would turn it red for
+    // a reason that is not the observer's.
+    let mut failures: Vec<String> = Vec::new();
+
     match get_json(&service, &url).await {
         GetOutcome::Retry(why) => {
-            assert!(why.contains("503"), "refusal not recognized as 503: {why}")
+            if !why.contains("503") {
+                failures.push(format!("refusal not recognized as 503: {why}"));
+            }
         }
-        other => panic!(
+        other => failures.push(format!(
             "the gate must refuse with 503 while an unprojected row hangs under the book; got {}",
             match other {
-                GetOutcome::Ok(_) => "200",
-                GetOutcome::Fatal(ref f) => f,
+                GetOutcome::Ok(_) => "200".to_string(),
+                GetOutcome::Fatal(f) => f,
                 GetOutcome::Retry(_) => unreachable!(),
             }
-        ),
+        )),
     }
 
     // Remove the cause of the refusal — the same request must now succeed.
@@ -249,21 +262,51 @@ async fn a_fail_closed_503_is_retryable_and_a_bad_request_is_not() {
     seed_at_head(&pool).await; // the cursor may have gone stale during the test
     match get_json(&service, &url).await {
         GetOutcome::Ok(_) => {}
-        other => panic!(
+        other => failures.push(format!(
             "after removing the cause of the refusal the request must succeed; got {}",
             match other {
-                GetOutcome::Retry(ref w) | GetOutcome::Fatal(ref w) => w.as_str(),
+                GetOutcome::Retry(w) | GetOutcome::Fatal(w) => w,
                 GetOutcome::Ok(_) => unreachable!(),
             }
-        ),
+        )),
     }
 
     // 400: the book address is not passed at all ⇒ -1102, and that is terminal.
     let bad = get_json(&service, &api("depth")).await;
-    assert!(
-        matches!(bad, GetOutcome::Fatal(_)),
-        "a missing required parameter is a test defect, not \"not there yet\""
-    );
+    if !matches!(bad, GetOutcome::Fatal(_)) {
+        failures
+            .push("a missing required parameter is a test defect, not \"not there yet\"".into());
+    }
 
     purge(&pool, ob).await;
+    assert!(failures.is_empty(), "read_model_polling gate failures: {failures:#?}");
+}
+
+#[tokio::test]
+async fn a_book_not_yet_visible_answers_404_and_is_retried() {
+    // `get_json`'s `404 → Retry` arm has no other test, and it is the arm
+    // every on-chain read phase hits while a book is still discovering — those
+    // binaries need a live shellnet, so this is the only local coverage that
+    // would catch a future edit making "not visible yet" terminal instead of
+    // retryable.
+    //
+    // Exercising the simpler of the two conditions that collapse into it
+    // (`inference_read_repo.rs`, `list_inference_trades_impl`'s comment: "an
+    // unknown book and a never-reconciled one collapse to one client-visible
+    // miss"): an address with NO `inference_markets` row at all, not a
+    // seeded-but-unreconciled one. Nothing is inserted, so there is nothing
+    // to `purge`.
+    let Some((service, _pool, _kek, _pn)) = common::setup().await else { return };
+    let url = api("markets?inferenceOrderBookAddress=0:rmp_no_such_book");
+    match get_json(&service, &url).await {
+        GetOutcome::Retry(why) => assert!(why.contains("404"), "wrong wording: {why}"),
+        other => panic!(
+            "an address with no row must read as \"not visible yet\" (404), got {}",
+            match other {
+                GetOutcome::Ok(_) => "200".to_string(),
+                GetOutcome::Fatal(f) => f,
+                GetOutcome::Retry(_) => unreachable!(),
+            }
+        ),
+    }
 }

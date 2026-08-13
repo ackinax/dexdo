@@ -241,6 +241,9 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
     // run.
     if let (Some(service), Some(id)) = (read.as_ref(), order_id) {
         let want_id = id.to_string();
+        // Hoisted: both the `/orders` remainder check below and the `/depth`
+        // level check further down compare against this same expected size.
+        let want_ticks = ticks.to_string();
         let order = poll_read_with("IX-SEQ-02 order in /orders", budget.left(), || {
             let service = std::sync::Arc::clone(service);
             let ob = ob.clone();
@@ -281,7 +284,6 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
                 // The remainder fields are `ticks` / `ticksInitial`
                 // (`InferenceOrderDto`, `services/api/src/inference.rs:327-347`).
                 // The order was never crossed, so the remainder equals the initial size.
-                let want_ticks = ticks.to_string();
                 if o["ticks"].as_str() != Some(want_ticks.as_str()) {
                     failures.push(format!("ticks: want {want_ticks}, got {}", o["ticks"]));
                 }
@@ -324,7 +326,6 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
                         levels.len()
                     ));
                 }
-                let want_ticks = ticks.to_string();
                 if levels[0][1].as_str() != Some(want_ticks.as_str()) {
                     failures
                         .push(format!("level remainder: want {want_ticks}, got {}", levels[0][1]));

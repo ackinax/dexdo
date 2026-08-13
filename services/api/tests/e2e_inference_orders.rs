@@ -184,7 +184,7 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
     let read: Option<std::sync::Arc<salvo::Service>> =
         common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
     if read.is_none() {
-        eprintln!("[e2e_inference_orders] TEST_DATABASE_URL not set — read phase skipped");
+        eprintln!("[e2e_orders] TEST_DATABASE_URL not set — read phase skipped");
     }
     let budget = ReadBudget::start();
 
@@ -369,19 +369,38 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
                 match by_id(&cancelled_id) {
                     None => failures.push(format!("order {cancelled_id} missing from /orders")),
                     Some(o) => {
+                        // Defensive re-read: `poll_read_with`'s `Probe::Ready`
+                        // condition above already required this order to be
+                        // CANCELLED, so this cannot fail in practice. Kept for
+                        // the same reason `finish` is kept — a cheap check
+                        // that costs nothing to state explicitly.
                         if o["status"].as_str() != Some("CANCELLED") {
-                            failures.push(format!("cancelled order: status {}", o["status"]));
+                            failures.push(format!(
+                                "cancelled order: want CANCELLED, got {}",
+                                o["status"]
+                            ));
                         }
                         // The remainder is PRESERVED, not zeroed: a cancel is
-                        // not a fill. The order was never crossed, so `ticks`
-                        // equals `ticksInitial`; zeroing it here would make a
-                        // cancelled order indistinguishable from one that
-                        // filled completely.
-                        if o["ticks"].as_str() != o["ticksInitial"].as_str() {
+                        // not a fill. The order was never crossed, so both
+                        // `ticks` and `ticksInitial` must still read the
+                        // original size. Comparing them only to EACH OTHER
+                        // would also pass if the projector zeroed both —
+                        // exactly the failure this is meant to catch, since a
+                        // cancelled order would then be indistinguishable
+                        // from one that filled completely.
+                        let want_ticks = TICKS.to_string();
+                        if o["ticks"].as_str() != Some(want_ticks.as_str()) {
                             failures.push(format!(
-                                "cancelled order's remainder not preserved: ticks={} \
-                                 ticksInitial={}",
-                                o["ticks"], o["ticksInitial"]
+                                "cancelled order's remainder not preserved: ticks={}, want \
+                                 {want_ticks}",
+                                o["ticks"]
+                            ));
+                        }
+                        if o["ticksInitial"].as_str() != Some(want_ticks.as_str()) {
+                            failures.push(format!(
+                                "cancelled order's ticksInitial changed: ticksInitial={}, want \
+                                 {want_ticks}",
+                                o["ticksInitial"]
                             ));
                         }
                     }

@@ -46,10 +46,20 @@ pub enum Probe<T> {
 /// `60s × terminate-after 10` = 600s. A per-fact budget of 90s would give
 /// 630s — and in the "read model is stuck" scenario, where every budget burns
 /// out, nextest would kill the test BEFORE the final `assert!`, losing the
-/// collected `failures`. A shared budget keeps the worst case at 270 + 240 =
-/// 510s; if it burns out on the first phase, the remaining phases return
-/// `Err` immediately, and the binary still reaches order settlement and its
-/// own `assert!`.
+/// collected `failures`.
+///
+/// Chain waits and this budget share one clock — `ReadBudget::start()` sits
+/// ahead of all of them (decision E) — so the 240s bounds ELAPSED TEST TIME,
+/// not time spent polling: a slow chain eats into it before the first read
+/// phase ever runs. The worst case is therefore not the sum `chain + 240s`;
+/// it is `max(chain-so-far, 240s)` at the point the last read phase starts,
+/// plus whatever chain waits still follow it. For `e2e_inference` that is
+/// ≈330s: 180s of chain (the book-live wait, then the order-surface loop)
+/// before IX-SEQ-02 enters with `left() = 60s` and drains it, then a further
+/// ~90s cancel-drain wait before IX-SEQ-01 and IX-GATE-17 enter with
+/// `left() = 0` and return on their first probe. If it burns out on the
+/// first phase, the remaining phases return `Err` immediately, and the
+/// binary still reaches order settlement and its own `assert!`.
 pub const DEFAULT_READ_BUDGET: Duration = Duration::from_secs(240);
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -93,14 +103,7 @@ where
     Fut: std::future::Future<Output = Probe<T>>,
 {
     let started = Instant::now();
-    // The placeholder is unreachable by construction: every path that reads
-    // `last` runs after the `Probe::Pending` arm below has already
-    // overwritten it in the same iteration (the other two arms return
-    // early). Kept anyway so the type does not need an `Option`, and
-    // `#[allow]`ed rather than restructured because the dead store is the
-    // simplest honest expression of that invariant.
-    #[allow(unused_assignments)]
-    let mut last = String::from("(no probe made yet)");
+    let mut last: String;
     loop {
         match probe().await {
             Probe::Ready(v) => return Ok(v),

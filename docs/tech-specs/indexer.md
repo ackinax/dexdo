@@ -363,6 +363,13 @@ inference e2e binaries run after `deploy_dexdo`, i.e. against a live indexer, an
 of them carry read-model phases over the production router built in-process
 (`common::setup()`), asserting on the exact book and order they created.
 
+This is also the first time an e2e run seeds anything into the stand's own database:
+`common::setup()` calls `seed_accounts_from_notes`, so a stand operator who queries the
+`accounts` table will find `test-mm-001` / `dk_live_test_001` rows with no other
+explanation. They are inert by construction: the fixture addresses are `0:000…001`
+fillers, not real notes, and their secrets are encrypted under a fixed test KEK
+(`common::test_kek()`) that the deployed API does not hold, so it cannot decrypt them.
+
 Two rules govern those phases, both in `common::read_model`:
 
 - **Poll for presence, assert on content.** `poll_read_with` returns as soon as the row
@@ -389,6 +396,16 @@ What these phases do **not** prove: that the deployed `dodex-api` serves the sam
 bytes. The router is the production one and reads the stand's database, so the read
 path — visibility gate, scaling, filters — is genuinely exercised; the deployment is
 not.
+
+Two more gaps are structural, not incidental. The in-process `AppState` these phases
+build leaves `request_timeout = Duration::ZERO` (`services/api/src/lib.rs:163`), so
+`enforce_request_timeout` — the hoop wrapping every production read — is disabled
+here; production can answer `504` on a slow query where these phases structurally
+cannot. And each on-chain binary spends one budget (`ReadBudget`, `common::read_model`)
+shared across its own read phases, and that clock starts before the binary's chain
+waits run — so a CI log reading "...the binary's shared budget was spent earlier"
+means the shared clock ran out against a slow chain, not that the read model itself
+stalled.
 
 ## Reconciliation
 

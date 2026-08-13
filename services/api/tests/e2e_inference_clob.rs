@@ -145,7 +145,7 @@ async fn inference_partial_fill_leaves_remainder() {
     let read: Option<std::sync::Arc<salvo::Service>> =
         common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
     if read.is_none() {
-        eprintln!("[e2e_inference_clob] TEST_DATABASE_URL not set — read phase skipped");
+        eprintln!("[e2e_clob] TEST_DATABASE_URL not set — read phase skipped");
     }
     let budget = ReadBudget::start();
 
@@ -290,6 +290,8 @@ async fn inference_partial_fill_leaves_remainder() {
                 if tape.len() != 1 {
                     failures.push(format!("one match — one tape row, got {}", tape.len()));
                 }
+                // Safe by construction: `Probe::Ready` above only fires on a
+                // non-empty array, so `tape` always has at least one element.
                 let t = &tape[0];
                 // Trade volume is the CROSS (2 ticks), not either leg's own
                 // size (the SELL was 2, the BUY was 4).
