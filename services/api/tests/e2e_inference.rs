@@ -230,6 +230,109 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
         }
     }
 
+    // ---- read model: the order arrived ----
+    //
+    // IX-SEQ-02, and this phase sits BEFORE the cancellation below: after the
+    // cancel there is nothing to assert about a LIVE remainder.
+    //
+    // `order_id` is an `Option`: the chained block above leaves it `None`
+    // when the order never surfaced, and its own failure is already recorded
+    // there. There is nothing to duplicate, so this phase simply does not
+    // run.
+    if let (Some(service), Some(id)) = (read.as_ref(), order_id) {
+        let want_id = id.to_string();
+        let order = poll_read_with("IX-SEQ-02 order in /orders", budget.left(), || {
+            let service = std::sync::Arc::clone(service);
+            let ob = ob.clone();
+            let want = want_id.clone();
+            async move {
+                // `status=LIVE` is the wire name for an open order
+                // (`services/api/src/inference.rs:363`: LIVE, FILLED, CANCELLED, EXPIRED).
+                let url = api(&format!("orders?inferenceOrderBookAddress={ob}&status=LIVE"));
+                match get_json(&service, &url).await {
+                    GetOutcome::Retry(why) => Probe::Pending(why),
+                    GetOutcome::Fatal(why) => Probe::Fatal(why),
+                    GetOutcome::Ok(body) => {
+                        let found = body["orders"]
+                            .as_array()
+                            .and_then(|a| {
+                                a.iter().find(|o| o["orderId"].as_str() == Some(want.as_str()))
+                            })
+                            .cloned();
+                        match found {
+                            Some(o) => Probe::Ready(o),
+                            None => Probe::Pending(format!("order {want} not yet in /orders")),
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        match order {
+            Err(why) => failures.push(why),
+            Ok(o) => {
+                if o["side"].as_str() != Some("BUY") {
+                    failures.push(format!("side: want BUY, got {}", o["side"]));
+                }
+                if o["status"].as_str() != Some("LIVE") {
+                    failures.push(format!("status: want LIVE, got {}", o["status"]));
+                }
+                // The remainder fields are `ticks` / `ticksInitial`
+                // (`InferenceOrderDto`, `services/api/src/inference.rs:327-347`).
+                // The order was never crossed, so the remainder equals the initial size.
+                let want_ticks = ticks.to_string();
+                if o["ticks"].as_str() != Some(want_ticks.as_str()) {
+                    failures.push(format!("ticks: want {want_ticks}, got {}", o["ticks"]));
+                }
+                if o["ticksInitial"].as_str() != Some(want_ticks.as_str()) {
+                    failures.push(format!(
+                        "ticksInitial: want {want_ticks}, got {}",
+                        o["ticksInitial"]
+                    ));
+                }
+            }
+        }
+
+        // Depth is a separate claim, not a consequence of `/orders`: `/depth`
+        // aggregates by level, while `/orders` returns the order's own row.
+        // With `quantity_precision = 0` the level's quantity passes through
+        // unscaled, i.e. the string "2".
+        let bids = poll_read_with("IX-SEQ-02 level in /depth", budget.left(), || {
+            let service = std::sync::Arc::clone(service);
+            let ob = ob.clone();
+            async move {
+                let url = api(&format!("depth?inferenceOrderBookAddress={ob}"));
+                match get_json(&service, &url).await {
+                    GetOutcome::Retry(why) => Probe::Pending(why),
+                    GetOutcome::Fatal(why) => Probe::Fatal(why),
+                    GetOutcome::Ok(body) => match body["bids"].as_array() {
+                        Some(b) if !b.is_empty() => Probe::Ready(b.clone()),
+                        _ => Probe::Pending("bids are still empty".into()),
+                    },
+                }
+            }
+        })
+        .await;
+
+        match bids {
+            Err(why) => failures.push(why),
+            Ok(levels) => {
+                if levels.len() != 1 {
+                    failures.push(format!(
+                        "the book should hold exactly one resting BUY level, got {}",
+                        levels.len()
+                    ));
+                }
+                let want_ticks = ticks.to_string();
+                if levels[0][1].as_str() != Some(want_ticks.as_str()) {
+                    failures
+                        .push(format!("level remainder: want {want_ticks}, got {}", levels[0][1]));
+                }
+            }
+        }
+    }
+
     // 6. Cleanup: cancel all of the note's orders on this book, confirm drained.
     if let Err(err) = dex
         .cancel_all_inference_orders(
