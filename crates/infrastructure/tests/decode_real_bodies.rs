@@ -2,8 +2,8 @@
 //
 //! The decoder against real chain bodies.
 //!
-//! `crates/infrastructure/src/decoder.rs` already proves the decoder on two real
-//! `OrderBook.*` bodies. Nothing proved it on an inference body, because until this
+//! `crates/infrastructure/src/decoder.rs` already proves the decoder on one real
+//! `OrderBook.*` body (plus a real non-ABI body proving the unknown-id path). Nothing proved it on an inference body, because until this
 //! wave the repository held none: `capture.rs` reused the same prediction-side
 //! `OrderPlaced` fixture. So the inference payload layout was asserted by intention.
 //!

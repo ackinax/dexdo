@@ -327,7 +327,7 @@ pub const HARVESTED_TC_PROBE_BURNED_DECODED: &str = r#"{"buyer":"0:a071d9164c6d0
 /// `dst_address` `:00000000000000000000000000000000000000000000000000000000000002da`.
 ///
 /// Taken because a body was available and it proves something: the seller's
-/// cumulative-claim high-water-mark path, distinct from `TickFinalized`.
+/// cumulative-claim high-water-mark path, distinct from the tick-finalization event.
 pub const TC_TICKS_CLAIMED: &str =
     "te6ccgEBAQEAJgAASBSW5p8AAAAAAAAAAAAAAAAAD0JAAAAAAAAAAAAAAAAAAB6EgA==";
 
