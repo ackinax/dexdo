@@ -1,6 +1,13 @@
 // End-to-end smoke test for the AI Registry inference order book against a
-// real shellnet, driven directly through `dodex_chain::Dex` (no DB, no HTTP
-// router — there are no inference request handlers yet).
+// real shellnet, driven directly through `dodex_chain::Dex`, with read-model
+// phases over the production router (`common::setup()`) interleaved.
+//
+// The chain phases assert what the BOOK holds; the read phases assert that it
+// reached the read model and the public API. They are different claims: a
+// getter can be right while projection is broken, which is exactly the gap
+// wave 3 exists to close. Read phases are skipped (with a printed reason) when
+// TEST_DATABASE_URL is absent, and their failures join `failures` like every
+// other — nothing here may panic before the orders are cancelled.
 //
 // The note is the on-chain participant: it deploys a fresh per-model
 // `InferenceOrderBook` (the book code is baked into the note at deploy), then
@@ -36,6 +43,12 @@ use ackinacki_kit::tvm_client::crypto::KeyPair;
 use common::airegistry::wait_inference_book_live;
 use common::e2e_setup::model_hash_dec;
 use common::e2e_setup::network_endpoint;
+use common::read_model::api;
+use common::read_model::get_json;
+use common::read_model::poll_read_with;
+use common::read_model::GetOutcome;
+use common::read_model::Probe;
+use common::read_model::ReadBudget;
 use common::test_pns::TestPnPool;
 use dodex_chain::Dex;
 use dodex_contracts::dex::private_note::ParamsOfCancelAllInferenceOrders;
@@ -46,13 +59,25 @@ use dodex_contracts::dex::private_note::ParamsOfPlaceInferenceBuy;
 const POLL_TICK: Duration = Duration::from_secs(2);
 const POLL_TICKS: u32 = 45; // 90s budget — book deploy is an internal message.
 
-/// A per-run model name so each run deploys a fresh book — its address derives
-/// from `sha256(modelName)`, so a unique name keeps order-count assertions clean.
-/// The ctor enforces `sha256(modelName) == _modelHash`, so the hash must be
-/// `model_hash_dec(&this)`, never an arbitrary value.
-fn unique_model_name() -> String {
+/// Producer for the current run. Uniqueness lives HERE, not in the version:
+/// the `?producer=` filter below must select exactly one market, and with a
+/// shared producer it would be satisfied by another run's leftover market —
+/// i.e. it would be vacuously true exactly where it is supposed to catch a
+/// real failure.
+fn unique_producer() -> String {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    format!("e2e--{nanos}")
+    format!("e2e-{nanos}")
+}
+
+/// Model name for the run: THREE-PART. `parse_model_ref`
+/// (`inference_reconciler.rs:1069-1086`) fills in `producer`/`name`/`version`
+/// only when there are exactly three non-empty parts joined by `--`; with a
+/// two-part name they stay NULL, and the `?producer=` filter fails to find
+/// its own scene's market (IX-GATE-17). The book address is derived from the
+/// name (`sha256(modelName)`), so a unique producer also keeps the book
+/// fresh on every run.
+fn model_name_for(producer: &str) -> String {
+    format!("{producer}--probe--v1")
 }
 
 #[tokio::test]
@@ -73,7 +98,8 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
     let signer = || Signer::Keys { keys: keys.clone() };
 
     let dex = Dex::from_endpoints(vec![network_endpoint()]).expect("Dex::from_endpoints");
-    let model_name = unique_model_name();
+    let producer = unique_producer();
+    let model_name = model_name_for(&producer);
     let model_hash = model_hash_dec(&model_name);
     eprintln!(
         "[e2e_inference] note={} model_name={model_name} model_hash={model_hash}",
@@ -103,6 +129,28 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
         .await
         .expect("getInferenceOrderBookAddress");
     eprintln!("[e2e_inference] order_book={ob}");
+
+    // Router comes up HERE, not at the end: phase IX-SEQ-02 (task 3) sits
+    // between placement and cancellation, and bringing it up mid-scenario
+    // would mean holding escrow on the note for extra seconds.
+    //
+    // `Arc`, because `salvo::Service` is not `Clone` (`salvo_core::service`),
+    // and each probe captures its own copy.
+    //
+    // `None` does NOT exit the test: there are chained checks below and a
+    // final `assert!(failures.is_empty(), …)`. An early `return` would turn
+    // a red chain run green exactly where there is simply no database.
+    let read: Option<std::sync::Arc<salvo::Service>> =
+        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
+    if read.is_none() {
+        eprintln!("[e2e_inference] TEST_DATABASE_URL not set — read phases skipped");
+    }
+
+    // Wait budget — ONE per binary (decision E). A per-fact budget would push
+    // `e2e_inference` past `terminate-after`, and in the "read model stuck"
+    // scenario nextest would kill the test before the final `assert!`,
+    // losing the collected failures.
+    let budget = ReadBudget::start();
 
     // 3. Wait until the book is live: its getters answer once it is Active.
     let stats = wait_inference_book_live(&dex, &ob, POLL_TICKS, POLL_TICK)
@@ -199,6 +247,107 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
             if stats.order_count == 0 {
                 eprintln!("[e2e_inference] book drained after cancelAll");
                 break;
+            }
+        }
+    }
+
+    // ---- read model: the book arrived and is found by producer ----
+    //
+    // IX-SEQ-01 and IX-GATE-17. The chained checks above read the book's own
+    // getters — i.e. they confirm the state of the CHAIN and say nothing
+    // about whether that state reached the read model. Every outcome below
+    // goes into `failures`: nothing here may panic.
+    if let Some(service) = read.as_ref() {
+        let market = poll_read_with("IX-SEQ-01 book visible", budget.left(), || {
+            let service = std::sync::Arc::clone(service);
+            let ob = ob.clone();
+            async move {
+                let url = api(&format!("markets?inferenceOrderBookAddress={ob}"));
+                match get_json(&service, &url).await {
+                    GetOutcome::Retry(why) => Probe::Pending(why),
+                    GetOutcome::Fatal(why) => Probe::Fatal(why),
+                    GetOutcome::Ok(body) => {
+                        match body["markets"].as_array().and_then(|a| a.first().cloned()) {
+                            Some(m) => Probe::Ready(m),
+                            None => Probe::Pending(format!("book {ob} not yet in /markets")),
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        match market {
+            Err(why) => failures.push(why),
+            Ok(m) => {
+                // Checks — ONCE, after the poll (decision C): a wrong value
+                // must land in `failures` here, not eat into the budget.
+                //
+                // The field is `model.ref`, not `modelRef`: `InferenceModelDto`
+                // is nested under `model` and carries `#[serde(rename =
+                // "ref")]` (`services/api/src/inference.rs:78-85`).
+                if m["model"]["ref"].as_str() != Some(model_name.as_str()) {
+                    failures
+                        .push(format!("model.ref: want {model_name}, got {}", m["model"]["ref"]));
+                }
+                if m["model"]["producer"].as_str() != Some(producer.as_str()) {
+                    failures.push(format!(
+                        "model.producer: want {producer}, got {}",
+                        m["model"]["producer"]
+                    ));
+                }
+                if m["model"]["name"].as_str() != Some("probe") {
+                    failures.push(format!("model.name: want probe, got {}", m["model"]["name"]));
+                }
+                if m["model"]["version"].as_str() != Some("v1") {
+                    failures.push(format!("model.version: want v1, got {}", m["model"]["version"]));
+                }
+                // Precision constants — exactly what the reconciler writes
+                // (`inference_reconciler.rs`: PRICE_PRECISION = 9,
+                // QUANTITY_PRECISION = 0).
+                if m["pricePrecision"].as_i64() != Some(9) {
+                    failures.push(format!("pricePrecision: want 9, got {}", m["pricePrecision"]));
+                }
+                if m["quantityPrecision"].as_i64() != Some(0) {
+                    failures
+                        .push(format!("quantityPrecision: want 0, got {}", m["quantityPrecision"]));
+                }
+            }
+        }
+
+        // IX-GATE-17: the producer filter finds EXACTLY this market.
+        let filtered = poll_read_with("IX-GATE-17 producer filter", budget.left(), || {
+            let service = std::sync::Arc::clone(service);
+            let producer = producer.clone();
+            async move {
+                let url = api(&format!("markets?producer={producer}"));
+                match get_json(&service, &url).await {
+                    GetOutcome::Retry(why) => Probe::Pending(why),
+                    GetOutcome::Fatal(why) => Probe::Fatal(why),
+                    GetOutcome::Ok(body) => match body["markets"].as_array() {
+                        Some(a) if !a.is_empty() => Probe::Ready(a.clone()),
+                        _ => Probe::Pending(format!("producer={producer} filter still empty")),
+                    },
+                }
+            }
+        })
+        .await;
+
+        match filtered {
+            Err(why) => failures.push(why),
+            Ok(list) => {
+                if list.len() != 1 {
+                    failures.push(format!(
+                        "a unique producer must select exactly one market, got {}",
+                        list.len()
+                    ));
+                }
+                if list[0]["inferenceOrderBookAddress"].as_str() != Some(ob.as_str()) {
+                    failures.push(format!(
+                        "filter found the wrong book: {}",
+                        list[0]["inferenceOrderBookAddress"]
+                    ));
+                }
             }
         }
     }
