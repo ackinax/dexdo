@@ -20,6 +20,19 @@
 //     emptied slot — while the other still holds its size;
 //   * the best bid falls from the cancelled price to the surviving one.
 //
+// ## Read model: does a precise cancel show up as precise?
+//
+// The chain readings above prove the BOOK told the truth. A read-model phase
+// after the point cancel asks a different question: did that truth reach the
+// public API? It polls the production router (`common::setup()`, raised
+// in-process) until `/orders` reports the cancelled id as CANCELLED, then
+// asserts on BOTH orders — the neighbour staying LIVE is the load-bearing
+// half, since `cancelAllInferenceOrders` would make that same assertion a
+// coin flip. Skipped (with a printed reason) when TEST_DATABASE_URL is
+// absent, and its failures join `failures` like every other check here —
+// nothing in it may panic before the note's resting orders are cleared by
+// `finish`.
+//
 // ## A deadline already past
 //
 // `placeBuyOrder` requires `deadline == 0 || deadline > block.timestamp`, and
@@ -52,6 +65,12 @@ use ackinacki_kit::tvm_client::crypto::KeyPair;
 use common::airegistry::wait_inference_book_live;
 use common::e2e_setup::model_hash_dec;
 use common::e2e_setup::network_endpoint;
+use common::read_model::api;
+use common::read_model::get_json;
+use common::read_model::poll_read_with;
+use common::read_model::GetOutcome;
+use common::read_model::Probe;
+use common::read_model::ReadBudget;
 use common::test_pns::TestPnPool;
 use dodex_chain::Dex;
 use dodex_contracts::dex::private_note::ParamsOfCancelAllInferenceOrders;
@@ -157,6 +176,17 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
     assert_eq!(fresh.order_count, 0, "a book this test just deployed already holds orders");
 
     let mut failures: Vec<String> = Vec::new();
+
+    // Router for the read-model phase. `None` does not exit the test: below,
+    // `finish(...)` cancels the resting orders and only then asserts
+    // `failures.is_empty()`, so an early `return` here would skip both the
+    // cleanup and any chain-phase failures already collected.
+    let read: Option<std::sync::Arc<salvo::Service>> =
+        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
+    if read.is_none() {
+        eprintln!("[e2e_inference_orders] TEST_DATABASE_URL not set — read phase skipped");
+    }
+    let budget = ReadBudget::start();
 
     // ── two bids, and the ids the book gave them ──────────────────────────
     //
@@ -294,6 +324,83 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
              assigned past the validation that was supposed to refuse it",
             before_stale.next_order_id, after_stale.next_order_id
         ));
+    }
+
+    // ---- read model: the cancel arrived ----
+    //
+    // IX-SEQ-08. TWO facts are checked, and the second matters more than the
+    // first: the cancelled order becomes CANCELLED, while its neighbour stays
+    // LIVE. Cancelling ALL orders would have produced the first fact too —
+    // that is exactly why this reads the point `cancelInferenceOrder`, not
+    // the sweep.
+    if let Some(service) = read.as_ref() {
+        let cancelled_id = better_id.to_string();
+        let survivor_id = worse_id.to_string();
+        let orders = poll_read_with("IX-SEQ-08 cancel in /orders", budget.left(), || {
+            let service = std::sync::Arc::clone(service);
+            let ob = ob.clone();
+            let want = cancelled_id.clone();
+            async move {
+                let url = api(&format!("orders?inferenceOrderBookAddress={ob}"));
+                match get_json(&service, &url).await {
+                    GetOutcome::Retry(why) => Probe::Pending(why),
+                    GetOutcome::Fatal(why) => Probe::Fatal(why),
+                    GetOutcome::Ok(body) => {
+                        let all = body["orders"].as_array().cloned().unwrap_or_default();
+                        let done = all.iter().any(|o| {
+                            o["orderId"].as_str() == Some(want.as_str())
+                                && o["status"].as_str() == Some("CANCELLED")
+                        });
+                        if done {
+                            Probe::Ready(all)
+                        } else {
+                            Probe::Pending(format!("order {want} not CANCELLED yet"))
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        match orders {
+            Err(why) => failures.push(why),
+            Ok(all) => {
+                let by_id = |id: &str| all.iter().find(|o| o["orderId"].as_str() == Some(id));
+                match by_id(&cancelled_id) {
+                    None => failures.push(format!("order {cancelled_id} missing from /orders")),
+                    Some(o) => {
+                        if o["status"].as_str() != Some("CANCELLED") {
+                            failures.push(format!("cancelled order: status {}", o["status"]));
+                        }
+                        // The remainder is PRESERVED, not zeroed: a cancel is
+                        // not a fill. The order was never crossed, so `ticks`
+                        // equals `ticksInitial`; zeroing it here would make a
+                        // cancelled order indistinguishable from one that
+                        // filled completely.
+                        if o["ticks"].as_str() != o["ticksInitial"].as_str() {
+                            failures.push(format!(
+                                "cancelled order's remainder not preserved: ticks={} \
+                                 ticksInitial={}",
+                                o["ticks"], o["ticksInitial"]
+                            ));
+                        }
+                    }
+                }
+                match by_id(&survivor_id) {
+                    None => failures
+                        .push(format!("neighbour order {survivor_id} disappeared from /orders")),
+                    Some(o) => {
+                        if o["status"].as_str() != Some("LIVE") {
+                            failures.push(format!(
+                                "the neighbour order must stay LIVE, but it is {} — meaning ALL \
+                                 orders were cancelled, not just one",
+                                o["status"]
+                            ));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     finish(&dex, &note.address, &model_hash, signer(), failures).await;
