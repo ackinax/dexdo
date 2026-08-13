@@ -106,6 +106,15 @@ Intended use: shed confirmed observability-only floods (e.g. `OrderBook.Queued`,
 
 When `LOG_DIR` is set, the projector's "no handler for event type" warnings are split by novelty. The projection loop is the sole emitter of these warnings (the capture path no longer projects). The **first** time the process sees a given unhandled `event_type`, the warning is emitted at the normal target, so it reaches stdout and the main `<service>.log` — this is the operator's signal that a deployed contract emits an event the indexer does not yet handle. Every **later** repeat of that same type is written to `<service>.noise.log` (a separate daily-rotating file in `LOG_DIR`, like the main log) via the `dodex::event_noise` tracing target, configured by the `dodex-logging` crate (`EVENT_NOISE_TARGET`), so a steady flood does not drown the main log. When `LOG_DIR` is not set, all of these warnings appear on stdout alongside the rest of the log output.
 
+Capture stores the event body verbatim: the GraphQL edge's `body` is the base64 BOC, and
+`persist_page` writes it into `raw_events.body_json` unchanged. There is no separate raw-body
+column — `body_json` *is* the body, held as a JSON string. That is why harvesting real bodies for
+fixtures is a SQL query against any populated indexer database rather than a chain export tool.
+
+How much history that query reaches is a property of the deployment, not of the schema:
+`deploy/sql/prune_raw_events.sql` deletes *processed* rows past its retention (three days by
+default) and never touches un-projected ones. A rare event's body can therefore be gone.
+
 ## Projection — lifecycle events
 
 Lifecycle events drive transitions on [`markets`](data-schema.md#prediction-markets) and the [`oracles`](data-schema.md#oracles) / [`oracle_event_lists`](data-schema.md#oracle_event_lists) / [`oracle_events`](data-schema.md#oracle_events) hierarchy. Each projector identifies its row by `pmp_address` (or the relevant parent address); if that row does not exist yet, the projector returns `Deferred` so the projection loop will retry once the parent event has landed.

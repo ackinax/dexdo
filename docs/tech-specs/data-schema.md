@@ -58,7 +58,7 @@ The append-only event log. Every message edge the indexer pulls from the GraphQL
 | `src_address` | `text` | Source contract address (the contract that emitted the event). |
 | `dst_address` | `text` | Destination address from the message header. |
 | `event_type` | `text` | `"<ContractKind>.<EventName>"`, e.g. `OrderBook.OrderPlaced`. NULL when decoding failed or the body was not an event message. |
-| `body_json` | `jsonb` | Raw message body JSON as ingested. |
+| `body_json` | `jsonb` | Raw message body as ingested, verbatim. For an event message this is a JSON **string** holding the base64 BOC of the body — there is no separate raw-body column, so this is where a real body is recovered from (`select body_json #>> '{}'`). `'null'::jsonb` when the edge carried no body. |
 | `decoded` | `jsonb` | ABI-decoded event payload. Filled at ingest time if decoding succeeds; reprojection reuses this — bodies are not re-decoded. |
 | `processed_at` | `timestamptz` | Stamped by the projector when the row is `Applied` or `Unknown`. NULL = pending; covered by the reprojection sweep. |
 | `created_at` | `timestamptz` | Indexer ingestion time (wall-clock). |
