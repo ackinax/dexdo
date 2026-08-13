@@ -18,6 +18,10 @@ use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+mod fixtures;
+
+use fixtures::chain_bodies::INFERENCE_ORDER_PLACED;
+
 async fn setup() -> Option<PgPool> {
     let _ = dotenvy::dotenv();
     let url = match env::var("TEST_DATABASE_URL") {
@@ -67,6 +71,63 @@ const ORDER_PLACED_BODY: &str = "te6ccgEBAgEAhwAB8xucaVcAAAAAAAAAAAAAAAAAAAACAAA
 // A stream of this test's own: `persist_page` upserts `at_head` into `indexer_cursors`,
 // and the production row is read by the inference orders endpoint's fail-closed gate.
 const CAPTURE_TEST_STREAM: &str = "capture_persist_page_test_stream";
+
+// A stream of this test's own, for the same reason the neighbouring cases have one:
+// `persist_page` upserts `at_head` into `indexer_cursors`, and the production row is
+// read by the inference orders endpoint's fail-closed gate.
+const INFERENCE_BODY_TEST_STREAM: &str = "capture_real_inference_body_test_stream";
+
+#[tokio::test]
+async fn persist_page_stores_a_real_inference_body_as_a_decoded_row() {
+    // IX-CAP-01. The neighbouring cases run a prediction-side `OrderBook.OrderPlaced`
+    // body, so nothing proved capture on an inference payload — the decoder is shared
+    // but the ABI set and the event-id space are not.
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+    let decoder = Decoder::new().expect("decoder");
+    let msg_id = "cap-real-inference-1";
+    let orderbook = "0:cap_real_inference_book";
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", msg_id),
+            ("delete from indexer_cursors where stream_name = $1", INFERENCE_BODY_TEST_STREAM),
+        ],
+    )
+    .await;
+
+    let edges = vec![edge(msg_id, Some("5f80capreal0000000000000001"), orderbook, Some(INFERENCE_ORDER_PLACED))];
+    let result = repo
+        .persist_page(INFERENCE_BODY_TEST_STREAM, &edges, Some("cursor-1"), &decoder, false)
+        .await
+        .expect("persist_page");
+    assert_eq!(result.inserted, 1, "one edge in, one row out");
+
+    let (event_type, decoded_is_null, processed_at_is_null, body): (
+        Option<String>,
+        bool,
+        bool,
+        Option<String>,
+    ) = sqlx::query_as(
+        "select event_type, decoded is null, processed_at is null, body_json #>> '{}'
+           from raw_events where msg_id = $1",
+    )
+    .bind(msg_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the captured row");
+
+    assert_eq!(event_type.as_deref(), Some("InferenceOrderBook.InferenceOrderPlaced"));
+    assert!(!decoded_is_null, "a decodable inference body must land decoded, not as an orphan");
+    assert!(processed_at_is_null, "capture must leave the row pending for the projector");
+    // Not decoration: this pins the fact the whole wave's fixture supply rests on —
+    // capture stores the body verbatim, so real bodies can be harvested from any
+    // populated indexer database with a SQL query. If that ever changes, the next
+    // harvest would silently come up empty; this fails first instead.
+    assert_eq!(body.as_deref(), Some(INFERENCE_ORDER_PLACED), "body_json must hold the base64 verbatim");
+
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
+}
 
 #[tokio::test]
 async fn captures_decodable_event_without_projecting() {
