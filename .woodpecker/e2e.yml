@@ -196,14 +196,6 @@ steps:
       - mkdir -p ~/.ssh
       - echo "$SSH_NET_KEY" | tr '@' '\n' > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
       - cp -ar ~/.ssh ./.ssh
-      # The run's start, for the observer's window (the `observer` step). This step is
-      # chosen because it is the only one without `depends_on` — i.e. it is guaranteed
-      # to precede everything that touches the host. Woodpecker does not carry the
-      # environment between steps, so the mark travels as a file. What goes to the
-      # observer is not the mark itself but the ELAPSED time: the host reconstructs the
-      # start against its own clock, keeping any runner/stand clock skew out of the
-      # window.
-      - date +%s > ./.e2e_started_at
 
   prepare_host:
     depends_on:
@@ -246,6 +238,18 @@ steps:
         ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
         "$E2E_CI_USER@$E2E_HOST"
         "bash -s -- acquire $CI_PIPELINE_NUMBER" < $CI_WORKSPACE/tests/e2e/host-lease.sh
+      # The run's start, for the observer's window (the `observer` step), stamped only
+      # once the lease is OURS. Stamping earlier is wrong rather than merely imprecise:
+      # `lease_acquire` blocks for as long as another pipeline holds the host, and the
+      # stand's Postgres outlives pipelines, so a mark taken before that wait would open
+      # the window over the other run's writes — its books could then fail our observer,
+      # or satisfy our positive anchor without a single event of our own ever arriving.
+      # Nothing of ours is cut off by stamping here: every write this run makes comes
+      # after `net_up`, well past this point. Woodpecker does not carry the environment
+      # between steps, so the mark travels as a file. What goes to the observer is not
+      # the mark itself but the ELAPSED time: the host reconstructs the start against
+      # its own clock, keeping any runner/stand clock skew out of the window.
+      - date +%s > $CI_WORKSPACE/.e2e_started_at
 
   assert_net_up:
     depends_on:

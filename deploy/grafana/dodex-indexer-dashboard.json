@@ -831,7 +831,7 @@
     {
       "type": "timeseries",
       "title": "Orphans dropped rate",
-      "description": "rate() of indexer_inference_orphans_dropped — inference Filled/OrderCancelled events dead-lettered because their parent OrderPlaced never arrived within the orphan cutoff.",
+      "description": "rate() of indexer_inference_orphans_dropped — orphan events dead-lettered because their parent never arrived within the orphan cutoff: the four inference events (InferenceFilled, InferenceOrderCancelled, InferenceOrderExpired, InferenceRefunded) plus OracleEventList.RangeEventAdded. A non-zero rate means lost counterparties, lost cancels/expiries, unattributable refunds, or lost range-to-book linkage — see the metric catalog in docs/tech-specs/indexer.md.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
       "id": 25,

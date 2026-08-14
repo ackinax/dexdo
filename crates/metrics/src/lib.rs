@@ -207,7 +207,7 @@ impl IndexerMetrics {
         let inference_orphans_dropped_counter = meter
             .u64_observable_counter("indexer_inference_orphans_dropped")
             .with_description(
-                "Inference orphan events (Filled/OrderCancelled) dead-lettered after their parent OrderPlaced never arrived within the cutoff. A Filled first decrements any present resting leg, so book depth stays correct; what is unrecorded is the missing counterparty (Filled) or the lost cancel (OrderCancelled)",
+                "Orphan events dead-lettered after their parent never arrived within the cutoff: the four inference events (InferenceFilled, InferenceOrderCancelled, InferenceOrderExpired, InferenceRefunded) plus OracleEventList.RangeEventAdded, which is counted here rather than left uncounted because a dropped row is a dropped row whichever contract emitted it. Each loses something different: a Filled first decrements any present resting leg (so book depth stays correct) and what goes unrecorded is the missing counterparty; a cancel or an expiry is lost outright, so the order never reaches its terminal status; a refund cannot be attributed to any order; and a RangeEventAdded loses the range-to-book linkage",
             )
             .with_callback(move |observer| {
                 observer.observe(orphans_cache.load(Ordering::Relaxed), &[]);
