@@ -448,3 +448,136 @@ async fn persist_page_handles_mixed_decodable_and_undecodable_edges() {
     )
     .await;
 }
+
+/// `edge` with an explicit `dst` (the decoder's routing key). The shared
+/// helper pins `dst = src`, which is right for order-book events but cannot
+/// express the ambiguous-collision case: a colliding event id whose `dst` no
+/// route knows. Kept separate so the neighbours' calls stay untouched.
+fn edge_with_dst(
+    msg_id: &str,
+    chain_order: Option<&str>,
+    src: &str,
+    dst: Option<&str>,
+    body: Option<&str>,
+) -> EventEdge {
+    EventEdge {
+        cursor: "c".to_string(),
+        node: EventNode {
+            msg_id: msg_id.to_string(),
+            msg_chain_order: chain_order.map(str::to_string),
+            src: Some(src.to_string()),
+            src_dapp_id: None,
+            dst: dst.map(str::to_string),
+            body: body.map(|b| json!(b)),
+            created_at: Some(json!(1_700_000_000_i64)),
+        },
+    }
+}
+
+// Streams of these tests' own, for the reason the neighbours have one:
+// `persist_page` upserts into `indexer_cursors`, and the production row is read
+// by the inference orders endpoint's fail-closed gate.
+const MALFORMED_BODY_TEST_STREAM: &str = "capture_malformed_body_test_stream";
+const AMBIGUOUS_TEST_STREAM: &str = "capture_ambiguous_test_stream";
+
+#[tokio::test]
+async fn a_malformed_body_lands_undecoded_and_bumps_the_decode_error_counter() {
+    // IX-CAP-05 + the decode_errors third of IX-MET-06. The existing mixed test's
+    // undecodable edge is `body: None`, which returns from try_decode BEFORE the
+    // counter — so it can never observe the increment. Only a body that parses as
+    // a string and then fails the decoder reaches the Err arm that counts.
+    // "this-is-not-a-boc" is not valid base64, so `decode_event_body` fails hard
+    // (a decode error, not an unknown/ambiguous id).
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone()); // fresh instance => counters at zero
+    let decoder = Decoder::new().expect("decoder");
+    let msg_id = "cap-malformed-body-1";
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", msg_id),
+            ("delete from indexer_cursors where stream_name = $1", MALFORMED_BODY_TEST_STREAM),
+        ],
+    )
+    .await;
+
+    let edges = vec![edge(
+        msg_id,
+        Some("5f80capmalformed000000000001"),
+        "0:cap_malformed_book",
+        Some("this-is-not-a-boc"),
+    )];
+    let result = repo
+        .persist_page(MALFORMED_BODY_TEST_STREAM, &edges, None, &decoder, false)
+        .await
+        .expect("persist_page");
+    assert_eq!(result.inserted, 1);
+    assert_eq!(result.undecoded, 1, "the row must be stored undecoded, not dropped");
+    assert_eq!(repo.decode_errors_count(), 1, "the counter is the only durable signal (IX-CAP-05)");
+    // IX-MET-06 says the counters grow ON THEIR OWN events only — mutual exclusivity
+    // is half the claim, and the ambiguous test asserts the mirror direction.
+    assert_eq!(
+        repo.decode_ambiguous_collisions_count(),
+        0,
+        "a hard decode failure is not an ambiguity"
+    );
+
+    let (event_type_is_null, decoded_is_null): (bool, bool) = sqlx::query_as(
+        "select event_type is null, decoded is null from raw_events where msg_id = $1",
+    )
+    .bind(msg_id)
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert!(event_type_is_null && decoded_is_null, "a failed decode stores the row bare");
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", msg_id),
+            ("delete from indexer_cursors where stream_name = $1", MALFORMED_BODY_TEST_STREAM),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_colliding_body_with_an_unrouted_dst_bumps_the_ambiguous_counter() {
+    // The ambiguous third of IX-MET-06. TC_CONTRACT_DEPLOYED's event id collides
+    // with RootModel.ContractDeployed; with a dst the router does not know, the
+    // decoder returns AmbiguousCollision and try_decode counts it.
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+    let decoder = Decoder::new().expect("decoder");
+    let msg_id = "cap-ambiguous-collision-1";
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", msg_id),
+            ("delete from indexer_cursors where stream_name = $1", AMBIGUOUS_TEST_STREAM),
+        ],
+    )
+    .await;
+
+    let edges = vec![edge_with_dst(
+        msg_id,
+        Some("5f80capambig0000000000000001"),
+        "0:cap_ambig_src",
+        Some("0:no-such-route-dst"),
+        Some(fixtures::chain_bodies::TC_CONTRACT_DEPLOYED),
+    )];
+    let result = repo
+        .persist_page(AMBIGUOUS_TEST_STREAM, &edges, None, &decoder, false)
+        .await
+        .expect("persist_page");
+    assert_eq!(result.undecoded, 1, "ambiguity stores the row undecoded");
+    assert_eq!(repo.decode_ambiguous_collisions_count(), 1);
+    assert_eq!(repo.decode_errors_count(), 0, "ambiguity is not a decode error");
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", msg_id),
+            ("delete from indexer_cursors where stream_name = $1", AMBIGUOUS_TEST_STREAM),
+        ],
+    )
+    .await;
+}

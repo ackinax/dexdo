@@ -1189,15 +1189,23 @@ async fn expired_orphans_dropped_all_four_types_using_ingest_age_not_chain_time(
     )
     .await;
 
-    // Orphan dead-lettering only fires once capture has reached head.
+    // Orphan dead-lettering only fires once capture has reached head. The repo
+    // is bound (fresh instance, per-instance counters at zero) so the drop
+    // counter below asserts an absolute value, not a delta.
     let stream = "orphan_drop_athead_stream";
     set_cursor_at_head(&pool, stream, true).await;
-    IndexerRepository::new(pool.clone())
+    let repo = IndexerRepository::new(pool.clone())
         .with_capture_stream(stream)
-        .with_inference_orphan_cutoff(Duration::from_secs(60))
-        .reproject_pending_from(50, Some("00orphan-"), Some("00orphan-z"))
-        .await
-        .unwrap();
+        .with_inference_orphan_cutoff(Duration::from_secs(60));
+    repo.reproject_pending_from(50, Some("00orphan-"), Some("00orphan-z")).await.unwrap();
+    // The counter third of IX-MET-06: four aged orphans (one per deferrable
+    // type) = exactly four drops recorded on this fresh instance; the fresh
+    // and old-chain rows deferred, not dropped, and must not count.
+    assert_eq!(
+        repo.inference_orphans_dropped_count(),
+        4,
+        "each of the four aged orphan types must bump the drop counter exactly once"
+    );
 
     assert!(raw_processed(&pool, "orphan-fill").await, "aged Filled orphan must be dropped");
     assert!(
