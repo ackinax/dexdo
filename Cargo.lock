@@ -2024,7 +2024,7 @@ dependencies = [
  "dodex-infrastructure",
  "dodex-logging",
  "dodex-metrics",
- "dotenvy",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",

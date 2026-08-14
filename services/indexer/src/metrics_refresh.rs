@@ -142,9 +142,7 @@ async fn refresh_once(repo: &IndexerRepository, metrics: &IndexerMetrics, cursor
 
 #[cfg(test)]
 mod tests {
-    use dodex_infrastructure::config::DatabaseSection;
     use dodex_infrastructure::config::METRIC_CRITICAL_EVENT_TYPES;
-    use dodex_infrastructure::database;
     use dodex_infrastructure::indexer_repo::IndexerRepository;
     use dodex_metrics::IndexerMetrics;
 
@@ -197,13 +195,15 @@ mod tests {
         assert_eq!(resolve_counts(&rows), (0, 0));
     }
 
-    // IX-MET-05: the only test of the refresh loop's failure arms. Connect to
-    // the test DB (a pool must validate one live connection to build), close
-    // the pool, and drive a single `refresh_once`: every DB query then fails
-    // fast with PoolClosed. Sentinels sit on exactly the caches the eight
-    // fallible sections write — including both events-by-type counter caches —
-    // and NOT on the metrics updated without a query (pool-connections is
-    // legitimately rewritten from the closed pool's live stats). Asserted:
+    // IX-MET-05: the only test of the refresh loop's failure arms. A lazy,
+    // never-connected pool is closed before the pass, so every acquire —
+    // and therefore every DB query — fails fast with PoolClosed: no live
+    // database, no TEST_DATABASE_URL, no skip path, the test runs and asserts
+    // everywhere (the DSN below is never dialed; `connect_lazy` only parses
+    // it). Sentinels sit on exactly the caches the eight fallible sections
+    // write — including both events-by-type counter caches — and NOT on the
+    // metrics updated without a query (pool-connections is legitimately
+    // rewritten from the closed pool's live stats). Asserted:
     // (a) the failure counter grew by exactly 8 — the sections are independent
     // (each its own query + its own inc, no short-circuit), so fewer means a
     // skipped section or an early return and more means a double increment;
@@ -212,23 +212,9 @@ mod tests {
     // defaults could not tell the difference, hence non-zero sentinels).
     #[tokio::test]
     async fn refresh_once_on_a_closed_pool_freezes_gauges_and_counts_eight_failures() {
-        // `make test` creates .env but does not export it; without this load
-        // the test silently skips under the canonical local flow.
-        let _ = dotenvy::dotenv();
-        let url = match std::env::var("TEST_DATABASE_URL") {
-            Ok(v) if !v.is_empty() => v,
-            _ => {
-                eprintln!("skipping: TEST_DATABASE_URL not set");
-                return;
-            }
-        };
-        let cfg = DatabaseSection {
-            url,
-            max_connections: 2,
-            min_connections: 0,
-            connect_timeout_ms: 5_000,
-        };
-        let pool = database::build_pool(&cfg).await.expect("TEST_DATABASE_URL connect");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@localhost:1/never_connected")
+            .expect("lazy pool from a well-formed DSN");
         let repo = IndexerRepository::new(pool.clone());
         let (_provider, metrics) = IndexerMetrics::new_in_memory_for_tests();
 
