@@ -36,10 +36,12 @@ async fn setup() -> Option<PgPool> {
 // The state-count queries are whole-table aggregates. Under nextest's
 // process-per-test model many sibling tests insert into `inference_markets`
 // concurrently, so a whole-table count delta is not reproducible. This test
-// asserts exact per-bucket counts scoped to its own seeded addresses
-// (`inference_market_state_counts_for`) — immune to concurrent writers — and
-// smoke-checks the whole-table path with lower bounds. Staleness is likewise a
-// lower bound: any other visible row only makes `min(ts)` older, never younger.
+// asserts exact per-bucket counts and staleness lower bounds scoped to its own
+// seeded addresses (the `*_for` siblings) — immune to concurrent writers. The
+// whole-table production variants run the very same shared SELECT consts
+// (`MARKET_STATE_COUNTS_SELECT`, `STALENESS_SELECT`), so the scoped asserts
+// cover their predicates without a whole-table call. Staleness stays a lower
+// bound because wall-clock time keeps passing between the seed and the query.
 // model_hash is left NULL on every row: the UNIQUE partial index
 // `inference_markets_model_hash_idx` ignores NULLs, so distinct rows never collide.
 #[tokio::test]
@@ -89,20 +91,13 @@ async fn state_counts_and_staleness_reflect_inserted_rows() {
     let scoped = repo.inference_market_state_counts_for(&addrs).await.expect("scoped state counts");
     assert_eq!(scoped, (1, 1, 1), "each seeded row lands in exactly its own bucket");
 
-    // Smoke-test the production whole-table path on the same predicates: it must at
-    // least see our three rows. Not an exact count — other rows in the shared test
-    // DB are expected and a concurrent writer can move any bucket at any moment.
-    let (dw, vw, fw) =
-        repo.inference_market_state_counts().await.expect("whole-table state counts");
-    assert!(
-        dw >= 1 && vw >= 1 && fw >= 1,
-        "whole-table counts must include our rows: {dw},{vw},{fw}"
-    );
-
-    // Our visible row makes the oldest reference_price_at at least 1000s old and
-    // the oldest last_swept_at at least 500s old; any other visible row can only
-    // be older (larger lag), never younger — so these lower bounds always hold.
-    let (price_lag, sweep_lag) = repo.inference_staleness_seconds().await.expect("staleness");
+    // Scoped to the same seeded addresses, only the `visible` row qualifies
+    // (`last_reconciled_at is not null`), so both ages come from exactly the
+    // timestamps seeded above: at least 1000s / 500s, plus whatever wall-clock
+    // time passed since the insert. This is the positive scoped case proving
+    // `STALENESS_SELECT` did not drift from the whole-table behaviour.
+    let (price_lag, sweep_lag) =
+        repo.inference_staleness_seconds_for(&addrs).await.expect("scoped staleness");
     assert!(price_lag >= 1000, "price_lag {price_lag} should be >= 1000");
     assert!(sweep_lag >= 500, "sweep_lag {sweep_lag} should be >= 500");
 
@@ -172,6 +167,19 @@ async fn order_status_counts_reflect_inserted_rows() {
         .execute(&pool)
         .await
         .expect("cleanup");
+}
+
+#[tokio::test]
+async fn staleness_for_an_empty_scope_is_zero_zero() {
+    // IX-MET-04: `unwrap_or(0)` on the empty set is documented (indexer.md) but was
+    // never asserted. A scoped probe over an address that has no rows is the only
+    // concurrency-safe way to observe it in the shared test database.
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+    let scope = vec!["0:staleness_empty_scope_never_seeded".to_string()];
+    let (price_lag, sweep_lag) =
+        repo.inference_staleness_seconds_for(&scope).await.expect("staleness_for");
+    assert_eq!((price_lag, sweep_lag), (0, 0), "empty scope must read as zero lag, not an error");
 }
 
 #[tokio::test]

@@ -220,6 +220,13 @@ impl IndexerRepository {
     const PENDING_PROJECTION_WHERE: &'static str = r#"processed_at is null
                   and event_type is not null
                   and decoded is not null"#;
+    /// Shared SELECT projection for the two staleness ages, in
+    /// `(price_lag, sweep_lag)` order. Shared by `inference_staleness_seconds`
+    /// (whole-table) and `inference_staleness_seconds_for` (scoped) for the
+    /// same anti-drift reason as `ORDER_STATUS_COUNTS_SELECT`.
+    const STALENESS_SELECT: &'static str = r#"
+        extract(epoch from now() - min(reference_price_at))::bigint as price_lag,
+        extract(epoch from now() - min(last_swept_at))::bigint as sweep_lag"#;
     /// Shared WHERE-clause fragment for "a row the projection loop will NOT pick
     /// up": untyped or undecoded. A deliberate complement to
     /// [`Self::PENDING_PROJECTION_WHERE`], not a variant of it: a growing count
@@ -1020,16 +1027,36 @@ impl IndexerRepository {
     /// `(reference_price_lag, sweep_lag)`, each 0 when no book is visible yet.
     /// Both values come from one query to keep it to a single round-trip.
     pub async fn inference_staleness_seconds(&self) -> anyhow::Result<(i64, i64)> {
-        let row: (Option<i64>, Option<i64>) = sqlx::query_as(
-            r#"select
-                   extract(epoch from now() - min(reference_price_at))::bigint as price_lag,
-                   extract(epoch from now() - min(last_swept_at))::bigint as sweep_lag
-                 from inference_markets
-                where last_reconciled_at is not null"#,
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("inference staleness seconds")?;
+        let sql = format!(
+            "select {} from inference_markets where last_reconciled_at is not null",
+            Self::STALENESS_SELECT
+        );
+        let row: (Option<i64>, Option<i64>) = sqlx::query_as(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .context("inference staleness seconds")?;
+        Ok((row.0.unwrap_or(0), row.1.unwrap_or(0)))
+    }
+
+    /// `inference_staleness_seconds` restricted to the `orderbook_address`es in
+    /// `scope`, running the identical `STALENESS_SELECT` age expressions.
+    /// Test-scoping counterpart, same rationale as
+    /// `inference_market_state_counts_for`. The `unwrap_or(0)` empty-set
+    /// behaviour is shared too: a scope with no visible rows reads as zero lag.
+    pub async fn inference_staleness_seconds_for(
+        &self,
+        scope: &[String],
+    ) -> anyhow::Result<(i64, i64)> {
+        let sql = format!(
+            "select {} from inference_markets \
+             where last_reconciled_at is not null and orderbook_address = any($1)",
+            Self::STALENESS_SELECT
+        );
+        let row: (Option<i64>, Option<i64>) = sqlx::query_as(&sql)
+            .bind(scope)
+            .fetch_one(&self.pool)
+            .await
+            .context("inference staleness seconds (scoped)")?;
         Ok((row.0.unwrap_or(0), row.1.unwrap_or(0)))
     }
 
