@@ -64,6 +64,14 @@ pub const DEFAULT_READ_BUDGET: Duration = Duration::from_secs(240);
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Lower bound on the time any single probe is given, and the upper bound on
+/// how far one probe can overrun its phase's remaining allowance. A healthy
+/// in-process probe answers in milliseconds; one that is still running after
+/// this long has stalled (a DB lock, an exhausted pool) and is reported as an
+/// observation instead of hanging the loop. Public so the polling tests can
+/// assert the bound itself.
+pub const PROBE_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
+
 /// The remaining shared budget. Created once per binary; each phase gets
 /// `left()`. Waiting for visibility is paid for once, not once per request.
 pub struct ReadBudget {
@@ -105,10 +113,27 @@ where
     let started = Instant::now();
     let mut last: String;
     loop {
-        match probe().await {
-            Probe::Ready(v) => return Ok(v),
-            Probe::Fatal(why) => return Err(format!("{label}: terminal refusal: {why}")),
-            Probe::Pending(why) => last = why,
+        // Bound the probe itself: an in-process request that stalls (a DB
+        // lock, an exhausted pool) would otherwise hang this await past every
+        // budget and hand the scenario to nextest's 600s kill before cleanup —
+        // the exact outcome the shared budget exists to prevent. The bound is
+        // the remaining allowance, floored at PROBE_TIMEOUT_FLOOR so the
+        // single probe of an exhausted budget keeps a bounded-but-fair chance
+        // instead of an unbounded await. A timed-out probe is an observation,
+        // not a verdict: it feeds the same deadline logic below, so the
+        // branch wordings and the "single probe" contract are unchanged.
+        let allowance = budget.saturating_sub(started.elapsed()).max(PROBE_TIMEOUT_FLOOR);
+        match tokio::time::timeout(allowance, probe()).await {
+            Ok(Probe::Ready(v)) => return Ok(v),
+            Ok(Probe::Fatal(why)) => return Err(format!("{label}: terminal refusal: {why}")),
+            Ok(Probe::Pending(why)) => last = why,
+            Err(_) => {
+                last = format!(
+                    "the probe itself was still running after {}s — a stalled in-process \
+                     request (DB lock or pool exhaustion), not a missing fact",
+                    allowance.as_secs()
+                )
+            }
         }
         // Exit when the NEXT round would not fit, not when the budget has
         // already expired. The difference shows up in the window `0 < budget
@@ -158,10 +183,12 @@ pub enum GetOutcome {
 
 /// GET with response classification.
 ///
-/// `404` (`-1121`) — the book is not `visible` yet; `503` (`-1500`) — the read
-/// path refused fail-closed. Both are legitimate and retryable. Everything
-/// else is terminal: `400` means a bad URL in the test itself, and a silent
-/// retry would turn a typo into an expired budget.
+/// `404` with the production `ErrorBody` code `-1121` — the book is not
+/// `visible` yet; `503` (`-1500`) — the read path refused fail-closed. Both
+/// are legitimate and retryable. Everything else is terminal: `400` means a
+/// bad URL in the test itself, and a `404` WITHOUT the `-1121` envelope is
+/// Salvo's own router miss — a misspelled path, which must fail fast rather
+/// than retry until the shared budget expires.
 pub async fn get_json(service: &Service, url: &str) -> GetOutcome {
     let mut resp = TestClient::get(url).send(service).await;
     match resp.status_code {
@@ -172,12 +199,25 @@ pub async fn get_json(service: &Service, url: &str) -> GetOutcome {
         Some(StatusCode::SERVICE_UNAVAILABLE) => {
             GetOutcome::Retry(format!("503 (-1500) on {url} — legitimate refusal, retrying"))
         }
-        Some(StatusCode::NOT_FOUND) => {
-            GetOutcome::Retry(format!("404 (-1121) on {url} — book not visible yet, retrying"))
-        }
+        Some(StatusCode::NOT_FOUND) => match resp.take_string().await {
+            Ok(body) if error_body_code(&body) == Some(-1121) => {
+                GetOutcome::Retry(format!("404 (-1121) on {url} — book not visible yet, retrying"))
+            }
+            Ok(body) => GetOutcome::Fatal(format!(
+                "{url}: 404 without the -1121 envelope is the router's own miss (a misspelled \
+                 path), not \"book not visible\"; body: {body:?}"
+            )),
+            Err(e) => GetOutcome::Fatal(format!("{url}: 404 with an unreadable body: {e}")),
+        },
         other => GetOutcome::Fatal(format!(
             "{url}: status {other:?} is not \"not there yet\" — 400 is a test defect, any 5xx \
              other than 503 is a service refusal"
         )),
     }
+}
+
+/// The `code` of a production `ErrorBody`, when the body is one. A router-level
+/// 404 carries no such envelope, which is exactly what tells it apart.
+fn error_body_code(body: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(body).ok()?.get("code")?.as_i64()
 }

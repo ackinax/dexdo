@@ -16,6 +16,7 @@ use common::read_model::get_json;
 use common::read_model::poll_read_with;
 use common::read_model::GetOutcome;
 use common::read_model::Probe;
+use common::read_model::PROBE_TIMEOUT_FLOOR;
 use dodex_infrastructure::indexer_repo::CAPTURE_STREAM;
 use sqlx::PgPool;
 
@@ -167,6 +168,34 @@ async fn an_exhausted_budget_says_so_instead_of_reporting_zero_seconds() {
 }
 
 #[tokio::test]
+async fn a_stalled_probe_is_bounded_by_the_floor_instead_of_hanging() {
+    // Every probe is bounded by max(remaining, PROBE_TIMEOUT_FLOOR): an
+    // in-process request that stalls (a DB lock, an exhausted pool) must
+    // surface as an expired budget with the stall NAMED — not hang the loop
+    // past every budget into nextest's 600s kill, which would lose the
+    // collected `failures` before scenario cleanup. Zero budget exercises the
+    // tightest case: the single-probe contract holds (the probe still runs),
+    // but bounded by the floor rather than awaited without limit.
+    let started = Instant::now();
+    let err = poll_read_with::<i32, _, _>("probe-stalled", Duration::ZERO, || async {
+        std::future::pending::<Probe<i32>>().await
+    })
+    .await
+    .expect_err("a stalled probe must come back as Err, not hang");
+    assert!(err.contains("still running"), "the stall must be named: {err}");
+    assert!(err.contains("spent earlier"), "zero budget keeps the exhausted wording: {err}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= PROBE_TIMEOUT_FLOOR,
+        "the single probe keeps its floored allowance: {elapsed:?}"
+    );
+    assert!(
+        elapsed < PROBE_TIMEOUT_FLOOR + Duration::from_secs(2),
+        "the stall must be cut off at the floor, not awaited: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_fatal_probe_does_not_wait_out_the_budget() {
     // A terminal outcome must exit at once: a 400 is a typo in the URL, and
     // waiting would turn it into an expired budget.
@@ -306,6 +335,29 @@ async fn a_book_not_yet_visible_answers_404_and_is_retried() {
                 GetOutcome::Ok(_) => "200".to_string(),
                 GetOutcome::Fatal(f) => f,
                 GetOutcome::Retry(_) => unreachable!(),
+            }
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_router_404_without_the_error_envelope_is_terminal() {
+    // Salvo answers 404 for a misspelled path too, without the production
+    // ErrorBody envelope. Only a body carrying code -1121 means "book not
+    // visible"; retrying a router miss would burn the shared budget on a typo
+    // and report it as a read-model timeout. The test above is this one's
+    // mirror: the same status with the -1121 envelope stays retryable.
+    let Some((service, _pool, _kek, _pn)) = common::setup().await else { return };
+    match get_json(&service, &api("no-such-endpoint")).await {
+        GetOutcome::Fatal(why) => {
+            assert!(why.contains("404"), "the router miss must be named: {why}")
+        }
+        other => panic!(
+            "a 404 without the -1121 envelope must be terminal, got {}",
+            match other {
+                GetOutcome::Ok(_) => "200".to_string(),
+                GetOutcome::Retry(w) => format!("Retry: {w}"),
+                GetOutcome::Fatal(_) => unreachable!(),
             }
         ),
     }
