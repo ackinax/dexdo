@@ -489,6 +489,92 @@ impl IndexerMetrics {
     pub fn inc_metrics_refresh_failures(&self) {
         self.metrics_refresh_failures.fetch_add(1, Ordering::Relaxed);
     }
+
+    // Test-only snapshot getters: plain atomic reads of the caches written by
+    // the refresh loop's eight fallible DB-backed sections, plus the failure
+    // counter itself — what the indexer's refresh-failure test asserts on
+    // (its sentinels are unreadable from another crate otherwise). Same
+    // precedent as `IndexerRepository::decode_errors_count`: `#[doc(hidden)]`,
+    // no features or cfg bridges. Tuple getters mirror the tuple setters.
+
+    #[doc(hidden)]
+    pub fn orders_created_value(&self) -> u64 {
+        self.orders_created.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn orders_partially_filled_value(&self) -> u64 {
+        self.orders_partially_filled.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn projection_backlog_value(&self) -> u64 {
+        self.projection_backlog.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn projection_lag_seconds_value(&self) -> u64 {
+        self.projection_lag_seconds.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn capture_cursor_age_seconds_value(&self) -> u64 {
+        self.capture_cursor_age_seconds.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn inference_market_states_value(&self) -> (u64, u64, u64) {
+        (
+            self.inference_markets_discovering.load(Ordering::Relaxed),
+            self.inference_markets_visible.load(Ordering::Relaxed),
+            self.inference_markets_failing.load(Ordering::Relaxed),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn inference_reference_price_lag_seconds_value(&self) -> u64 {
+        self.inference_reference_price_lag_seconds.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn inference_sweep_lag_seconds_value(&self) -> u64 {
+        self.inference_sweep_lag_seconds.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn inference_order_counts_value(&self) -> (u64, u64, u64, u64) {
+        (
+            self.inference_orders_open.load(Ordering::Relaxed),
+            self.inference_orders_filled.load(Ordering::Relaxed),
+            self.inference_orders_cancelled.load(Ordering::Relaxed),
+            self.inference_orders_expired.load(Ordering::Relaxed),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn inference_wedged_books_value(&self) -> u64 {
+        self.inference_wedged_books.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn metrics_refresh_failures_count(&self) -> u64 {
+        self.metrics_refresh_failures.load(Ordering::Relaxed)
+    }
+
+    /// Test-only factory: an `IndexerMetrics` on a reader-less in-memory
+    /// provider ("exports nowhere", the same shape as the in-crate setter
+    /// test). Exists because a dependent crate's test (the indexer's
+    /// refresh-failure test) has no opentelemetry dependency to build a
+    /// `Meter` with, and `init()` without an OTLP endpoint returns `None`.
+    /// The provider is returned as owner — dropping it kills the instruments,
+    /// so hold it for the metrics' lifetime.
+    #[doc(hidden)]
+    pub fn new_in_memory_for_tests() -> (SdkMeterProvider, IndexerMetrics) {
+        let provider = SdkMeterProvider::builder().build();
+        let meter = provider.meter("dodex-metrics-test");
+        let metrics = IndexerMetrics::new(&meter);
+        (provider, metrics)
+    }
 }
 
 /// Picks the OTLP endpoint with the standard precedence: the metrics-specific
