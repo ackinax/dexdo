@@ -993,6 +993,79 @@ async fn observability_event_seeds_market_only() {
     assert_eq!((m, o), (1, 0), "observability seeds the market but creates no order");
 }
 
+/// Seed-only assert shared by the three IX-OB-18 tests below: project one
+/// event of the given type onto a fresh book and require exactly (1 market,
+/// 0 orders) — the shared skeleton pre-step ran, the arm itself wrote nothing.
+async fn assert_seed_only(pool: &PgPool, ob: &str, e: &DecodedEvent) {
+    sqlx::query("delete from inference_orders where orderbook_address=$1")
+        .bind(ob)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("delete from inference_markets where orderbook_address=$1")
+        .bind(ob)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, e, &node(ob, "co-seed-1")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+    let m: i64 =
+        sqlx::query_scalar("select count(*) from inference_markets where orderbook_address=$1")
+            .bind(ob)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let o: i64 =
+        sqlx::query_scalar("select count(*) from inference_orders where orderbook_address=$1")
+            .bind(ob)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!((m, o), (1, 0), "the event must seed the market and write nothing else");
+}
+
+#[tokio::test]
+async fn order_book_deployed_event_seeds_market_only() {
+    // IX-OB-18: `InferenceOrderBookDeployed` is one of the four seed-only arms.
+    // Payload follows `OrderBookDeployedData` (note, modelHash, modelName); the
+    // arm never reads it — the assert is that nothing beyond the seed happens.
+    let Some(pool) = setup().await else { return };
+    let e = ev(
+        "InferenceOrderBookDeployed",
+        serde_json::json!({"note":"0:deployer_note","modelHash":"123","modelName":"seed-model"}),
+    );
+    assert_seed_only(&pool, "0:t_obd_seed", &e).await;
+}
+
+#[tokio::test]
+async fn order_cancel_rejected_event_seeds_market_only() {
+    // IX-OB-18: `InferenceOrderCancelRejected` fires when a cancel matched no
+    // resting order or came from a foreign owner — the book did not change, so
+    // the arm must not touch any row. Payload follows `OrderCancelRejectedData`.
+    let Some(pool) = setup().await else { return };
+    let e = ev(
+        "InferenceOrderCancelRejected",
+        serde_json::json!({"orderId":"7","reason":"1","note":"0:cancel_note"}),
+    );
+    assert_seed_only(&pool, "0:t_ocr_seed", &e).await;
+}
+
+#[tokio::test]
+async fn order_rejected_event_seeds_market_only() {
+    // IX-OB-18: `InferenceOrderRejected` carries no orderId — the placement was
+    // refused before anything rested, so there is no row to key on. The routing
+    // outcome of this type is already pinned by no_op_event_arms.rs; THIS test
+    // asserts the different claim that projecting it writes nothing beyond the
+    // market skeleton. Payload follows `OrderRejectedData`.
+    let Some(pool) = setup().await else { return };
+    let e = ev(
+        "InferenceOrderRejected",
+        serde_json::json!({"reason":"2","note":"0:reject_note","tokenContract":ZERO_ADDRESS,"refund":"0"}),
+    );
+    assert_seed_only(&pool, "0:t_or_seed", &e).await;
+}
+
 #[tokio::test]
 async fn routes_by_event_type_when_event_name_is_empty() {
     // The reprojection loop reconstructs DecodedEvent with event_name EMPTY (only
@@ -2022,6 +2095,36 @@ async fn buy_placement_normalizes_zero_token_contract_and_deadline_to_null() {
     .unwrap();
     assert!(tc.is_none(), "zero address must normalize to NULL");
     assert!(dl.is_none(), "zero deadline must normalize to NULL");
+}
+
+#[tokio::test]
+async fn buy_placement_with_a_nonzero_deadline_keeps_it() {
+    // IX-OB-04's missing combination: the BUY normalization must collapse ONLY
+    // zero values. A BUY with a real deadline (IOC-style) keeps it; the zero
+    // token contract still collapses to NULL. The SELL positive lives at
+    // order_placed_persists_token_contract_and_deadline; the BUY all-zero case
+    // is the test above.
+    let Some(pool) = setup().await else { return };
+    let ob = "0:buy_nonzero_deadline_book";
+    clean(&pool, ob).await;
+
+    project_placed(&pool, ob, 9, /* is_buy */ true, "10", "5", Some(ZERO_ADDRESS), 1760003600)
+        .await;
+
+    let (tc, dl): (Option<String>, Option<String>) = sqlx::query_as(
+        "select token_contract, deadline::text from inference_orders where orderbook_address=$1 and order_id=9",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(tc.is_none(), "zero token contract still collapses");
+    assert_eq!(
+        dl.as_deref(),
+        Some("1760003600"),
+        "a non-zero deadline must survive the BUY normalization"
+    );
+    clean(&pool, ob).await;
 }
 
 #[tokio::test]

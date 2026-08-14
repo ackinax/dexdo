@@ -346,6 +346,56 @@ async fn unknown_event_type_is_marked_processed() {
     );
 }
 
+#[tokio::test]
+async fn unknown_inference_scoped_event_type_is_marked_processed_and_never_retried() {
+    // IX-FAIL-06, the inference-scoped variant of the test above: a typed,
+    // decoded row whose `TokenContract.*` suffix matches no settlement arm falls
+    // through to `_ => Unknown` in projectors.rs, which stamps it processed on
+    // first sight — "a handler added later needs an explicit backfill"
+    // (projectors.rs). The stamp is drainage's doing (`mark_processed`), which
+    // is why this lives here and not in token_contract_projectors.rs: projector
+    // tests call project_event directly, bypassing the stamp.
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_unknown_tc_event";
+    let msg_id = format!("{test}-msg");
+
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
+
+    insert_raw(&pool, &msg_id, "0:reproj_unknown_tc_src", "TokenContract.Bogus", &json!({})).await;
+
+    repo.reproject_pending(1000).await.expect("reproject");
+    assert!(
+        processed_at_is_set(&pool, &msg_id).await,
+        "an unroutable TokenContract suffix must stamp processed_at, not defer"
+    );
+
+    // A second pass must not touch the row: the pending SELECT filters
+    // `processed_at is null`, so an unchanged stamp proves the row left the
+    // queue for good (Unknown is terminal, not a retryable deferral).
+    let stamp_after_first: String =
+        sqlx::query_scalar("select processed_at::text from raw_events where msg_id = $1")
+            .bind(&msg_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stamp");
+    repo.reproject_pending(1000).await.expect("second reproject");
+    let stamp_after_second: String =
+        sqlx::query_scalar("select processed_at::text from raw_events where msg_id = $1")
+            .bind(&msg_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stamp again");
+    assert_eq!(
+        stamp_after_first, stamp_after_second,
+        "the second pass must not pick the stamped row back up"
+    );
+
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
+}
+
 /// One captured `warn!` event: its tracing target plus the `message` and
 /// `event_type` fields, enough to assert which sink the no-handler warning
 /// would land in.

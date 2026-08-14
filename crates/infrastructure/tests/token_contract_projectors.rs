@@ -821,6 +821,42 @@ async fn a_real_seller_bond_funded_body_is_skeleton_only() {
 }
 
 #[tokio::test]
+async fn a_synthetic_shell_withdrawn_event_is_skeleton_only() {
+    // IX-TC-11's last uncovered type. SYNTHETIC by necessity: the wave-4 harvest
+    // captured no post-upgrade `ShellWithdrawn` body (no run withdrew shell), so
+    // unlike the five real-body neighbours this payload is hand-built after
+    // `ShellWithdrawnData` (recipient, amount). Replace it with a
+    // `decode_and_verify_snapshot` fixture at the first stand run that performs
+    // a withdrawal. Until then the claim is the projector's, not the decoder's:
+    // the arm seeds the deal skeleton and writes no further state.
+    let Some(pool) = setup().await else { return };
+    let tc = "0:tc_synth_shell_withdrawn";
+    sqlx::query("delete from inference_deals where token_contract_address=$1")
+        .bind(tc)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let decoded =
+        ev("ShellWithdrawn", serde_json::json!({"recipient":"0:withdraw_to","amount":"12345"}));
+
+    let mut tx = pool.begin().await.unwrap();
+    let outcome = project(&mut tx, &decoded, &node(tc, "co-synth-sw-1")).await;
+    assert_eq!(outcome, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let (deposit, close_kind): (Option<String>, Option<String>) = sqlx::query_as(
+        "select deposit::text, close_kind from inference_deals where token_contract_address=$1",
+    )
+    .bind(tc)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(deposit.is_none(), "ShellWithdrawn carries no deal-level state the read model needs");
+    assert!(close_kind.is_none());
+}
+
+#[tokio::test]
 async fn a_real_stream_opened_body_projects_price_per_tick() {
     let Some(pool) = setup().await else { return };
     let tc = "0:tc_real_stream_opened";
