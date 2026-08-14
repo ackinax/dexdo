@@ -54,11 +54,12 @@ pub async fn project_inference_event(
     // the live loop and the direct tests.
     let suffix =
         event.event_type.strip_prefix("InferenceOrderBook.").unwrap_or(event.event_type.as_str());
-    // Маршрут по ВАРИАНТУ enum'а, а не по строковому литералу. Вариант пинится к
-    // ABI (`inference_order_book_enum_covers_every_abi_event`), поэтому арм,
-    // называющий несуществующее событие, перестаёт быть выразимым — так прожили
-    // мёртвыми `InferenceSubscriptionPlaced` и `StreamReclaimed`. `match`
-    // исчерпывающий БЕЗ `_`: новый вариант не соберётся, пока ему не назначат исход.
+    // Route by the enum VARIANT, not by a string literal. The variant is pinned
+    // to the ABI (`inference_order_book_enum_covers_every_abi_event`), so an arm
+    // naming an event that does not exist stops being expressible — that is how
+    // `InferenceSubscriptionPlaced` and `StreamReclaimed` lived on as dead arms.
+    // The `match` is exhaustive WITHOUT `_`: a new variant will not compile until
+    // someone assigns it an outcome.
     use InferenceOrderBookEvent as E;
     let Some(kind) = E::ALL.iter().copied().find(|v| {
         let n = format!("{v:?}");
@@ -105,8 +106,9 @@ async fn seed_market_skeleton(
     Ok(())
 }
 
-// Shared resting-order upsert. `is_subscription` приходит из бита FLAG_SUBSCRIPTION
-// поля `flags` события placement — отдельного события подписки в ABI нет.
+// Shared resting-order upsert. `is_subscription` comes from the FLAG_SUBSCRIPTION
+// bit of the placement event's `flags` field — the ABI carries no separate
+// subscription event.
 // Same still-fresh conflict guard as
 // projectors::apply_order_placed: a replay onto a closed or partially-filled-OPEN
 // row is a no-op, so it never resets amount_remaining and corrupts depth.
@@ -181,19 +183,20 @@ async fn apply_inference_order_placed(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let ob = node.src.as_deref().context("OrderPlaced: src missing")?;
-    // Исчерпывающая деструктуризация: каждое поле ABI обязано быть названо.
+    // Exhaustive destructuring: every ABI field must be named.
     let OrderPlacedData { order_id, is_buy, price, ticks, note, token_contract, deadline, flags } =
         serde_json::from_value(event.value.clone())
-            .context("InferenceOrderPlaced: payload не разбирается по ABI")?;
+            .context("InferenceOrderPlaced: payload does not parse against the ABI")?;
     let order_id = order_id.to_string();
-    // `price` — uint256, см. `FilledFields::parse`.
+    // `price` is a uint256, see `FilledFields::parse`.
     let price = uint256_maybe_hex(&price)?;
     let ticks = ticks.to_string();
     let note = Some(note.as_str());
     let token_contract: Option<&str> = non_zero_address(Some(token_contract.as_str()));
     let deadline: Option<String> = non_zero_uint(Some(deadline.to_string()));
-    // `flags` — 8-й параметр события с v4.0.33. Подписка это бит FLAG_SUBSCRIPTION
-    // (0x40, contracts/airegistry/modifiers/modifiers.sol), а не отдельное событие.
+    // `flags` is the event's 8th parameter as of v4.0.33. A subscription is the
+    // FLAG_SUBSCRIPTION bit (0x40, contracts/airegistry/modifiers/modifiers.sol),
+    // not an event of its own.
     const FLAG_SUBSCRIPTION: u8 = 0x40;
     let is_subscription = flags & FLAG_SUBSCRIPTION != 0;
     let chain_order = node_chain_order(node, "InferenceOrderPlaced")?;
@@ -240,19 +243,21 @@ struct FilledFields {
     /// Deal-link fields (present on the normal `Filled`; unused by orphan repair).
     seller_tc: Option<String>,
     buyer_note: Option<String>,
-    /// Продавец, названный самим событием (7-е поле `InferenceFilled` с v4.0.33).
-    /// До него продавец восстанавливался обходом по SELL-ноге в `inference_orders`,
-    /// что теряло его ровно тогда, когда нога не приехала — то есть на orphan-repair.
+    /// The seller named by the event itself (`InferenceFilled`'s 7th field as of
+    /// v4.0.33). Before it, the seller was recovered by walking the SELL leg in
+    /// `inference_orders`, which lost him exactly when that leg had not arrived —
+    /// that is, on orphan repair.
     seller_note: Option<String>,
 }
 
 impl FilledFields {
     fn parse(event: &DecodedEvent, node: &EventNode) -> anyhow::Result<Self> {
-        // ИСЧЕРПЫВАЮЩАЯ деструктуризация — единственная работающая форма гарда
-        // «поле ABI потребляется». Компилятор обязывает назвать каждое поле:
-        // приехавшее и никому не нужное нельзя молча проигнорировать. Сверка
-        // ключей DTO с ABI этого НЕ доказывает — она зелёная и тогда, когда поле
-        // объявлено, но выброшено (так и потерялся `sellerNote`).
+        // EXHAUSTIVE destructuring — the only form of the "this ABI field is
+        // consumed" guard that actually works. The compiler forces every field to
+        // be named: one that arrives and is needed by nobody cannot be ignored
+        // silently. Checking DTO keys against the ABI does NOT prove this — it
+        // stays green when a field is declared and then thrown away (which is
+        // exactly how `sellerNote` got lost).
         let FilledData {
             maker_id,
             taker_id,
@@ -262,7 +267,7 @@ impl FilledFields {
             buyer_note,
             seller_note,
         } = serde_json::from_value(event.value.clone())
-            .context("InferenceFilled: payload не разбирается по ABI")?;
+            .context("InferenceFilled: payload does not parse against the ABI")?;
 
         let maker_id = maker_id.to_string();
         let taker_id = taker_id.to_string();
@@ -272,10 +277,11 @@ impl FilledFields {
             maker_id,
             taker_id,
             ticks: ticks.to_string(),
-            // `clearingPrice` — uint256, декодер отдаёт его "0x"+64 hex. DTO держит
-            // СЫРОЕ значение ABI, поэтому конверсия остаётся здесь: без неё hex
-            // поедет в `inference_trades.price`, а numeric его не примет. Тесты с
-            // десятичными фикстурами разницы не увидят — см. гард
+            // `clearingPrice` is a uint256; the decoder hands it over as
+            // "0x" + 64 hex. The DTO holds the RAW ABI value, so the conversion
+            // stays here: without it the hex would reach
+            // `inference_trades.price`, which numeric will not accept. Tests with
+            // decimal fixtures see no difference — hence the guard
             // `a_uint256_price_arrives_as_decimal_not_hex`.
             clearing_price: uint256_maybe_hex(&clearing_price)?,
             chain_order: node_chain_order(node, "InferenceFilled")?,
@@ -332,9 +338,10 @@ async fn apply_filled_decrement(
                   end,
                   status = case
                       when o.status = 'FILLED' then 'FILLED'
-                      -- Истечение терминально: поздний филл не воскрешает строку.
-                      -- Возвращается СВОЙ статус, не 'FILLED' — исход другой. Арм стоит
-                      -- ВЫШЕ `is_buy = false`, иначе истёкший SELL перехватился бы им.
+                      -- Expiry is terminal: a late fill does not resurrect the row.
+                      -- It returns ITS OWN status, not 'FILLED' — the outcome differs.
+                      -- This arm sits ABOVE `is_buy = false`, otherwise an expired
+                      -- SELL would be intercepted by that one.
                       when o.status = 'EXPIRED' then 'EXPIRED'
                       when o.status = 'CANCELLED' and o.swept_at is null then 'CANCELLED'
                       when o.is_buy = false then 'FILLED'
@@ -418,8 +425,9 @@ async fn link_deal_from_filled(
         return Ok(());
     };
 
-    // Обход по SELL-ноге (is_buy=false): работает, только если нога СПРОЕЦИРОВАНА.
-    // Оставлен фолбэком — событие теперь называет продавца прямым полем.
+    // Walking the SELL leg (is_buy=false) works only if that leg has been
+    // PROJECTED. Kept as a fallback — the event now names the seller in a field
+    // of its own.
     let seller_from_leg: Option<String> = sqlx::query_scalar(
         r#"select note_address from inference_orders
             where orderbook_address = $1 and order_id = any($2::numeric[]) and is_buy = false
@@ -432,8 +440,8 @@ async fn link_deal_from_filled(
     .context("resolve seller_note for deal link")?
     .flatten();
 
-    // Событие авторитетнее обхода: обход теряет продавца ровно тогда, когда нога не
-    // приехала (orphan-repair), а `sellerNote` есть всегда.
+    // The event outranks the walk: the walk loses the seller exactly when the leg
+    // has not arrived (orphan repair), whereas `sellerNote` is always there.
     let seller_note = f.seller_note.clone().or(seller_from_leg);
 
     sqlx::query(
@@ -567,16 +575,17 @@ pub enum ExpiredOrphanOutcome {
     /// `OrderPlaced` was dropped), so the authoritative cancel is lost. If a late
     /// placement re-opens the order the phantom sweep reconciles it.
     CancelLost,
-    /// Истечение, чей `InferenceOrderPlaced` так и не приехал: закрывать нечего,
-    /// но статус ордера потерян — он не станет `EXPIRED` никогда.
+    /// An expiry whose `InferenceOrderPlaced` never arrived: there is nothing to
+    /// close, but the order's status is lost — it will never reach `EXPIRED`.
     ExpiryLost,
-    /// Рефанд без родителя: возврат состоялся на цепи, а ордера, которого он
-    /// касается, в read-модели нет. Что именно потеряно — сказать НЕЛЬЗЯ, и
-    /// формулировка обязана это уважать: до дедлайна тот же тип события шлёт
-    /// `_finalizeTaker` по тейкеру, в том числе полностью исполненному, и сам
-    /// по себе не закрывает ничего (см. `apply_inference_refunded`). Без строки
-    /// не виден и дедлайн, то есть неизвестно даже, истечение это или конец
-    /// жизни тейкера. Потеряна привязка возврата к ордеру — не более.
+    /// A refund with no parent: the return happened on chain, but the order it
+    /// concerns is absent from the read model. What exactly was lost CANNOT be
+    /// stated, and the wording must respect that: before the deadline the same
+    /// event type is emitted by `_finalizeTaker` for a taker — including a fully
+    /// filled one — and on its own closes nothing (see `apply_inference_refunded`).
+    /// Without the row the deadline is invisible too, so it is not even known
+    /// whether this is an expiry or the end of a taker's life. What is lost is the
+    /// link between the refund and its order — no more than that.
     RefundLost,
     /// Any other inference event past cutoff with no resting row to repair.
     Nothing,
@@ -707,35 +716,38 @@ async fn apply_inference_order_expired(
     }
 }
 
-/// `InferenceRefunded(orderId, note, amount)` — деньги вернулись владельцу, и с
-/// v4.0.33 событие несёт id, то есть говорит про КОНКРЕТНУЮ строку. Оно НЕ является
-/// общим сигналом закрытия: контракт шлёт его с четырёх мест, и только два из них
-/// про исчезновение ордера по времени (`InferenceOrderBook.sol`):
-///   * `:1368` — continuation возобновился после дедлайна: ЕДИНСТВЕННОЕ событие,
-///     `InferenceOrderExpired` для этого пути не эмитится вообще;
-///   * `:1135` — `_removeExpiredBid` -> `_refundAndRemove`: следом придёт
-///     `InferenceOrderExpired`, так что здесь это лишь ранний дубль;
-///   * `:1183` — `_finalizeTaker` для BUY: конец жизни тейкера, в том числе
-///     ПОЛНОСТЬЮ ИСПОЛНЕННОГО (`remaining < 2` покрывает и ноль, событие уходит
-///     даже при нулевом `leftover`);
-///   * `:1223` — `_finalizeTaker` для taker-only SELL, который не сматчился.
+/// `InferenceRefunded(orderId, note, amount)` — the money went back to its owner,
+/// and as of v4.0.33 the event carries an id, i.e. it speaks about a SPECIFIC row.
+/// It is NOT a general close signal: the contract emits it from four sites, and
+/// only two of them are about an order disappearing on time
+/// (`InferenceOrderBook.sol`):
+///   * `:1368` — a continuation resumed past its deadline: the ONLY event on this
+///     path, `InferenceOrderExpired` is not emitted for it at all;
+///   * `:1135` — `_removeExpiredBid` -> `_refundAndRemove`: an
+///     `InferenceOrderExpired` follows, so here this is merely an early duplicate;
+///   * `:1183` — `_finalizeTaker` for a BUY: the end of a taker's life, including
+///     a FULLY FILLED one (`remaining < 2` covers zero too, and the event goes out
+///     even with a zero `leftover`);
+///   * `:1223` — `_finalizeTaker` for a taker-only SELL that did not match.
 ///
-/// Разделяет их дедлайн, и разделяет ТОЧНО: `:1643` требует при submit
-/// `deadline == 0 || deadline > block.timestamp`, а повторная проверка на входе в
-/// `_doPlaceHead` (`:1355`) уводит просроченный continuation в ветку рефанда ДО
-/// матчинга. Значит `_finalizeTaker` недостижим с прошедшим дедлайном, а обе
-/// ветки истечения — с непрошедшим.
+/// The deadline separates them, and separates them EXACTLY: `:1643` requires
+/// `deadline == 0 || deadline > block.timestamp` at submit, and the re-check on
+/// entry to `_doPlaceHead` (`:1355`) diverts an expired continuation into the
+/// refund branch BEFORE matching. So `_finalizeTaker` is unreachable past the
+/// deadline, and both expiry branches are unreachable before it.
 ///
-/// Поэтому строка закрывается ТОЛЬКО с прошедшим дедлайном и только в `EXPIRED`.
-/// Ветки `CANCELLED` здесь нет намеренно. Про тейкера рефанд не знает, исполнился
-/// тот или нет — знает `InferenceFilled`, и если он отложен из-за недостающей ноги,
-/// дренаж всё равно идёт дальше (`indexer_repo.rs:522`), так что рефанд применился
-/// бы РАНЬШЕ своего же fill'а. Закрыв строку, он навсегда оставил бы исполненный
-/// ордер отменённым: при повторе fill'а терминальный гард `apply_filled_decrement`
-/// запретит и декремент, и переход в `FILLED`.
+/// The row is therefore closed ONLY past the deadline and only into `EXPIRED`.
+/// There is deliberately no `CANCELLED` branch here. The refund knows nothing
+/// about whether the taker filled — `InferenceFilled` knows that, and if it is
+/// deferred over a missing leg the drain still moves on
+/// (`indexer_repo.rs:522`), so the refund would be applied BEFORE its own fill.
+/// Closing the row would leave a filled order cancelled forever: on the fill's
+/// retry the terminal guard in `apply_filled_decrement` forbids both the
+/// decrement and the transition to `FILLED`.
 ///
-/// Остаток IOC/MARKET и dust закрывает phantom sweep — сверкой с самой цепью,
-/// а не догадкой по payload'у. Это и есть его работа.
+/// An IOC/MARKET leftover and dust are closed by the phantom sweep — by
+/// reconciling against the chain itself, not by guessing from a payload. That is
+/// precisely the sweep's job.
 async fn apply_inference_refunded(
     tx: &mut Transaction<'_, Postgres>,
     event: &DecodedEvent,
@@ -744,21 +756,22 @@ async fn apply_inference_refunded(
     let ob = node.src.as_deref().context("Refunded: src missing")?;
     let RefundedData {
         order_id,
-        // Кому вернули — знает сама нота; в `inference_orders` для этого нет колонки.
+        // Who was refunded is known to the note itself; `inference_orders` has no
+        // column for it.
         note: _,
-        // Сумма возврата read-модели не нужна: закрытие строки решает дедлайн,
-        // а не размер возврата (см. тело функции).
+        // The read model does not need the refunded amount: closing the row is
+        // decided by the deadline, not by the size of the return (see the body).
         amount: _,
     } = serde_json::from_value(event.value.clone())
-        .context("InferenceRefunded: payload не разбирается по ABI")?;
+        .context("InferenceRefunded: payload does not parse against the ABI")?;
     let order_id = order_id.to_string();
     let chain_order = node_chain_order(node, "InferenceRefunded")?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
 
-    // РОДИТЕЛЬ ПРОВЕРЯЕТСЯ ПЕРВЫМ и независимо от того, известно ли время. Сирота
-    // обязана уйти в Deferred и дальше — в dead-letter по возрасту. Ранний выход по
-    // отсутствию времени пометил бы её Applied, и поздний placement открыл бы ордер,
-    // который рефанд уже никогда не закроет.
+    // THE PARENT IS CHECKED FIRST, regardless of whether the time is known. An
+    // orphan must go to Deferred and from there into the age-based dead letter.
+    // An early return on a missing time would mark it Applied, and a late
+    // placement would then open an order this refund can never close.
     let parent: Option<(String,)> = sqlx::query_as(
         r#"select status from inference_orders
             where orderbook_address = $1 and order_id = $2::numeric for update"#,
@@ -772,11 +785,11 @@ async fn apply_inference_refunded(
         return Ok(ProjectionOutcome::Deferred);
     }
 
-    // Родитель есть, но времени события нет: выбрать между «истекло» и «тейкер
-    // закончился» НЕЛЬЗЯ, а угадать — значит записать неверный терминальный статус
-    // навсегда. Строка остаётся как есть, событие помечается Applied, а закрытие
-    // достаётся sweep'у — тому самому, который эта волна сохранила именно как
-    // сверку с состоянием цепи.
+    // The parent exists, but the event carries no time: choosing between "it
+    // expired" and "the taker finished" is IMPOSSIBLE, and guessing means writing
+    // a wrong terminal status forever. The row is left as is, the event is marked
+    // Applied, and closing it falls to the sweep — the very one this wave kept
+    // precisely as a reconciliation against chain state.
     let Some(chain_seconds) = chain_seconds else {
         warn!(
             orderbook_address = ob, order_id = %order_id, chain_order = %chain_order,
@@ -785,17 +798,17 @@ async fn apply_inference_refunded(
         return Ok(ProjectionOutcome::Applied);
     };
 
-    // Строка уже заблокирована SELECT'ом выше, поэтому решение можно принять
-    // предикатом в WHERE: не подошла — не тронута ВООБЩЕ, включая `updated_at`.
-    // Иначе «no-op» врёт наблюдателю и churn'ит метку на каждом dust-рефанде по
-    // уже исполненному ордеру.
+    // The row is already locked by the SELECT above, so the decision can be made
+    // by a predicate in the WHERE: a row that does not qualify is not touched AT
+    // ALL, `updated_at` included. Otherwise a "no-op" lies to an observer and
+    // churns the stamp on every dust refund against an already filled order.
     //
-    // Предикат «кому можно проставить истечение» — тот же, что у
-    // `apply_inference_order_expired`: `OPEN` или ПРОВИЗОРНАЯ sweep-отметка
-    // (`swept_at` NOT NULL). Sweep угадал `CANCELLED` только потому, что ордер
-    // исчез из книги, а это ровно то, что делает истечение, — событие его
-    // поправляет и снимает `swept_at`. `FILLED`, `EXPIRED` и НАСТОЯЩАЯ отмена
-    // (`swept_at` NULL) стоят.
+    // The "who may be stamped expired" predicate is the same one
+    // `apply_inference_order_expired` uses: `OPEN`, or a PROVISIONAL sweep mark
+    // (`swept_at` NOT NULL). The sweep guessed `CANCELLED` only because the order
+    // had vanished from the book, which is exactly what expiry does — so the
+    // event corrects it and clears `swept_at`. `FILLED`, `EXPIRED` and a REAL
+    // cancel (`swept_at` NULL) stand.
     sqlx::query(
         r#"update inference_orders o
               set status = 'EXPIRED',
@@ -805,8 +818,8 @@ async fn apply_inference_refunded(
                   updated_at = now()
             where o.orderbook_address = $1
               and o.order_id = $2::numeric
-              -- Закрывать по рефанду можно ТОЛЬКО просроченный ордер: с непрошедшим
-              -- дедлайном это `_finalizeTaker`, где судьбу ордера решает `Filled`.
+              -- A refund may close ONLY a past-deadline order: before the deadline
+              -- this is `_finalizeTaker`, where `Filled` decides the order's fate.
               and o.deadline is not null
               and o.deadline <= $4::numeric
               and (o.status = 'OPEN' or (o.status = 'CANCELLED' and o.swept_at is not null))"#,
@@ -819,9 +832,10 @@ async fn apply_inference_refunded(
     .await
     .context("inference Refunded update")?;
 
-    // Applied независимо от числа затронутых строк: существование родителя уже
-    // доказано блокирующим SELECT'ом, а «не подошёл по дедлайну» — это ответ, а не
-    // отсрочка. Deferred здесь означал бы «жди», и событие крутилось бы вечно.
+    // Applied regardless of how many rows were affected: the parent's existence
+    // is already proven by the locking SELECT, and "did not qualify by deadline"
+    // is an answer, not a postponement. Deferred here would mean "wait", and the
+    // event would spin forever.
     Ok(ProjectionOutcome::Applied)
 }
 
@@ -840,8 +854,8 @@ async fn apply_inference_order_cancelled(
     let prior: Option<(String,)> = sqlx::query_as(
         r#"with prior as (
                select status,
-                      -- Истечение терминально наравне с исполнением: поздняя отмена
-                      -- не имеет права понизить EXPIRED до CANCELLED.
+                      -- Expiry is terminal on a par with a fill: a late cancel has
+                      -- no right to demote EXPIRED to CANCELLED.
                       status in ('FILLED','EXPIRED') as terminal
                  from inference_orders
                 where orderbook_address = $1 and order_id = $2::numeric for update)

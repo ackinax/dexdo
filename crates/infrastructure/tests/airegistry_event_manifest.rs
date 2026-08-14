@@ -269,7 +269,7 @@ fn parse_emit(rest: &str) -> Option<(&str, &str)> {
 
 // ────────────────────────────────── checks ──────────────────────────────────
 
-/// `"Kind.EventName" -> routing id`, выведенное из уже разобранных строк манифеста.
+/// `"Kind.EventName" -> routing id`, derived from the already-parsed manifest rows.
 fn id_by_event_type() -> BTreeMap<String, u32> {
     let mut out = BTreeMap::new();
     for e in MANIFEST {
@@ -280,14 +280,14 @@ fn id_by_event_type() -> BTreeMap<String, u32> {
     out
 }
 
-/// Дискриминант Rust-enum'а обязан равняться id, на который контракт реально
-/// эмитит это событие. Соответствие «вариант -> событие» берётся из правила,
-/// которое пинит `crates/contracts`: имя варианта совпадает с именем события ABI,
-/// книга дополнительно префиксуется словом `Inference`.
+/// A Rust enum's discriminant must equal the id the contract actually emits that
+/// event on. The "variant -> event" correspondence comes from the rule
+/// `crates/contracts` pins: the variant name matches the ABI event name, and the
+/// book's events additionally carry an `Inference` prefix.
 ///
-/// Рукописной таблицы здесь нет намеренно: она была бы третьим списком id после
-/// `modifiers.sol` и `MANIFEST`, и именно дублирование развело
-/// `TokenContractEvent::ContractDeployed` с контрактом.
+/// There is deliberately no hand-written table here: it would be a third list of
+/// ids after `modifiers.sol` and `MANIFEST`, and duplication is exactly what let
+/// `TokenContractEvent::ContractDeployed` drift away from the contract.
 #[test]
 fn typed_event_enums_carry_the_ids_the_contracts_emit_on() {
     use dodex_contracts::airegistry::inference_order_book_events::InferenceOrderBookEvent as Iob;
@@ -300,10 +300,10 @@ fn typed_event_enums_carry_the_ids_the_contracts_emit_on() {
         let event_type = format!("TokenContract.{v:?}");
         let expected = ids
             .get(&event_type)
-            .unwrap_or_else(|| panic!("{event_type} не эмитится ни на один id в modifiers.sol"));
+            .unwrap_or_else(|| panic!("{event_type} is not emitted on any id in modifiers.sol"));
         assert_eq!(
             *v as u32, *expected,
-            "TokenContractEvent::{v:?} объявлен на {}, а контракт эмитит его на {expected}",
+            "TokenContractEvent::{v:?} is declared on {}, but the contract emits it on {expected}",
             *v as u32
         );
         checked += 1;
@@ -315,20 +315,21 @@ fn typed_event_enums_carry_the_ids_the_contracts_emit_on() {
         let event_type = format!("InferenceOrderBook.{name}");
         let expected = ids
             .get(&event_type)
-            .unwrap_or_else(|| panic!("{event_type} не эмитится ни на один id в modifiers.sol"));
-        assert_eq!(*v as u32, *expected, "{v:?} расходится с {event_type}");
+            .unwrap_or_else(|| panic!("{event_type} is not emitted on any id in modifiers.sol"));
+        assert_eq!(*v as u32, *expected, "{v:?} disagrees with {event_type}");
         checked += 1;
     }
 
-    assert!(checked >= 19, "проверено {checked} вариантов — ALL опустел, гард ослеп");
+    assert!(checked >= 19, "checked {checked} variants — ALL went empty and the guard went blind");
 }
 
-/// Круг `вариант -> Display -> TryFrom -> вариант` по КАЖДОМУ варианту.
+/// The `variant -> Display -> TryFrom -> variant` round trip for EVERY variant.
 ///
-/// Нужен потому, что `TryFrom` матчит по числу с `_ => Err`, а не по варианту:
-/// добавление варианта в enum его не ломает, файл собирается, тесты проходят —
-/// и `try_from` продолжает отвергать новый id. Тогда арм в `Decoded*Event::from_event`
-/// становится НЕДОСТИЖИМЫМ, то есть мёртвой веткой, которую ничто не краснит.
+/// Needed because `TryFrom` matches on the number with `_ => Err`, not on the
+/// variant: adding a variant to the enum does not break it, the file compiles, the
+/// tests pass — and `try_from` keeps rejecting the new id. The arm in
+/// `Decoded*Event::from_event` then becomes UNREACHABLE, i.e. a dead branch
+/// nothing turns red.
 #[test]
 fn every_declared_variant_round_trips_through_try_from() {
     use dodex_contracts::airegistry::inference_order_book_events::InferenceOrderBookEvent as Iob;
@@ -338,14 +339,14 @@ fn every_declared_variant_round_trips_through_try_from() {
         assert_eq!(
             Tc::try_from(v.to_string()).unwrap_or_else(|e| panic!("{v:?}: {e}")),
             *v,
-            "{v:?} объявлен вариантом, но TryFrom его id не знает — арм в from_event недостижим"
+            "{v:?} is a declared variant, but TryFrom does not know its id — the from_event arm is unreachable"
         );
     }
     for v in Iob::ALL {
         assert_eq!(
             Iob::try_from(v.to_string()).unwrap_or_else(|e| panic!("{v:?}: {e}")),
             *v,
-            "{v:?} объявлен вариантом, но TryFrom его id не знает — арм в from_event недостижим"
+            "{v:?} is a declared variant, but TryFrom does not know its id — the from_event arm is unreachable"
         );
     }
 }

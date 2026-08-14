@@ -30,13 +30,14 @@ const ABI_INFERENCE_ORDER_BOOK: &str =
     include_str!("../../../contracts/airegistry/InferenceOrderBook.abi.json");
 const ABI_TOKEN_CONTRACT: &str =
     include_str!("../../../contracts/airegistry/TokenContract.abi.json");
-// Загружается НЕ ради проекции — ни одно его событие в read-модель не идёт. Ради
-// разрешения коллизии: `RootModel.ContractDeployed(address self)` побайтово совпадает
-// с `TokenContract.ContractDeployed`, значит совпадает и body-id. Пока этот ABI не
-// загружен, id уникален, декодер молча отдаёт его TokenContract'у, и деплой
-// root-модели заводит фантомную строку `inference_deals` по её адресу — без единого
-// сигнала оператору: счётчик неоднозначных id не срабатывает, потому что с одним
-// загруженным ABI неоднозначности нет.
+// Loaded NOT for projection — none of its events reaches the read model. It is
+// loaded to resolve a collision: `RootModel.ContractDeployed(address self)` is
+// byte-for-byte identical to `TokenContract.ContractDeployed`, so their body ids
+// are identical too. While this ABI is not loaded the id looks unique, the decoder
+// silently hands it to TokenContract, and deploying the root model creates a
+// phantom `inference_deals` row under its address — with no signal to the operator
+// at all: the ambiguous-id counter does not fire, because with a single loaded ABI
+// there is no ambiguity.
 const ABI_ROOT_MODEL: &str = include_str!("../../../contracts/airegistry/RootModel.abi.json");
 
 const DEX_ABIS: &[(&str, &str)] = &[
@@ -153,7 +154,7 @@ impl Decoder {
             "InferenceOrderBook",
             "InferenceOrderCancelled",
         )?;
-        // `ContractDeployedEmit` = 703 — RootModel; `DealDeployedEmit` = 732 — сделка.
+        // `ContractDeployedEmit` = 703 is RootModel; `DealDeployedEmit` = 732 is the deal.
         Self::add_route(&mut routes, &contracts, 703, "RootModel", "ContractDeployed")?;
         Self::add_route(&mut routes, &contracts, 732, "TokenContract", "ContractDeployed")?;
 
@@ -277,9 +278,9 @@ mod tests {
         }
 
         // 57 DEX unique ids + 9 InferenceOrderBook ids + 15 TokenContract ids
-        // + 1 RootModel id = 82. RootModel объявляет ДВА события, но `ContractDeployed`
-        // побайтово совпадает с TokenContract'ским и делит с ним id — новый id
-        // приносит только `TokenContractRegistered`.
+        // + 1 RootModel id = 82. RootModel declares TWO events, but its
+        // `ContractDeployed` is byte-for-byte identical to TokenContract's and
+        // shares its id — only `TokenContractRegistered` brings a new one.
         // distinct ids. (The InferenceOrderBook events carry an `Inference` prefix, so
         // none collides with the DEX OrderBook events.) The DEX side gained seven
         // PrivateNote events (DealCredited, BookCredited, InferenceOrderRemoved,
@@ -309,11 +310,12 @@ mod tests {
         assert!(pmp_event_ids.iter().any(|(_, n)| n == "ApprovedByOracle"));
     }
 
-    // Арм в `token_contract_projectors.rs` называл событие, которого в ABI нет:
-    // мёртвый код с вечно зелёным тестом. Тест держит удаление на том же основании,
-    // на котором оно сделано, — на ABI, а не на пересказе. Именованная проверка на
-    // ОДНО событие: общий гард «каждое маршрутизируемое событие существует в ABI»
-    // приезжает волной 1 и поглотит этот тест; тогда его надо удалить, а не оставить.
+    // An arm in `token_contract_projectors.rs` named an event the ABI does not
+    // declare: dead code with a forever-green test. This test holds the removal on
+    // the same ground the removal was made on — the ABI, not a retelling of it. It
+    // is a named check for ONE event: the general "every routed event exists in the
+    // ABI" guard arrives with wave 1 and will subsume this test; at that point it
+    // should be deleted rather than kept.
     #[test]
     fn token_contract_abi_does_not_declare_stream_reclaimed() {
         let abi: serde_json::Value = serde_json::from_str(ABI_TOKEN_CONTRACT).unwrap();
@@ -323,28 +325,32 @@ mod tests {
             .iter()
             .filter_map(|e| e["name"].as_str())
             .collect();
-        // Без этой проверки переименование ключа `events` превратило бы тест в
-        // утверждение о пустом списке, верное всегда.
-        assert!(!names.is_empty(), "events array parsed empty — ключ ABI изменился, тест ослеп");
+        // Without this check, renaming the `events` key would turn the test into a
+        // claim about an empty list — true always.
+        assert!(
+            !names.is_empty(),
+            "events array parsed empty — the ABI key changed and the test went blind"
+        );
         assert!(
             !names.contains(&"StreamReclaimed"),
-            "StreamReclaimed вернулся в ABI: арм и проекция close_kind='RECLAIMED' удалены как мёртвые — восстановить их, а не тест"
+            "StreamReclaimed is back in the ABI: the arm and the close_kind='RECLAIMED' projection were removed as dead — restore them, not this test"
         );
     }
 
-    // Сигнатуры RootModel.ContractDeployed и TokenContract.ContractDeployed
-    // ПОБАЙТОВО совпадают — `{"name":"ContractDeployed","inputs":[{"name":"self",
-    // "type":"address"}],"outputs":[]}` в обоих ABI, — значит совпадает и body-id.
-    // Различить их может только `dst`, и проверять это надо на том пути, который
-    // работает в бою: таблицу маршрутов можно прочесть и напрямую, но тогда тест
-    // переживёт и игнорирование `dst` в `decode_event_body`, и маршрут, указывающий
-    // на не то событие того же ABI.
+    // The signatures of RootModel.ContractDeployed and
+    // TokenContract.ContractDeployed are BYTE-FOR-BYTE identical —
+    // `{"name":"ContractDeployed","inputs":[{"name":"self","type":"address"}],
+    // "outputs":[]}` in both ABIs — so their body ids are identical too. Only
+    // `dst` can tell them apart, and that must be checked on the path that runs in
+    // production: the route table could be read directly, but then the test would
+    // survive both `decode_event_body` ignoring `dst` and a route pointing at the
+    // wrong event of the same ABI.
     #[test]
     fn contract_deployed_body_decodes_per_dst_route() {
         use crate::config::event_type_dst;
         let d = Decoder::new().unwrap();
         let zero = "0:0000000000000000000000000000000000000000000000000000000000000000";
-        // Тело одно на оба маршрута — в этом и состоит коллизия.
+        // One body for both routes — that is exactly what the collision is.
         let body = encode_event_body_b64(
             &d,
             "TokenContract",
@@ -352,27 +358,27 @@ mod tests {
             serde_json::json!({ "self": zero }),
         );
 
-        // `ContractDeployedEmit` = 703 (RootModel), `DealDeployedEmit` = 732 (сделка).
+        // `ContractDeployedEmit` = 703 (RootModel), `DealDeployedEmit` = 732 (the deal).
         let by_root =
             d.decode_event_body(&body, Some(&event_type_dst(703))).unwrap().decoded().unwrap();
         assert_eq!(
             by_root.event_type, "RootModel.ContractDeployed",
-            "деплой root-модели обязан перестать заводить строку inference_deals"
+            "a root-model deploy must stop creating an inference_deals row"
         );
 
         let by_deal =
             d.decode_event_body(&body, Some(&event_type_dst(732))).unwrap().decoded().unwrap();
         assert_eq!(by_deal.event_type, "TokenContract.ContractDeployed");
 
-        // Без dst id теперь неоднозначен, и это обязано быть ВИДНО. Молчаливый
-        // резолв в первый ABI — ровно тот дефект, из-за которого фантомные строки
-        // и заводились: счётчик коллизий не срабатывал, потому что коллизии не было.
+        // Without a dst the id is now ambiguous, and that must be VISIBLE. A silent
+        // resolve to the first ABI is exactly the defect that created the phantom
+        // rows: the collision counter never fired, because there was no collision.
         assert!(
             matches!(
                 d.decode_event_body(&body, None).unwrap(),
                 DecodeOutcome::AmbiguousCollision { .. }
             ),
-            "общий id без dst обязан считаться коллизией, а не разрешаться молча"
+            "a shared id with no dst must count as a collision, not resolve silently"
         );
     }
 
@@ -380,8 +386,8 @@ mod tests {
     fn registers_inference_orderbook_and_counts_unique_ids() {
         let decoder = Decoder::new().unwrap();
         assert!(decoder.contracts.contains_key("InferenceOrderBook"), "inference abi missing");
-        // 57 DEX + 9 inference + 15 TokenContract + 1 RootModel = 82 (см. выше:
-        // RootModel.ContractDeployed делит id с TokenContract.ContractDeployed).
+        // 57 DEX + 9 inference + 15 TokenContract + 1 RootModel = 82 (see above:
+        // RootModel.ContractDeployed shares its id with TokenContract.ContractDeployed).
         assert_eq!(decoder.unique_event_ids(), 82, "unexpected unique event-id count");
     }
 
@@ -513,18 +519,20 @@ mod tests {
             let entries =
                 decoder.event_index.get(&event.get_id()).map(Vec::as_slice).unwrap_or(&[]);
             if name == "ContractDeployed" {
-                // Коллизия НАМЕРЕННАЯ: RootModel объявляет событие с той же
-                // сигнатурой, и различает их только dst. Обе стороны обязаны быть
-                // в индексе и обе — иметь маршрут, иначе разрешение сведётся к
-                // порядку загрузки ABI и деплой root-модели заведёт фантомную сделку.
+                // The collision is DELIBERATE: RootModel declares an event with the
+                // same signature, and only dst tells them apart. Both sides must be
+                // in the index and both must have a route, otherwise resolution
+                // comes down to ABI load order and a root-model deploy creates a
+                // phantom deal.
                 assert_eq!(
                     entries.len(),
                     2,
-                    "ContractDeployed обязан коллидировать с RootModel: {entries:?}"
+                    "ContractDeployed must collide with RootModel: {entries:?}"
                 );
                 let kinds: Vec<_> = entries.iter().map(|(k, _)| *k).collect();
                 assert!(kinds.contains(&"TokenContract") && kinds.contains(&"RootModel"));
-                // `routes` приватно, но тест живёт в том же модуле — аксессор не нужен.
+                // `routes` is private, but the test lives in the same module — no
+                // accessor needed.
                 assert!(decoder.routes.contains_key(&crate::config::event_type_dst(732)));
                 assert!(decoder.routes.contains_key(&crate::config::event_type_dst(703)));
                 continue;

@@ -616,9 +616,9 @@ async fn probe_burned_is_terminal_close() {
 
 #[tokio::test]
 async fn a_tick_finalized_with_only_its_own_fields_still_inserts_the_row() {
-    // ГАРД, зелёный сегодня. Ловит превращение снисходительного чтения в строгое:
-    // строгость здесь означала бы, что дрейф ABI останавливает весь сеттлемент,
-    // а не теряет одну колонку.
+    // A GUARD, green today. It catches lenient reading being turned strict:
+    // strictness here would mean ABI drift halting the whole settlement rather
+    // than losing a single column.
     let Some(pool) = setup().await else { return };
     let tc = "0:tc_dto_lenient";
     for table in ["inference_ticks", "inference_deals"] {

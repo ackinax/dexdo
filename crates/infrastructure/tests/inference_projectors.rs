@@ -199,7 +199,7 @@ async fn placement_with_subscription_flag_marks_the_row() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(is_sub, "FLAG_SUBSCRIPTION в `flags` обязан ставить is_subscription");
+    assert!(is_sub, "FLAG_SUBSCRIPTION in `flags` must set is_subscription");
 }
 
 #[tokio::test]
@@ -209,7 +209,7 @@ async fn placement_without_the_flag_is_not_a_subscription() {
     clean(&pool, ob).await;
     let mut tx = pool.begin().await.unwrap();
 
-    // FLAG_AON = 0x20 — установлен, но это не подписка.
+    // FLAG_AON = 0x20 — set, but this is not a subscription.
     let e = ev(
         "InferenceOrderPlaced",
         serde_json::json!({
@@ -227,7 +227,7 @@ async fn placement_without_the_flag_is_not_a_subscription() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(!is_sub, "выставлен другой бит — подпиской это не делает");
+    assert!(!is_sub, "a different bit is set — that does not make it a subscription");
 }
 
 #[tokio::test]
@@ -246,13 +246,13 @@ async fn a_placement_replay_does_not_resurrect_an_expired_order() {
     project(&mut tx, &placed, &node(ob, "a1")).await;
     let expired = ev("InferenceOrderExpired", serde_json::json!({"orderId": "1"}));
     project(&mut tx, &expired, &node(ob, "a2")).await;
-    // Тот же placement приходит повторно (перекрытие страниц захвата).
+    // The same placement arrives again (overlapping capture pages).
     project(&mut tx, &placed, &node(ob, "a1")).await;
     tx.commit().await.unwrap();
 
     let (status, rem) = status_rem(&pool, ob, 1).await;
-    assert_eq!(status, "EXPIRED", "реплей размещения не имеет права открыть истёкший ордер");
-    assert_eq!(rem, "10", "остаток не восстанавливается");
+    assert_eq!(status, "EXPIRED", "a placement replay has no right to re-open an expired order");
+    assert_eq!(rem, "10", "the remainder is not restored");
 }
 
 #[tokio::test]
@@ -291,7 +291,7 @@ async fn a_late_cancel_does_not_demote_an_expired_order() {
     tx.commit().await.unwrap();
 
     let (status, _) = status_rem(&pool, ob, 1).await;
-    assert_eq!(status, "EXPIRED", "истечение уже терминально; отмена его не переписывает");
+    assert_eq!(status, "EXPIRED", "expiry is already terminal; a cancel does not overwrite it");
 }
 
 #[tokio::test]
@@ -312,9 +312,10 @@ async fn a_late_fill_does_not_revive_an_expired_order() {
         &node(ob, "a1"),
     )
     .await;
-    // ВТОРАЯ НОГА ОБЯЗАТЕЛЬНА: `apply_inference_filled` возвращает Deferred, пока
-    // хоть одна названная строка отсутствует. Без неё дефектный код тоже оставил бы
-    // EXPIRED и остаток 10 — тест был бы зелёным, не дойдя до apply_filled_decrement.
+    // THE SECOND LEG IS MANDATORY: `apply_inference_filled` returns Deferred while
+    // any named row is missing. Without it, defective code would also leave EXPIRED
+    // and a remainder of 10 — the test would be green without ever reaching
+    // apply_filled_decrement.
     project(
         &mut tx,
         &ev(
@@ -345,17 +346,17 @@ async fn a_late_fill_does_not_revive_an_expired_order() {
         &node(ob, "co-expfill-4"),
     )
     .await;
-    assert_eq!(outcome, ProjectionOutcome::Applied, "обе ноги на месте — филл обязан примениться");
+    assert_eq!(outcome, ProjectionOutcome::Applied, "both legs are present — the fill must apply");
     tx.commit().await.unwrap();
 
     let (status, rem) = status_rem(&pool, ob, 1).await;
-    assert_eq!(status, "EXPIRED", "истечение терминально и для филла");
-    assert_eq!(rem, "10", "остаток истёкшей строки филл не уменьшает");
+    assert_eq!(status, "EXPIRED", "expiry is terminal for a fill too");
+    assert_eq!(rem, "10", "a fill does not decrement an expired row's remainder");
 }
 
-// `place` (:721) хардкодит `deadline: "0"`, поэтому дедлайновым тестам нужен свой посев.
-// `is_buy` параметром, а не константой: последовательный тест ниже ставит SELL-ногу, и
-// у неё дедлайн обязан быть ненулевым (контракт отвергает GTC-оффер, `:1600`).
+// `place` (:721) hardcodes `deadline: "0"`, so the deadline tests need a seed of their
+// own. `is_buy` is a parameter rather than a constant: the sequential test below places
+// a SELL leg, whose deadline must be non-zero (the contract rejects a GTC offer, `:1600`).
 async fn place_with_deadline(
     pool: &sqlx::PgPool,
     ob: &str,
@@ -388,24 +389,24 @@ fn expired_ev(order_id: &str) -> DecodedEvent {
     )
 }
 
-// ДВА ГАРДА, оба зелёные до правки, и оба обязательны: предикат «закрывать можно»
-// состоит из двух конъюнктов, и каждый нужно прижать своим тестом.
+// TWO GUARDS, both green before the change and both mandatory: the "may be closed"
+// predicate is a conjunction of two clauses, and each needs its own test to pin it.
 //
-// Общий смысл — ОТКАЗ закрывать строку: `_finalizeTaker` (`:1183`, `:1223`) шлёт
-// рефанд тейкеру, чей дедлайн ещё не прошёл, и что с ордером случилось на самом
-// деле, знает `InferenceFilled`, а не рефанд. Остаток IOC/MARKET закрывает phantom
-// sweep, сверяясь с цепью.
+// Their shared meaning is a REFUSAL to close the row: `_finalizeTaker` (`:1183`,
+// `:1223`) sends a refund to a taker whose deadline has not passed, and what actually
+// happened to the order is known to `InferenceFilled`, not to the refund. An
+// IOC/MARKET leftover is closed by the phantom sweep, reconciling against the chain.
 
-// Конъюнкт 1: `deadline is not null`. GTC-бид приходит с нулём, проектор размещения
-// нормализует его в SQL NULL.
+// Clause 1: `deadline is not null`. A GTC bid arrives with zero, and the placement
+// projector normalizes it to SQL NULL.
 #[tokio::test]
 async fn a_filled_orphan_with_no_legs_still_records_the_seller() {
     let Some(pool) = setup().await else { return };
     let ob = "0:seller_direct";
-    // `clean` чистит orders/trades/markets, но НЕ inference_deals, а upsert сделки
-    // сохраняет первый ненулевой seller_note через coalesce. Общий ключ `0:tc`
-    // делил бы строку с другими тестами, и под параллельным nextest результат
-    // зависел бы от порядка. Ключ уникален и убирается за собой.
+    // `clean` purges orders/trades/markets but NOT inference_deals, and the deal
+    // upsert keeps the first non-null seller_note via coalesce. A shared `0:tc` key
+    // would share the row with other tests, making the result order-dependent under
+    // parallel nextest. The key is unique and cleans up after itself.
     let tc = "0:tc_seller_direct";
     clean(&pool, ob).await;
     sqlx::query("delete from inference_deals where token_contract_address = $1")
@@ -415,8 +416,8 @@ async fn a_filled_orphan_with_no_legs_still_records_the_seller() {
         .unwrap();
     let mut tx = pool.begin().await.unwrap();
 
-    // Ни одна нога не спроецирована — ровно случай orphan-repair. Продавец при
-    // этом назван самим событием, значит теряться ему не за что.
+    // Neither leg is projected — exactly the orphan-repair case. The seller is named
+    // by the event itself, so there is nothing for it to be lost to.
     let e = ev(
         "InferenceFilled",
         serde_json::json!({
@@ -437,7 +438,7 @@ async fn a_filled_orphan_with_no_legs_still_records_the_seller() {
     assert_eq!(
         seller.as_deref(),
         Some("0:seller"),
-        "продавец приехал в событии — обход по ноге не нужен"
+        "the seller arrived in the event — no leg walk needed"
     );
     sqlx::query("delete from inference_deals where token_contract_address = $1")
         .bind(tc)
@@ -448,9 +449,9 @@ async fn a_filled_orphan_with_no_legs_still_records_the_seller() {
 
 #[tokio::test]
 async fn expired_orphans_name_all_four_deferrable_types() {
-    // Отложиться без родителя умеют Filled, Cancelled, Expired и Refunded.
-    // Каждый обязан иметь собственный исход: `Nothing` означает «мы не знаем, что
-    // потеряли», и в логе от него нет пользы.
+    // Filled, Cancelled, Expired and Refunded can all defer without a parent. Each
+    // must have an outcome of its own: `Nothing` means "we do not know what was
+    // lost", and it is of no use in a log.
     for (name, value) in [
         ("InferenceOrderExpired", serde_json::json!({"orderId": "9"})),
         ("InferenceRefunded", serde_json::json!({"orderId": "9", "note": "0:b", "amount": "1"})),
@@ -466,20 +467,20 @@ async fn expired_orphans_name_all_four_deferrable_types() {
         assert_ne!(
             outcome,
             ExpiredOrphanOutcome::Nothing,
-            "{name}: сирота этого типа обязан быть назван, а не списан молча"
+            "{name}: an orphan of this type must be named, not written off silently"
         );
     }
 }
 
 #[tokio::test]
 async fn a_uint256_price_arrives_as_decimal_not_hex() {
-    // ГАРД. `clearingPrice` и `price` — uint256, декодер отдаёт их "0x"+64 hex
-    // (`uint256_hex_to_decimal`). Все прочие фикстуры подают десятичное, где
-    // старый и новый код неотличимы, — поэтому здесь hex.
+    // A GUARD. `clearingPrice` and `price` are uint256, and the decoder hands them
+    // over as "0x" + 64 hex (`uint256_hex_to_decimal`). Every other fixture supplies
+    // decimal, where the old and the new code are indistinguishable — hence hex here.
     //
-    // `expect`, а не `else { return }`: этот гард — единственное, что отличает
-    // верный переход на DTO от порчи данных.
-    let pool = setup().await.expect("hex-гард требует Postgres");
+    // `expect` rather than `else { return }`: this guard is the only thing that
+    // tells a correct move to DTOs from data corruption.
+    let pool = setup().await.expect("the hex guard requires Postgres");
     let ob = "0:uint256_hex";
     clean(&pool, ob).await;
     let mut tx = pool.begin().await.unwrap();
@@ -526,7 +527,7 @@ async fn a_uint256_price_arrives_as_decimal_not_hex() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(price, "257", "uint256 обязан доехать десятичным: numeric не примет hex");
+    assert_eq!(price, "257", "a uint256 must arrive as decimal: numeric will not accept hex");
 
     let traded: String =
         sqlx::query_scalar("select price::text from inference_trades where orderbook_address=$1")
@@ -534,13 +535,13 @@ async fn a_uint256_price_arrives_as_decimal_not_hex() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(traded, "257", "цена сделки в ленте обязана быть десятичной");
+    assert_eq!(traded, "257", "the trade price on the tape must be decimal");
 }
 
 #[tokio::test]
 async fn a_fill_without_seller_tc_still_decrements_the_legs() {
-    // ГАРД на снисходительность: строгое поле в DTO превратит дрейф ABI из
-    // «сделка не связалась, есть warn» в «каждый филл отказывает вечно».
+    // A GUARD on leniency: making the DTO field strict would turn ABI drift from
+    // "the deal did not link, and there is a warn" into "every fill fails forever".
     let Some(pool) = setup().await else { return };
     let ob = "0:dto_lenient";
     clean(&pool, ob).await;
@@ -549,7 +550,7 @@ async fn a_fill_without_seller_tc_still_decrements_the_legs() {
     place(&pool, &mut tx, ob, "2", true, "10", "co-lenient-2").await;
     let f = ev(
         "InferenceFilled",
-        // sellerTC и sellerNote отсутствуют — форма payload'а до v4.0.33.
+        // sellerTC and sellerNote are absent — the pre-v4.0.33 payload shape.
         serde_json::json!({"makerId":"1","takerId":"2","ticks":"10","clearingPrice":"1","buyerNote":"0:b"}),
     );
     assert_eq!(project(&mut tx, &f, &node(ob, "co-lenient-3")).await, ProjectionOutcome::Applied);
@@ -573,21 +574,21 @@ async fn a_refund_on_a_gtc_order_leaves_it_open() {
     assert_eq!(
         (status.as_str(), rem.as_str()),
         ("OPEN", "10"),
-        "рефанд по GTC не различает исполненного тейкера и остаток IOC — угадывать нельзя"
+        "a GTC refund cannot tell a filled taker from an IOC leftover — guessing is not allowed"
     );
 }
 
-// Конъюнкт 2: `deadline <= chain_seconds`. БЕЗ ЭТОГО ТЕСТА реализация, проверяющая
-// только `is not null`, проходит весь набор и при этом помечает `EXPIRED` живые
-// ордера с будущим дедлайном. Случай не синтетический, а ровно вся SELL-сторона:
-// оффер обязан нести ненулевой дедлайн (`InferenceOrderBook.sol:1600` отвергает
-// нулевой как malformed), значит taker-only SELL из `:1223` всегда попадает сюда.
+// Clause 2: `deadline <= chain_seconds`. WITHOUT THIS TEST an implementation
+// checking only `is not null` passes the whole set while marking live orders with a
+// future deadline `EXPIRED`. The case is not synthetic but exactly the entire SELL
+// side: an offer must carry a non-zero deadline (`InferenceOrderBook.sol:1600`
+// rejects zero as malformed), so the taker-only SELL from `:1223` always lands here.
 #[tokio::test]
 async fn a_refund_before_a_future_deadline_leaves_the_order_open() {
     let Some(pool) = setup().await else { return };
     let ob = "0:ref_future";
     clean(&pool, ob).await;
-    // node() ставит created_at = 1_700_000_000; дедлайн заведомо позже.
+    // node() sets created_at = 1_700_000_000; the deadline is deliberately later.
     place_with_deadline(&pool, ob, "1", false, "1700009999", "a1").await;
 
     let mut tx = pool.begin().await.unwrap();
@@ -598,7 +599,7 @@ async fn a_refund_before_a_future_deadline_leaves_the_order_open() {
     assert_eq!(
         (status.as_str(), rem.as_str()),
         ("OPEN", "10"),
-        "ордер с ненаступившим дедлайном живой: закрыть его по рефанду — выдумать истечение"
+        "an order whose deadline has not passed is alive: closing it on a refund would invent an expiry"
     );
 }
 
@@ -607,7 +608,7 @@ async fn a_refund_past_the_deadline_expires_the_order() {
     let Some(pool) = setup().await else { return };
     let ob = "0:ref_exp";
     clean(&pool, ob).await;
-    // node() ставит created_at = 1_700_000_000; дедлайн на секунду раньше.
+    // node() sets created_at = 1_700_000_000; the deadline is one second earlier.
     place_with_deadline(&pool, ob, "1", true, "1699999999", "a1").await;
 
     let mut tx = pool.begin().await.unwrap();
@@ -617,13 +618,14 @@ async fn a_refund_past_the_deadline_expires_the_order() {
     let (status, _) = status_rem(&pool, ob, 1).await;
     assert_eq!(
         status, "EXPIRED",
-        "continuation, истёкший до возобновления, эмитит только рефанд — статус выводится из дедлайна"
+        "a continuation expired before resuming emits only a refund — the status is derived from the deadline"
     );
 }
 
-// ГАРД, а не red-first тест: сегодня `InferenceRefunded` уходит в observability-арм
-// и строку не трогает, поэтому проверка зелёная и до правки. Она существует, чтобы
-// НОВЫЙ проектор не начал трогать терминальную строку — включая `updated_at`.
+// A GUARD, not a red-first test: today `InferenceRefunded` goes to the observability
+// arm and does not touch the row, so the check is green before the change too. It
+// exists so that a NEW projector does not start touching a terminal row — including
+// its `updated_at`.
 #[tokio::test]
 async fn a_refund_over_a_filled_row_changes_nothing_at_all() {
     let Some(pool) = setup().await else { return };
@@ -649,7 +651,7 @@ async fn a_refund_over_a_filled_row_changes_nothing_at_all() {
     let (status, _) = status_rem(&pool, ob, 1).await;
     assert_eq!(
         status, "FILLED",
-        "рефанд обслуживает и удаление dust — исполненную строку он не трогает"
+        "a refund also serves dust removal — it does not touch a filled row"
     );
     let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "select updated_at from inference_orders where orderbook_address=$1 and order_id=1",
@@ -658,7 +660,7 @@ async fn a_refund_over_a_filled_row_changes_nothing_at_all() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(after, before, "no-op обязан быть полным: даже updated_at не двигается");
+    assert_eq!(after, before, "the no-op must be complete: even updated_at does not move");
 }
 
 #[tokio::test]
@@ -674,44 +676,44 @@ async fn a_refund_without_its_parent_defers() {
     tx.commit().await.unwrap();
 }
 
-// ГАРД, зелёный и до правки — и ЕДИНСТВЕННЫЙ тест, который краснеет, если кто-нибудь
-// вернёт проектору ветку `CANCELLED` для непрошедшего дедлайна. Это ровно тот сценарий,
-// из-за которого её здесь нет; расширение существующего
-// `filled_defers_zero_writes_when_one_side_absent_then_applies_once` вставкой
-// рефанда между `Deferred` и повтором.
+// A GUARD, green before the change too — and the ONLY test that turns red if someone
+// gives the projector a `CANCELLED` branch for a deadline that has not passed. That is
+// exactly the scenario it is absent for; this is an extension of the existing
+// `filled_defers_zero_writes_when_one_side_absent_then_applies_once` with a refund
+// inserted between the `Deferred` and the retry.
 //
-// На цепи полностью исполненный тейкер-BUY даёт `Placed(2)` -> `Filled(1,2)` ->
-// `Refunded(2, leftover)` (`:1183`; событие уходит даже при `leftover == 0`). Мейкерская
-// нога потеряна на capture, поэтому fill откладывается, а дренаж идёт дальше
-// (`indexer_repo.rs:522` строку не помечает и берёт следующую) — рефанд применяется
-// РАНЬШЕ своего же fill'а.
+// On chain a fully filled taker BUY produces `Placed(2)` -> `Filled(1,2)` ->
+// `Refunded(2, leftover)` (`:1183`; the event goes out even with `leftover == 0`). The
+// maker leg was lost at capture, so the fill defers and the drain moves on
+// (`indexer_repo.rs:522` leaves the row unmarked and takes the next one) — the refund
+// is applied BEFORE its own fill.
 #[tokio::test]
 async fn a_refund_between_a_deferred_fill_and_its_retry_does_not_steal_the_terminal_status() {
     let Some(pool) = setup().await else { return };
     let ob = "0:ref_seq";
     clean(&pool, ob).await;
-    // Тейкер (id 2) спроецирован; мейкерская SELL-нога (id 1) — ещё нет.
+    // The taker (id 2) is projected; the maker SELL leg (id 1) is not yet.
     place_with_deadline(&pool, ob, "2", true, "0", "a1").await;
     let f = ev(
         "InferenceFilled",
-        // sellerTC уникален по репозиторию: clean() не чистит inference_deals (PK — адрес TC).
+        // sellerTC is repo-unique: clean() does not purge inference_deals (its PK is the TC address).
         serde_json::json!({"makerId":"1","takerId":"2","ticks":"10","clearingPrice":"5",
                            "sellerTC":"0:tc_refseq","buyerNote":"0:b","sellerNote":"0:s"}),
     );
 
-    // 1. Fill откладывается — нулевые записи.
+    // 1. The fill defers — zero writes.
     let mut tx = pool.begin().await.unwrap();
     assert_eq!(project(&mut tx, &f, &node(ob, "co-refseq-9")).await, ProjectionOutcome::Deferred);
     tx.commit().await.unwrap();
 
-    // 2. Рефанд тейкера дренируется следующим и обязан ничего не решить.
+    // 2. The taker's refund drains next and must decide nothing.
     let mut tx = pool.begin().await.unwrap();
     assert_eq!(project(&mut tx, &refunded("2"), &node(ob, "a3")).await, ProjectionOutcome::Applied);
     tx.commit().await.unwrap();
     let (status, _) = status_rem(&pool, ob, 2).await;
-    assert_eq!(status, "OPEN", "рефанд закрыл строку, у которой висит неприменённый fill");
+    assert_eq!(status, "OPEN", "the refund closed a row with an unapplied fill still pending");
 
-    // 3. Мейкерская нога приезжает, fill повторяется.
+    // 3. The maker leg arrives and the fill is retried.
     place_with_deadline(&pool, ob, "1", false, "1700009999", "a4").await;
     let mut tx = pool.begin().await.unwrap();
     assert_eq!(project(&mut tx, &f, &node(ob, "co-refseq-9")).await, ProjectionOutcome::Applied);
@@ -720,17 +722,17 @@ async fn a_refund_between_a_deferred_fill_and_its_retry_does_not_steal_the_termi
     assert_eq!(
         status_rem(&pool, ob, 2).await,
         ("FILLED".into(), "0".into()),
-        "исполненный тейкер обязан прийти в FILLED: рефанд лишь вернул неистраченный escrow"
+        "a filled taker must end up FILLED: the refund only returned the unspent escrow"
     );
 }
 
-// ГАРД на ПРЯМОЙ порядок — тот, что бывает на цепи. `_removeExpiredBid`
-// (`InferenceOrderBook.sol:1143-1146`) зовёт `_refundAndRemove` и лишь ПОТОМ эмитит
-// `InferenceOrderExpired`, то есть по `chain_order` рефанд всегда первый.
+// A GUARD on the FORWARD order — the one that happens on chain. `_removeExpiredBid`
+// (`InferenceOrderBook.sol:1143-1146`) calls `_refundAndRemove` and only THEN emits
+// `InferenceOrderExpired`, so by `chain_order` the refund always comes first.
 //
-// Зубы у теста конкретные: закрой рефанд строку любым статусом, кроме `EXPIRED`
-// (например `CANCELLED`, как в первой редакции этой задачи), — и пришедшее следом
-// истечение уже ничего не поправит.
+// The test has specific teeth: let the refund close the row under any status other
+// than `EXPIRED` (say `CANCELLED`, as in this task's first draft), and the expiry
+// arriving next will no longer fix anything.
 #[tokio::test]
 async fn a_refund_before_its_expiry_event_leaves_expired_standing() {
     let Some(pool) = setup().await else { return };
@@ -756,14 +758,15 @@ async fn a_refund_before_its_expiry_event_leaves_expired_standing() {
     assert_eq!(
         (status.as_str(), swept_null),
         ("EXPIRED", true),
-        "рефанд обязан закрыть просроченную строку ИМЕННО в EXPIRED — иначе истечение её не подберёт"
+        "a refund must close a past-deadline row into EXPIRED SPECIFICALLY — otherwise the expiry will not pick it up"
     );
 }
 
-// ГАРД на ОБРАТНЫЙ порядок: реплей и перестановка внутри батча. Здесь `updated_at`
-// проверяется намеренно и не для красоты — статус-ассерт тут беззубый: строка уже
-// `EXPIRED`, и предикат вида «не FILLED и не настоящая отмена» перезаписал бы её в
-// тот же `EXPIRED`, оставив ассерт зелёным. Ловит подмену только полный no-op.
+// A GUARD on the REVERSE order: a replay and a reordering within a batch. `updated_at`
+// is checked here deliberately and not for decoration — the status assert is toothless
+// on its own: the row is already `EXPIRED`, and a predicate like "not FILLED and not a
+// real cancel" would rewrite it into the same `EXPIRED`, leaving the assert green. Only
+// a complete no-op catches the substitution.
 #[tokio::test]
 async fn a_refund_after_its_expiry_event_changes_nothing_at_all() {
     let Some(pool) = setup().await else { return };
@@ -799,7 +802,7 @@ async fn a_refund_after_its_expiry_event_changes_nothing_at_all() {
     assert_eq!(status, "EXPIRED");
     assert_eq!(
         after, before,
-        "`EXPIRED` обязан быть вне предиката рефанда: строка не тронута вовсе"
+        "`EXPIRED` must be outside the refund predicate: the row is not touched at all"
     );
 }
 
@@ -970,10 +973,10 @@ async fn observability_event_seeds_market_only() {
         .await
         .unwrap();
     let mut tx = pool.begin().await.unwrap();
-    // Раньше здесь стоял `InferenceRefunded` БЕЗ `orderId` — событие, которого не
-    // бывает. Теперь у рефанда есть свой проектор со строгим разбором id, и такой
-    // payload уронил бы `project`. Смысл теста (любое inference-событие сеет скелет
-    // рынка) держит любой из оставшихся observability-типов.
+    // This used to be an `InferenceRefunded` WITHOUT an `orderId` — an event that does
+    // not exist. The refund now has a projector of its own with strict id parsing, and
+    // such a payload would make `project` fail. The test's point (any inference event
+    // seeds the market skeleton) holds for any of the remaining observability types.
     let r =
         ev("InferenceExecuted", serde_json::json!({"ticks":"1","clearingPrice":"1","cost":"1"}));
     assert_eq!(project(&mut tx, &r, &node(ob, "co-1")).await, ProjectionOutcome::Applied);
@@ -1188,11 +1191,11 @@ async fn expired_orphans_dropped_all_four_types_using_ingest_age_not_chain_time(
     let refunded = serde_json::json!({"orderId":"904","note":"0:b","amount":"1"});
     // (a)-(b'') aged-ingest orphans of ALL FOUR deferrable types => dropped.
     //
-    // ЭТО ЗЕЛЁНЫЙ ГАРД, а не red-first тест. Гейт `is_expired_inference_orphan`
-    // пропускает любой `InferenceOrderBook.*`, а оба пути дренажа матчат `Ok(_)`,
-    // то есть помечают строку processed даже при исходе `Nothing`. Значит новые
-    // типы дренируются и без арм'ов. Ценность в другом: тест покраснеет, если гейт
-    // когда-нибудь сузят обратно до Filled/Cancelled — строки станут pending навсегда.
+    // THIS IS A GREEN GUARD, not a red-first test. The `is_expired_inference_orphan`
+    // gate admits any `InferenceOrderBook.*`, and both drain paths match `Ok(_)`, i.e.
+    // they mark the row processed even on a `Nothing` outcome. So new types drain even
+    // without arms. The value lies elsewhere: the test turns red if the gate is ever
+    // narrowed back to Filled/Cancelled — the rows would then be pending forever.
     insert_raw(
         &pool,
         "orphan-fill",
@@ -1287,11 +1290,11 @@ async fn expired_orphans_dropped_all_four_types_using_ingest_age_not_chain_time(
     );
     assert!(
         raw_processed(&pool, "orphan-expired").await,
-        "aged OrderExpired orphan must be dropped — сужение гейта оставило бы строку pending навсегда"
+        "aged OrderExpired orphan must be dropped — narrowing the gate would leave the row pending forever"
     );
     assert!(
         raw_processed(&pool, "orphan-refund").await,
-        "aged Refunded orphan must be dropped — сужение гейта оставило бы строку pending навсегда"
+        "aged Refunded orphan must be dropped — narrowing the gate would leave the row pending forever"
     );
     assert!(!raw_processed(&pool, "orphan-oldchain").await,
         "old created_at_chain but fresh ingest => NOT dropped (proves raw_events.created_at, not chain time)");
@@ -1453,19 +1456,19 @@ async fn expired_filled_orphan_decrements_present_leg() {
 
 #[tokio::test]
 async fn a_range_event_orphan_dead_letters_like_the_books_own() {
-    // `OracleEventList.RangeEventAdded` откладывается, пока нет родительского
-    // `oracle_events`. Родители эмитятся oracle-списком, который мог быть
-    // развёрнут ДО старта курсора захвата этого развёртывания — тогда они лежат
-    // вне захваченной истории и не придут никогда. Сам RangeEventAdded строку не
-    // создаёт, он аннотирует чужую, так что ждать нечего. Без финального исхода
-    // строка pending навсегда и держит backlog наблюдателя выше нуля.
+    // `OracleEventList.RangeEventAdded` defers while its parent `oracle_events` row
+    // is missing. Parents are emitted by the oracle list, which may have been deployed
+    // BEFORE this deployment's capture cursor started — in which case they lie outside
+    // the captured history and never arrive. RangeEventAdded creates no row of its own,
+    // it annotates someone else's, so there is nothing to wait for. Without a final
+    // outcome the row stays pending forever and holds the observer's backlog above zero.
     let Some(pool) = setup().await else { return };
     let oel = "0:t_range_orphan_list";
     sqlx::query("delete from raw_events where chain_order like '00rgoph-%'")
         .execute(&pool)
         .await
         .unwrap();
-    // Возраст приёма 3600 с — заведомо больше отсечки в 60 с.
+    // An ingest age of 3600 s — deliberately beyond the 60 s cutoff.
     insert_raw(
         &pool,
         "rgoph-range",
@@ -1487,11 +1490,11 @@ async fn a_range_event_orphan_dead_letters_like_the_books_own() {
         .await
         .unwrap();
 
-    assert_eq!(stats.applied, 1, "dead-letter засчитывается как applied, как и у книги");
+    assert_eq!(stats.applied, 1, "a dead letter counts as applied, same as on the book side");
     assert!(
         raw_processed(&pool, "rgoph-range").await,
-        "RangeEventAdded старше отсечки обязан получить финальный исход: \
-         иначе он pending навсегда и роняет наблюдателя"
+        "a RangeEventAdded past the cutoff must reach a final outcome: \
+         otherwise it is pending forever and fails the observer"
     );
 
     sqlx::query("delete from raw_events where chain_order like '00rgoph-%'")
@@ -1502,17 +1505,17 @@ async fn a_range_event_orphan_dead_letters_like_the_books_own() {
 
 #[tokio::test]
 async fn a_prediction_orphan_is_never_dead_lettered_however_old() {
-    // ГАРД ОБРАТНОЙ СТОРОНЫ. Без него положительный тест выше не отличает
-    // allow-list от снятого префиксного условия — а снятие было бы регрессом:
-    // `projectors.rs` откладывает в четырнадцати местах, и почти все ждут того,
-    // что законно приходит позже (`PMPDeployed` ждёт строку в `ref_tokens`,
-    // `TimingsSet`/`Resolved` ждут свой `PMPDeployed`). При проде-отсечке в 30
-    // минут их dead-letter убивает рынок молча и навсегда: строка помечается
-    // processed и не переспрашивается (IX-FAIL-06).
+    // THE REVERSE-SIDE GUARD. Without it the positive test above cannot tell an
+    // allow-list from a dropped prefix condition — and dropping it would be a
+    // regression: `projectors.rs` defers in fourteen places, and nearly all of them
+    // wait for something that legitimately arrives later (`PMPDeployed` waits for a
+    // `ref_tokens` row; `TimingsSet`/`Resolved` wait for their `PMPDeployed`). Under
+    // the production 30-minute cutoff, dead-lettering them kills a market silently and
+    // forever: the row is marked processed and never retried (IX-FAIL-06).
     //
-    // `OracleEventList.EventAdded` взят намеренно: тот же контракт, что у
-    // разрешённого `RangeEventAdded`. Тест поэтому проверяет список по ПОЛНОМУ
-    // имени, а не по префиксу контракта.
+    // `OracleEventList.EventAdded` is chosen deliberately: the same contract as the
+    // allowed `RangeEventAdded`. The test therefore checks the list by FULL name, not
+    // by contract prefix.
     let Some(pool) = setup().await else { return };
     let oel = "0:t_pred_orphan_list";
     sqlx::query("delete from raw_events where chain_order like '00prdph-%'")
@@ -1542,13 +1545,13 @@ async fn a_prediction_orphan_is_never_dead_lettered_however_old() {
         .await
         .unwrap();
 
-    // `deferred`, а не просто «строка ещё pending»: ошибка разбора payload'а
-    // тоже оставила бы строку pending, и тест зеленел бы по неверной причине.
-    assert_eq!(stats.deferred, 1, "строка обязана быть именно ОТЛОЖЕНА, а не упасть с Err");
+    // `deferred` rather than merely "the row is still pending": a payload parse error
+    // would also leave it pending, and the test would go green for the wrong reason.
+    assert_eq!(stats.deferred, 1, "the row must be DEFERRED specifically, not fail with an Err");
     assert!(
         !raw_processed(&pool, "prdph-added").await,
-        "не-разрешённый тип обязан остаться отложенным независимо от возраста: \
-         его родитель приходит законно позже, и dead-letter убил бы рынок молча"
+        "a non-allow-listed type must stay deferred regardless of age: its parent \
+         legitimately arrives later, and a dead letter would kill the market silently"
     );
 
     sqlx::query("delete from raw_events where chain_order like '00prdph-%'")
@@ -1906,8 +1909,8 @@ async fn orphan_repair_filled_no_leg_still_links() {
         "InferenceFilled",
         serde_json::json!({
         "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer",
-        // ZERO намеренно: тест про ФОЛБЭК — продавец обязан остаться невосстановимым,
-        // когда SELL-нога не спроецирована, а событие его не назвало.
+        // ZERO deliberately: this test is about the FALLBACK — the seller must stay
+        // unrecoverable when the SELL leg is not projected and the event did not name him.
         "sellerNote":ZERO_ADDRESS}),
     );
     repair_expired_inference_orphan(&mut tx, &filled, &node(ob, "co-1")).await.unwrap();
@@ -1976,8 +1979,8 @@ async fn orphan_repair_filled_taker_only_resolves_from_taker_side() {
         "InferenceFilled",
         serde_json::json!({
         "makerId":"1","takerId":"2","ticks":"10","clearingPrice":"100","sellerTC":tc,"buyerNote":"0:buyer",
-        // ZERO намеренно: тест упражняет разрешение НАПРАВЛЕНИЯ по присутствующей ноге,
-        // а не связку продавца — событие его не называет.
+        // ZERO deliberately: this test exercises resolving the DIRECTION from the leg
+        // that is present, not the seller link — the event does not name him.
         "sellerNote":ZERO_ADDRESS}),
     );
     // Applied via the orphan path mints a global-PK inference_trades row — chain order
@@ -2027,9 +2030,10 @@ async fn project_placed(
     tx.commit().await.unwrap();
 }
 
-// Подписка приезжает обычным `InferenceOrderPlaced` с битом FLAG_SUBSCRIPTION (0x40):
-// отдельного события в ABI книги нет. Предпосылка вызывающего теста — «строка рождается
-// без дедлайна» — сохраняется: подписочный бид кладут с нулевым дедлайном и без TC.
+// A subscription arrives as an ordinary `InferenceOrderPlaced` with the
+// FLAG_SUBSCRIPTION bit (0x40): the book's ABI has no separate event for it. The
+// caller's premise — "the row is born without a deadline" — still holds: a subscription
+// bid is placed with a zero deadline and no TC.
 async fn project_subscription(pool: &PgPool, ob: &str, id: i64, price: &str, ticks: &str) {
     let e = ev(
         "InferenceOrderPlaced",

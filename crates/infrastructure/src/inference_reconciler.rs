@@ -244,8 +244,8 @@ impl InferenceReconciler {
                     stats.failed += 1;
                     self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
                     warn!(ob = %book.orderbook_address, ?err, "discovery failed");
-                    // `{err:#}` — вся цепочка `anyhow`, а не только верхний слой:
-                    // колонка заводится ровно чтобы отличать причины.
+                    // `{err:#}` is the whole `anyhow` chain, not just the top layer:
+                    // the column exists precisely to tell causes apart.
                     self.stamp_failure_logged(&book.orderbook_address, &format!("{err:#}")).await;
                 }
             }

@@ -1,8 +1,8 @@
 // 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 //
-// Совместимость схемы с запросом dodex-points-rewards. Потребитель живёт в другом
-// репозитории и его тесты гоняются отдельно, поэтому изменение колонок здесь
-// ломает его молча — этот тест переводит поломку в красный на нашей стороне.
+// Schema compatibility with the dodex-points-rewards query. The consumer lives in
+// another repository and its tests run separately, so changing columns here breaks
+// it silently — this test turns that breakage red on our side.
 
 use std::env;
 use std::time::Duration;
@@ -11,11 +11,11 @@ use dodex_infrastructure::database;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
-/// Дословно `resolve_deal` из
+/// Verbatim `resolve_deal` from
 /// dodex-points-rewards/crates/infrastructure/src/indexer_reader.rs:52-57.
-/// Пять выражений — ровно то, что потребитель читает. Ни `finalized_ticks`,
-/// ни `close_kind` он не запрашивает, и требовать их здесь значило бы
-/// придумывать обязательство, которого никто не брал.
+/// These five expressions are exactly what the consumer reads. It asks for
+/// neither `finalized_ticks` nor `close_kind`, and requiring them here would be
+/// inventing an obligation nobody took on.
 const REWARDS_RESOLVE_DEAL: &str =
     "select orderbook_address, seller_note, buyer_note, clean_settlement, \
      (settled_at_chain is not null) as settled \
@@ -49,9 +49,9 @@ async fn the_rewards_resolve_deal_query_still_decodes() {
         .execute(&pool)
         .await
         .unwrap();
-    // Строка обязательна: на пустой выборке `query_as` НИЧЕГО не декодирует, и
-    // несовместимость типа колонки прошла бы незамеченной — проверялось бы лишь
-    // наличие имён.
+    // The row is mandatory: on an empty result set `query_as` decodes NOTHING, so a
+    // column-type incompatibility would pass unnoticed — only the names would be
+    // checked.
     sqlx::query(
         "insert into inference_deals \
          (token_contract_address, orderbook_address, seller_note, buyer_note, clean_settlement, settled_at_chain) \
@@ -67,13 +67,13 @@ async fn the_rewards_resolve_deal_query_still_decodes() {
             .bind(tc)
             .fetch_one(&pool)
             .await
-            .expect("запрос rewards обязан оставаться валидным против схемы dexdo");
+            .expect("the rewards query must stay valid against the dexdo schema");
 
     assert_eq!(row.0.as_deref(), Some("0:ob"));
     assert_eq!(row.1.as_deref(), Some("0:seller"));
     assert_eq!(row.2.as_deref(), Some("0:buyer"));
     assert_eq!(row.3, Some(true));
-    assert!(row.4, "settled выводится из settled_at_chain");
+    assert!(row.4, "settled is derived from settled_at_chain");
 
     sqlx::query("delete from inference_deals where token_contract_address = $1")
         .bind(tc)

@@ -36,11 +36,11 @@ pub async fn project_token_contract_event(
 
     let suffix =
         event.event_type.strip_prefix("TokenContract.").unwrap_or(event.event_type.as_str());
-    // Маршрут по ВАРИАНТУ enum'а, а не по строковому литералу: вариант пинится к
-    // ABI (`token_contract_enum_covers_every_abi_event`), поэтому арм, называющий
-    // несуществующее событие, перестаёт быть выразимым — так прожил мёртвым
-    // `StreamReclaimed`. `match` исчерпывающий БЕЗ `_`: новый вариант не соберётся,
-    // пока ему не назначат исход.
+    // Route by the enum VARIANT, not by a string literal: the variant is pinned to
+    // the ABI (`token_contract_enum_covers_every_abi_event`), so an arm naming an
+    // event that does not exist stops being expressible — that is how
+    // `StreamReclaimed` lived on as a dead arm. The `match` is exhaustive WITHOUT
+    // `_`: a new variant will not compile until someone assigns it an outcome.
     use TokenContractEvent as E;
     let Some(kind) = E::ALL.iter().copied().find(|v| format!("{v:?}") == suffix) else {
         return Ok(ProjectionOutcome::Unknown);
@@ -93,9 +93,9 @@ async fn apply_stream_funded(
     node: &EventNode,
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("StreamFunded: src missing")?;
-    // Исчерпывающая деструктуризация: каждое поле ABI обязано быть названо.
+    // Exhaustive destructuring: every ABI field must be named.
     let StreamFundedData { buyer, deposit } = serde_json::from_value(event.value.clone())
-        .context("StreamFunded: payload не разбирается по ABI")?;
+        .context("StreamFunded: payload does not parse against the ABI")?;
     let buyer = buyer.as_str();
     let deposit = deposit.to_string();
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
@@ -124,7 +124,7 @@ async fn apply_stream_opened(
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("StreamOpened: src missing")?;
     let StreamOpenedData { buyer, price_per_tick } = serde_json::from_value(event.value.clone())
-        .context("StreamOpened: payload не разбирается по ABI")?;
+        .context("StreamOpened: payload does not parse against the ABI")?;
     let buyer = buyer.as_str();
     let ppt = price_per_tick.to_string();
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
@@ -162,7 +162,7 @@ async fn apply_ticks_claimed(
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("TicksClaimed: src missing")?;
     let TicksClaimedData { trusted, claimed } = serde_json::from_value(event.value.clone())
-        .context("TicksClaimed: payload не разбирается по ABI")?;
+        .context("TicksClaimed: payload does not parse against the ABI")?;
     let trusted = trusted.to_string();
     let claimed = claimed.to_string();
     let chain_order = node_chain_order(node, "TicksClaimed")?;
@@ -193,7 +193,7 @@ async fn apply_tick_finalized(
 ) -> anyhow::Result<ProjectionOutcome> {
     let tc = node.src.as_deref().context("TickFinalized: src missing")?;
     let TickFinalizedData { finalized_owed, deposit } = serde_json::from_value(event.value.clone())
-        .context("TickFinalized: payload не разбирается по ABI")?;
+        .context("TickFinalized: payload does not parse against the ABI")?;
     let finalized_owed = finalized_owed.to_string();
     let deposit = deposit.to_string();
     let chain_order = node_chain_order(node, "TickFinalized")?;

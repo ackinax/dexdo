@@ -196,12 +196,13 @@ steps:
       - mkdir -p ~/.ssh
       - echo "$SSH_NET_KEY" | tr '@' '\n' > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
       - cp -ar ~/.ssh ./.ssh
-      # Начало прогона, для окна наблюдателя (шаг `observer`). Этот шаг выбран
-      # потому, что он единственный без `depends_on` — то есть гарантированно
-      # предшествует всему, что трогает хост. Окружение между шагами Woodpecker
-      # не переносит, поэтому метка едет файлом. Наблюдателю уходит не она сама, а
-      # ПРОШЕДШЕЕ время: хост восстановит начало по своим часам, и расхождение
-      # часов раннера и стенда в окно не попадёт.
+      # The run's start, for the observer's window (the `observer` step). This step is
+      # chosen because it is the only one without `depends_on` — i.e. it is guaranteed
+      # to precede everything that touches the host. Woodpecker does not carry the
+      # environment between steps, so the mark travels as a file. What goes to the
+      # observer is not the mark itself but the ELAPSED time: the host reconstructs the
+      # start against its own clock, keeping any runner/stand clock skew out of the
+      # window.
       - date +%s > ./.e2e_started_at
 
   prepare_host:
@@ -1180,15 +1181,16 @@ steps:
         docker compose -f docker/dexdo-e2e.compose.yaml logs --tail=100 block_manager 2>/dev/null;
         true"
 
-  # Наблюдатель. Трафика не создаёт — проверяет, что оставили сценарии, поэтому
-  # идёт последним. `status: [success, failure]` не про снисходительность: прогон,
-  # в котором сценарий упал, тем более нуждается в диагнозе, а без клаузы один
-  # упавший сценарий пропустил бы этот шаг целиком.
+  # The observer. It creates no traffic — it checks what the scenarios left behind,
+  # so it runs last. `status: [success, failure]` is not about leniency: a run in which
+  # a scenario failed needs the diagnosis all the more, and without the clause a single
+  # failed scenario would skip this step entirely.
   #
-  # `depends_on` здесь — тот же список, что у `dump_logs`, то есть все сценарные
-  # шаги; и `net_down` ниже ждёт ЭТОТ шаг. Без второй половины правка была бы не
-  # просто бесполезной, а опасной: порядок задаёт только `depends_on`, так что
-  # Woodpecker снёс бы стенд и отпустил лиз параллельно с чтением его базы.
+  # `depends_on` here is the same list as `dump_logs`, i.e. every scenario step; and
+  # `net_down` below waits for THIS step. Without the second half the change would be
+  # not merely useless but dangerous: order is set only by `depends_on`, so Woodpecker
+  # would tear down the stand and release the lease in parallel with reading its
+  # database.
   observer:
     when:
       - status: [ success, failure ]

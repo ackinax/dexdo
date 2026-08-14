@@ -422,29 +422,29 @@ mod tests {
 
     #[test]
     fn a_self_rooted_settlement_edge_survives_the_dapp_filter() {
-        // TokenContract разворачивается внешним сообщением, поэтому его
-        // `src_dapp_id` равен его же адресу и НИКОГДА не совпадёт с настроенным
-        // dapp_id. Строгое сравнение выбрасывает весь сеттлемент до raw_events —
-        // вне границы восстановления: реплей его не вернёт.
+        // A TokenContract is deployed by an external message, so its `src_dapp_id`
+        // equals its own address and will NEVER match the configured dapp_id. A strict
+        // comparison throws away the whole settlement path before raw_events — outside
+        // the recovery boundary: no replay brings it back.
         let edge = edge_with_all(Some("0:deadbeef"), Some("0:deadbeef"), None);
-        assert!(edge_in_scope(&edge, "0:our_dapp"), "self-rooted edge обязан оставаться в скоупе");
+        assert!(edge_in_scope(&edge, "0:our_dapp"), "a self-rooted edge must stay in scope");
     }
 
     #[test]
     fn a_foreign_non_self_rooted_edge_is_still_dropped() {
         let edge = edge_with_all(Some("0:their_contract"), Some("0:someone_else"), None);
-        assert!(!edge_in_scope(&edge, "0:our_dapp"), "чужой edge обязан отбрасываться");
+        assert!(!edge_in_scope(&edge, "0:our_dapp"), "a foreign edge must be dropped");
     }
 
     #[test]
     fn a_foreign_self_rooted_edge_is_admitted_and_that_is_the_trade() {
-        // ЭТО ЦЕНА ПОСЛАБЛЕНИЯ, и тест существует, чтобы она была записана, а не
-        // обнаружена потом. `src_dapp_id == src` не отличает наш self-rooted
-        // контракт от чужого: признак — способ развёртывания, а не принадлежность.
-        // Такой edge дойдёт до `raw_events` и будет отброшен уже декодером (его
-        // событий нет ни в одном загруженном ABI) — то есть ценой лишней строки,
-        // а не неверной read-модели. Обратный размен — потеря всего сеттлемента —
-        // хуже на порядок.
+        // THIS IS THE PRICE OF THE RELAXATION, and the test exists so it is recorded
+        // rather than discovered later. `src_dapp_id == src` does not distinguish our
+        // self-rooted contract from a foreign one: the trait is how it was deployed,
+        // not who owns it. Such an edge reaches `raw_events` and is then dropped by the
+        // decoder (none of its events are in any loaded ABI) — the cost is a stored
+        // row, not a wrong read model. The opposite trade — losing all of settlement —
+        // is an order of magnitude worse.
         let edge =
             edge_with_all(Some("0:foreign_self_rooted"), Some("0:foreign_self_rooted"), None);
         assert!(edge_in_scope(&edge, "0:our_dapp"));

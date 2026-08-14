@@ -1788,9 +1788,10 @@ async fn sweep_still_cancels_phantoms_and_partially_filled_buy_takers() {
 
 #[tokio::test]
 async fn a_reconcile_failure_records_its_reason() {
-    // Наблюдатель — DB-tail шаг и логов не читает. Если причина живёт только в
-    // логах, «failing с причиной» (IX-SEQ-10) проверяемо лишь как «стоит отметка»,
-    // то есть строка матрицы закрывается ослабленной версией молча.
+    // The observer is a DB-tail step and does not read logs. If the reason lives
+    // only in the logs, "failing with a reason" (IX-SEQ-10) is checkable only as
+    // "a stamp is present" — i.e. the matrix row would be closed by a weakened
+    // version of itself, silently.
     let Some(pool) = setup().await else { return };
     let ob = "0:reconcile_err";
     seed_market(&pool, ob, false).await;
@@ -1806,10 +1807,10 @@ async fn a_reconcile_failure_records_its_reason() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(failed_at.is_some(), "отметка времени отказа обязана стоять");
+    assert!(failed_at.is_some(), "the failure timestamp must be stamped");
     assert_eq!(
         err.as_deref(),
         Some("getModelName reverted: exit code 78"),
-        "причина обязана лежать рядом с отметкой, а не только в логах"
+        "the reason must sit next to the stamp, not only in the logs"
     );
 }

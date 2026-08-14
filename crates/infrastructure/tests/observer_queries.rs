@@ -1,9 +1,9 @@
 // 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 //
-//! Окна прогона для наблюдателя e2e. Каждый запрос здесь ограничен либо
-//! временем ПРИЁМА (`raw_events.created_at`), либо набором адресов, поэтому
-//! тесты безопасны в общей БД и не зависят от чужих строк — в отличие от
-//! глобальных агрегатов, на которых волна 1 потеряла время.
+//! Run windows for the e2e observer. Every query here is bounded either by
+//! INGEST time (`raw_events.created_at`) or by a set of addresses, so the tests
+//! are safe in a shared database and do not depend on anyone else's rows — unlike
+//! the global aggregates wave 1 lost time on.
 
 use std::env;
 use std::time::Duration;
@@ -32,7 +32,7 @@ async fn setup() -> Option<PgPool> {
     Some(pool)
 }
 
-/// Строка `raw_events` с заданным возрастом приёма и заданной декодируемостью.
+/// A `raw_events` row with a given ingest age and a given decodability.
 async fn seed_raw(pool: &PgPool, msg: &str, src: &str, event_type: Option<&str>, age_secs: i64) {
     sqlx::query(
         "insert into raw_events
@@ -86,13 +86,13 @@ async fn seed_book(
 
 #[tokio::test]
 async fn the_pending_window_excludes_rows_ingested_before_the_run() {
-    // Окно существует ровно потому, что база стенда переживает пайплайны:
-    // без него строка, брошенная позавчерашним прогоном, роняет сегодняшний.
+    // The window exists precisely because the stand's database outlives pipelines:
+    // without it, a row left behind by the run before last fails today's.
     let Some(pool) = setup().await else { return };
     let src = "0:obsq_pending";
-    // Тип уникален для этого теста. Иначе соседний тест, пишущий строку того же
-    // типа, сделал бы строгое равенство ниже флаки, а нестрогое сравнение не
-    // отличило бы «окно сузило» от «окно проигнорировано».
+    // The type is unique to this test. Otherwise a neighbouring test writing a row
+    // of the same type would make the strict equality below flaky, while a loose
+    // comparison could not tell "the window narrowed" from "the window was ignored".
     let ty = "InferenceOrderBook.ObsWindowProbe";
     let undec_new = "0:obsq_undec_new";
     let undec_old = "0:obsq_undec_old";
@@ -116,34 +116,42 @@ async fn the_pending_window_excludes_rows_ingested_before_the_run() {
     };
 
     let narrow = repo.pending_projection_since(now - 60).await.unwrap();
-    assert_eq!(count_of(&narrow), 1, "в узкое окно обязана попасть ровно свежая строка");
+    assert_eq!(count_of(&narrow), 1, "the narrow window must contain exactly the fresh row");
     let wide = repo.pending_projection_since(now - 86_400).await.unwrap();
-    assert_eq!(count_of(&wide), 2, "в широкое — обе: значит окно сужает, а не игнорируется");
+    assert_eq!(
+        count_of(&wide),
+        2,
+        "the wide one holds both: so the window narrows rather than being ignored"
+    );
 
-    // Недекодируемые считаются ОТДЕЛЬНО от проецируемых и тем же окном.
+    // Undecodable rows are counted SEPARATELY from projectable ones, by the same window.
     //
-    // Проверка идёт через СКОУПНЫЙ вариант, а не через разность двух глобальных
-    // счётчиков: `count_undecodable_since` — единственный метод здесь без скоупа,
-    // и сравнение двух его чтений ломается от постороннего писателя.
-    // Конкурент известен поимённо — `capture.rs`
-    // (`persist_page_handles_mixed_decodable_and_undecodable_edges`) вставляет
-    // недекодируемую строку и затем её вычищает; удаление между двумя чтениями
-    // ломает неравенство при полностью исправном окне.
+    // The check goes through the SCOPED variant rather than the difference of two
+    // global counters: `count_undecodable_since` is the only method here without a
+    // scope, and comparing two of its readings breaks under an outside writer.
+    // The competitor is known by name — `capture.rs`
+    // (`persist_page_handles_mixed_decodable_and_undecodable_edges`) inserts an
+    // undecodable row and then purges it; a delete between the two readings breaks
+    // the inequality even with a perfectly working window.
     let mut in_narrow = repo.undecodable_addresses_since(now - 60, &undec_scope).await.unwrap();
     in_narrow.sort();
     assert_eq!(
         in_narrow,
         vec![undec_new.to_string()],
-        "в узкое окно попадает только свежая недекодируемая строка"
+        "only the fresh undecodable row falls into the narrow window"
     );
     let mut in_wide = repo.undecodable_addresses_since(now - 86_400, &undec_scope).await.unwrap();
     in_wide.sort();
-    assert_eq!(in_wide, vec![undec_new.to_string(), undec_old.to_string()], "в широкое — обе");
-    // Глобальный счётчик — тот, что зовёт наблюдатель. Утверждение односторонее и
-    // от чужих строк не зависит: наша свежая строка в окне есть и никуда не денется.
+    assert_eq!(
+        in_wide,
+        vec![undec_new.to_string(), undec_old.to_string()],
+        "the wide one holds both"
+    );
+    // The global counter is the one the observer calls. The claim is one-sided and
+    // does not depend on foreign rows: our fresh row is in the window and stays there.
     assert!(
         repo.count_undecodable_since(now - 60).await.unwrap() >= 1,
-        "свежая недекодируемая строка обязана считаться и глобальным методом"
+        "the fresh undecodable row must be counted by the global method too"
     );
 
     for a in [src, undec_new, undec_old] {
@@ -157,13 +165,13 @@ async fn the_pending_window_excludes_rows_ingested_before_the_run() {
 
 #[tokio::test]
 async fn the_book_scope_holds_only_books_with_events_in_this_run() {
-    // Этот метод решает, КОГО наблюдатель вообще судит: и проверка вердикта, и
-    // wedged берут скоуп у него. Неверное окно здесь оставило бы соседние тесты
-    // зелёными, а на стенде дало бы либо суд над всеми книгами, что когда-либо
-    // существовали, либо ни над одной. Общая константа `EVENTS_IN_WINDOW`
-    // гарантирует, что предикат у двух методов ОДИНАКОВ, — но не что множество
-    // правильное, и «книга позавчерашнего прогона не роняет сегодняшний»
-    // держалось бы на непроверенном методе.
+    // This method decides WHO the observer judges at all: both the verdict check
+    // and the wedged check take their scope from it. A wrong window here would
+    // leave the neighbouring tests green while, on the stand, judging either every
+    // book that ever existed or none of them. The shared `EVENTS_IN_WINDOW`
+    // constant guarantees the two methods share the SAME predicate — but not that
+    // the set is right, and "a book from the run before last does not fail today's"
+    // would then rest on an unverified method.
     let Some(pool) = setup().await else { return };
     let fresh = "0:obsq_scope_fresh";
     let stale = "0:obsq_scope_stale";
@@ -184,17 +192,20 @@ async fn the_book_scope_holds_only_books_with_events_in_this_run() {
     let now = chrono::Utc::now().timestamp();
 
     let narrow = repo.inference_books_with_events_since(now - 60).await.unwrap();
-    assert!(!narrow.contains(&fresh.to_string()), "книга без событий в окне в скоуп не входит");
+    assert!(
+        !narrow.contains(&fresh.to_string()),
+        "a book with no events in the window is not in the scope"
+    );
     assert!(
         !narrow.contains(&stale.to_string()),
-        "книга, чьё единственное событие СТАРШЕ окна, в скоуп не входит — иначе \
-         брошенная отменённым прогоном роняла бы следующий по чужой причине"
+        "a book whose only event is OLDER than the window is not in the scope — \
+         otherwise one left by an aborted run would fail the next for a foreign reason"
     );
 
     seed_raw(&pool, "obsq-scope-fresh", fresh, Some("InferenceOrderBook.InferenceFilled"), 5).await;
-    // Строка ОБРАБОТАНА: на хвосте прогона таких большинство, и скоуп обязан их
-    // видеть. Это же и причина, по которой индекс 0007 не может быть частичным
-    // по `processed_at is null`, как оба существующих индекса по `src_address`.
+    // The row is PROCESSED: at the tail of a run most of them are, and the scope
+    // must see them. That is also why index 0007 cannot be partial on
+    // `processed_at is null` the way both existing `src_address` indexes are.
     sqlx::query("update raw_events set processed_at = now() where msg_id = 'obsq-scope-fresh'")
         .execute(&pool)
         .await
@@ -203,14 +214,17 @@ async fn the_book_scope_holds_only_books_with_events_in_this_run() {
     let narrow = repo.inference_books_with_events_since(now - 60).await.unwrap();
     assert!(
         narrow.contains(&fresh.to_string()),
-        "книга с событием в окне обязана попасть в скоуп, в том числе с обработанным"
+        "a book with an event in the window must land in the scope, processed rows included"
     );
-    assert!(!narrow.contains(&silent.to_string()), "книга без событий вообще в скоуп не входит");
+    assert!(
+        !narrow.contains(&silent.to_string()),
+        "a book with no events at all is not in the scope"
+    );
 
     let wide = repo.inference_books_with_events_since(now - 86_400).await.unwrap();
     assert!(
         wide.contains(&stale.to_string()),
-        "в широком окне старая книга появляется — значит выбор делает именно окно"
+        "the stale book appears in the wide window — so the selection is made by the window itself"
     );
 
     for ob in [fresh, stale, silent] {
@@ -252,15 +266,15 @@ async fn a_verdict_needs_a_reason_and_a_superseded_book_needs_none() {
     assert_eq!(
         without,
         vec![discovering.to_string(), failing_without.to_string()],
-        "вердикта нет ровно у ещё не разобранной книги и у той, чей отказ БЕЗ ТЕКСТА; \
-         superseded — полноценный третий вердикт, а не смягчение"
+        "a verdict is missing for exactly the not-yet-resolved book and the one whose \
+         failure carries NO TEXT; superseded is a full third verdict, not a softening"
     );
 
     let failing = repo.inference_failing_books(&scope).await.unwrap();
     assert_eq!(
         failing,
         vec![(failing_with.to_string(), "getVersion reverted".to_string())],
-        "печатаемый список failing несёт причину: без неё шаг зелёный, но нечитаемый"
+        "the printed failing list carries the reason: without it the step is green but unreadable"
     );
 
     sqlx::query("delete from inference_markets where orderbook_address = any($1)")
@@ -289,7 +303,7 @@ async fn the_anchor_finds_a_visible_book_with_orders_and_events_in_the_window() 
     let repo = IndexerRepository::new(pool.clone());
     let window = chrono::Utc::now().timestamp() - 60;
 
-    // Ни ордеров, ни событий — якорь пуст.
+    // Neither orders nor events — the anchor is empty.
     assert!(repo.inference_anchored_books_since(window).await.unwrap().iter().all(|a| a != ob));
 
     sqlx::query(
@@ -302,13 +316,13 @@ async fn the_anchor_finds_a_visible_book_with_orders_and_events_in_the_window() 
     .execute(&pool)
     .await
     .unwrap();
-    // Ордер есть, а события прогона — нет: якорь всё ещё пуст.
+    // An order exists but no event from this run: the anchor is still empty.
     assert!(repo.inference_anchored_books_since(window).await.unwrap().iter().all(|a| a != ob));
 
     seed_raw(&pool, "obsq-anchor-ev", ob, Some("InferenceOrderBook.InferenceOrderPlaced"), 5).await;
     assert!(repo.inference_anchored_books_since(window).await.unwrap().iter().any(|a| a == ob));
 
-    // И вне окна — снова пусто: окно действительно сужает, а не украшает.
+    // And outside the window it is empty again: the window really narrows rather than decorates.
     let future = chrono::Utc::now().timestamp() + 3600;
     assert!(repo.inference_anchored_books_since(future).await.unwrap().iter().all(|a| a != ob));
 

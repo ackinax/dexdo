@@ -105,11 +105,12 @@ pub async fn project_event(
         | "PrivateNote.InferenceOrderPlacedConfirmed"
         | "PrivateNote.InferenceFilledConfirmed"
         | "RootPN.DealWriteOffReported"
-        // ABI RootModel загружен ради разрешения коллизии `ContractDeployed` по `dst`
-        // (см. decoder.rs), а не ради проекции — в read-модель ни одно его событие не
-        // идёт. Арм'ы обязаны быть явными: без них оба уходят в `_ => Unknown`, где
-        // строка помечается processed и теряется НАВСЕГДА. Для `ContractDeployed` это
-        // ещё и суть починки: событие деплоя root-модели не должно заводить сделку.
+        // The RootModel ABI is loaded to resolve the `ContractDeployed` collision by
+        // `dst` (see decoder.rs), not for projection — none of its events reaches
+        // the read model. The arms must be explicit: without them both fall through
+        // to `_ => Unknown`, where the row is marked processed and lost FOREVER. For
+        // `ContractDeployed` this is also the substance of the fix: a root-model
+        // deploy event must not create a deal.
         | "RootModel.ContractDeployed"
         | "RootModel.TokenContractRegistered" => Ok(ProjectionOutcome::Applied),
         et if et.starts_with("TokenContract.") => {
@@ -354,12 +355,12 @@ async fn apply_range_event_added(
 ) -> anyhow::Result<ProjectionOutcome> {
     let eventlist_address =
         node.src.as_deref().context("RangeEventAdded: src missing on event message")?;
-    // Исчерпывающая деструктуризация: каждое поле ABI обязано быть названо.
+    // Exhaustive destructuring: every ABI field must be named.
     let RangeEventAddedData { event_id, ob, bounds } = serde_json::from_value(event.value.clone())
-        .context("RangeEventAdded: payload не разбирается по ABI")?;
-    // `eventId` и `bounds` — uint256 и uint256[]; DTO держит СЫРЫЕ значения ABI
-    // ("0x"+64 hex), поэтому конверсия остаётся здесь. Хранимая форма — то, что
-    // отдаёт API: десятичные строки.
+        .context("RangeEventAdded: payload does not parse against the ABI")?;
+    // `eventId` and `bounds` are uint256 and uint256[]; the DTO holds the RAW ABI
+    // values ("0x" + 64 hex), so the conversion stays here. The stored form is what
+    // the API serves: decimal strings.
     let event_id_decimal = uint256_maybe_hex(&event_id)?;
     let range_ob_address = ob.as_str();
     let bounds_json = Value::Array(
@@ -1244,10 +1245,10 @@ pub(crate) fn field_str<'a>(value: &'a Value, key: &str) -> anyhow::Result<&'a s
     value.get(key).and_then(Value::as_str).with_context(|| format!("missing field `{key}`"))
 }
 
-/// То же правило, что применяет `uint_field_to_decimal`, но к уже извлечённой
-/// строке — для путей, где значение приходит из типизированного DTO, а не из
-/// `serde_json::Value`. Декодер отдаёт uint256 как "0x"+64 hex, а всё, что уже,
-/// — десятичным; принять надо оба.
+/// The same rule `uint_field_to_decimal` applies, but to an already-extracted
+/// string — for paths where the value comes from a typed DTO rather than from a
+/// `serde_json::Value`. The decoder hands over a uint256 as "0x" + 64 hex and
+/// anything narrower as decimal; both must be accepted.
 pub(crate) fn uint256_maybe_hex(raw: &str) -> anyhow::Result<String> {
     if raw.starts_with("0x") || raw.starts_with("0X") {
         uint256_hex_to_decimal(raw)

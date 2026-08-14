@@ -37,9 +37,9 @@ pub enum InferenceOrderBookEvent {
 }
 
 impl InferenceOrderBookEvent {
-    /// Каждый вариант, ровно один раз. Rust не умеет перечислять варианты сам, а
-    /// рукописный список ЗДЕСЬ безопасен именно потому, что тест сверяет его с
-    /// ABI: забытый вариант ловится, а не переносится дальше.
+    /// Every variant, exactly once. Rust cannot enumerate variants on its own, and a
+    /// hand-written list HERE is safe precisely because a test checks it against the
+    /// ABI: a forgotten variant is caught rather than carried forward.
     pub const ALL: &'static [Self] = &[
         Self::OrderPlaced,
         Self::OrderCancelled,
@@ -278,9 +278,10 @@ pub struct OrderCancelledData {
 #[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `InferenceOrderBookEvent::Refunded`.
 pub struct RefundedData {
-    /// Ордер, которого касается возврат. Приехал с v4.0.33 и до волны 0 не читался
-    /// ничем: без него рефанд нельзя привязать к строке, и continuation-истечение —
-    /// единственный путь, где других событий не бывает, — не закрывало ордер вовсе.
+    /// The order the refund concerns. It arrived with v4.0.33 and until wave 0 was
+    /// read by nothing: without it a refund cannot be tied to a row, and a
+    /// continuation expiry — the only path with no other events — did not close the
+    /// order at all.
     #[serde(deserialize_with = "deserialize_u128")]
     pub order_id: u128,
     pub note: String,
@@ -303,10 +304,10 @@ pub struct FilledData {
     pub clearing_price: String,
     /// ABI field is `sellerTC` (both caps); `rename_all = camelCase` would emit
     /// `sellerTc`, so the name is pinned explicitly.
-    /// `Option`, а не `String`, и это решение, а не упущение: связка сделки — не
-    /// то, ради чего стоит отказывать событию навсегда. Дрейф ABI здесь
-    /// логируется и пропускается (`link_deal_from_filled`), а ловит его гард
-    /// формы, а не рантайм.
+    /// `Option` rather than `String`, and that is a decision, not an oversight: the
+    /// deal link is not worth failing an event forever over. ABI drift here is logged
+    /// and skipped (`link_deal_from_filled`), and what catches it is the shape guard,
+    /// not the runtime.
     #[serde(default, rename = "sellerTC")]
     pub seller_tc: Option<String>,
     pub buyer_note: String,

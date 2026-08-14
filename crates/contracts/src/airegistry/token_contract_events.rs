@@ -34,17 +34,17 @@ pub enum TokenContractEvent {
     EndpointSet = 731,
     BuyerBondFunded = 733,
     ProbeBurned = 729,
-    /// Деплой СДЕЛКИ, `DealDeployedEmit` (732). Не `ContractDeployedEmit` (703):
-    /// та константа принадлежит `RootModel`, и обе стороны объявляют побайтово
-    /// одинаковое `ContractDeployed(address self)`, то есть делят body-id.
-    /// Различить их может только внешний `dst` — таблица маршрутов в
+    /// The DEAL deploy, `DealDeployedEmit` (732). Not `ContractDeployedEmit` (703):
+    /// that constant belongs to `RootModel`, and both sides declare a byte-for-byte
+    /// identical `ContractDeployed(address self)`, i.e. they share a body id. Only the
+    /// external `dst` can tell them apart — the route table in
     /// `crates/infrastructure/src/decoder.rs`.
     ContractDeployed = 732,
 }
 
 impl TokenContractEvent {
-    /// См. `InferenceOrderBookEvent::ALL`: список сверяется с ABI тестом, поэтому
-    /// забытый вариант краснеет, а не расходится молча.
+    /// See `InferenceOrderBookEvent::ALL`: a test checks the list against the ABI, so
+    /// a forgotten variant turns red rather than drifting silently.
     pub const ALL: &'static [Self] = &[
         Self::ContractDestroyed,
         Self::ShellWithdrawn,
@@ -363,7 +363,7 @@ pub struct TicksClaimedData {
 #[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `TokenContractEvent::EndpointSet`.
 pub struct EndpointSetData {
-    /// ABI-тип `bytes` — приезжает hex-строкой, конвертировать нечего.
+    /// The ABI type is `bytes` — it arrives as a hex string, nothing to convert.
     pub endpoint_cipher: String,
 }
 

@@ -20,8 +20,9 @@ pub enum OracleEventListEvent {
     DescriptionUpdated = 107,
     EventAdded = 133,
     /// `ORACLE_RANGE_EVENT_ADDED` (`contracts/dex/modifiers/modifiers.sol:88`).
-    /// Тот же id уже запинен манифестом (`dex_event_manifest.rs:295`) вместе с
-    /// emit-сайтом; здесь он не вводится заново, а догоняет уже выведенный факт.
+    /// The same id is already pinned by the manifest (`dex_event_manifest.rs:295`)
+    /// together with its emit site; it is not introduced anew here but catches up with
+    /// an already-derived fact.
     RangeEventAdded = 162,
 }
 
@@ -175,10 +176,10 @@ pub struct DescriptionUpdatedData {
 #[cfg_attr(test, serde(deny_unknown_fields))]
 /// Payload of `OracleEventListEvent::RangeEventAdded`.
 pub struct RangeEventAddedData {
-    /// uint256 — приезжает "0x"+64 hex, конверсию делает потребитель
-    /// (`uint256_maybe_hex`). `u128` здесь не годится в принципе.
+    /// A uint256 — arrives as "0x" + 64 hex, and the consumer does the conversion
+    /// (`uint256_maybe_hex`). `u128` is fundamentally unsuitable here.
     pub event_id: String,
     pub ob: String,
-    /// uint256[] — массив hex-строк, конверсия поэлементная.
+    /// A uint256[] — an array of hex strings, converted element by element.
     pub bounds: Vec<String>,
 }

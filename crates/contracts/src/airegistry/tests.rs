@@ -353,13 +353,13 @@ fn event_ids_match_modifiers() {
     assert_eq!(Rm::TokenContractRegistered as u128, 702);
     assert_eq!(Rm::ContractDeployed as u128, 703);
 
-    // Реликт. Утверждения об id ниже дублируют
+    // A relic. The id assertions below duplicate
     // `typed_event_enums_carry_the_ids_the_contracts_emit_on`
-    // (`crates/infrastructure/tests/airegistry_event_manifest.rs`), который выводит те
-    // же числа из `modifiers.sol` вместо того, чтобы повторять их здесь. Новые
-    // варианты сюда НЕ дописываются: расхождение этой таблицы с контрактом и было
-    // дефектом 703 — деплой сделки переехал на `DealDeployedEmit`, манифест это
-    // записал, а enum и эта строка — нет.
+    // (`crates/infrastructure/tests/airegistry_event_manifest.rs`), which derives the
+    // same numbers from `modifiers.sol` instead of repeating them here. New variants
+    // are NOT added here: this table drifting away from the contract is exactly what
+    // defect 703 was — the deal deploy moved to `DealDeployedEmit`, the manifest
+    // recorded it, and the enum and this line did not.
     assert_eq!(Tc::ContractDeployed as u128, 732);
     assert_eq!(Tc::ContractDestroyed as u128, 709);
     assert_eq!(Tc::ShellWithdrawn as u128, 710);
@@ -397,13 +397,14 @@ fn event_address_roundtrips_through_try_from() {
     );
     assert_eq!(Tc::try_from(Tc::ProbeAccepted.to_string()).unwrap(), Tc::ProbeAccepted);
     assert_eq!(Iob::try_from(Iob::Filled.to_string()).unwrap(), Iob::Filled);
-    // Тот же круг, что `every_declared_variant_round_trips_through_try_from` делает
-    // по `ALL`: без арма в `TryFrom` вариант объявлен, а декодер его не знает.
+    // The same round trip `every_declared_variant_round_trips_through_try_from` does
+    // over `ALL`: without an arm in `TryFrom` the variant is declared but the decoder
+    // does not know it.
     use crate::dex::oracle_event_list_events::OracleEventListEvent as Oel;
     assert_eq!(
         Oel::try_from(Oel::RangeEventAdded.to_string()).unwrap(),
         Oel::RangeEventAdded,
-        "RangeEventAdded объявлен вариантом, но TryFrom его id (162) не знает"
+        "RangeEventAdded is a declared variant, but TryFrom does not know its id (162)"
     );
     assert!(Iob::try_from(
         ":0000000000000000000000000000000000000000000000000000000000000063".to_string()
@@ -413,13 +414,13 @@ fn event_address_roundtrips_through_try_from() {
 
 // ── Event payload decoders (field names vs ABI event inputs) ───────────────
 
-/// Имена всех событий ABI.
+/// The names of every ABI event.
 fn abi_event_names(abi: &str) -> BTreeSet<String> {
     let v: Value = serde_json::from_str(abi).expect("abi json");
     let events = v["events"].as_array().expect("abi.events array");
-    // Пустой массив сделал бы любое утверждение о нём верным всегда — так гард
-    // слепнет от переименования ключа.
-    assert!(!events.is_empty(), "events пуст — ключ ABI изменился");
+    // An empty array would make any claim about it true always — that is how a guard
+    // goes blind when the key is renamed.
+    assert!(!events.is_empty(), "events is empty — the ABI key changed");
     events.iter().map(|e| e["name"].as_str().expect("event name").to_string()).collect()
 }
 
@@ -441,7 +442,7 @@ fn inference_order_book_enum_covers_every_abi_event() {
     assert_eq!(
         declared,
         in_abi,
-        "лишние в enum: {:?}; отсутствующие: {:?}",
+        "extra in enum: {:?}; missing: {:?}",
         declared.difference(&in_abi).collect::<Vec<_>>(),
         in_abi.difference(&declared).collect::<Vec<_>>()
     );
@@ -455,7 +456,7 @@ fn token_contract_enum_covers_every_abi_event() {
     assert_eq!(
         declared,
         in_abi,
-        "лишние в enum: {:?}; отсутствующие: {:?}",
+        "extra in enum: {:?}; missing: {:?}",
         declared.difference(&in_abi).collect::<Vec<_>>(),
         in_abi.difference(&declared).collect::<Vec<_>>()
     );
@@ -496,8 +497,8 @@ fn event_payloads_decode_abi_shape() {
     decodes!(tc::EndpointSetData, TOKEN_CONTRACT_ABI, "EndpointSet");
     decodes!(tc::BuyerBondFundedData, TOKEN_CONTRACT_ABI, "BuyerBondFunded");
 
-    // Алиасы выше идут через `use super::… as …`, где `super` — `airegistry`.
-    // Для чужого модуля нужен полный путь от корня крейта.
+    // The aliases above go through `use super::… as …`, where `super` is
+    // `airegistry`. A foreign module needs the full path from the crate root.
     use crate::dex::oracle_event_list_events as oel;
     decodes!(oel::RangeEventAddedData, ORACLE_EVENT_LIST_ABI, "RangeEventAdded");
 

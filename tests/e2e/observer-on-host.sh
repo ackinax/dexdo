@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Наблюдатель: сквозные инварианты индексера по всему прогону. Трафика не
-# создаёт, читает только развёрнутую БД.
+# The observer: end-to-end indexer invariants over the whole run. It creates no
+# traffic and reads only the deployed database.
 #
 # Required env: DEXDO_SHA, PIPELINE_ID, TEST_DATABASE_URL, E2E_ELAPSED_SECONDS.
 # Optional: DEXDO_REPO, DEXDO_DIR, OBSERVER_DEADLINE_SECS.
 #
-# Пайпится по ssh из чекаута CI-раннера, как sdk-proof-on-host.sh, и по той же
-# причине: общий чекаут на хосте B — это ровно то состояние, которое скрипт
-# собирается перезаписать, и оно может хранить что угодно от прошлого пайплайна.
-# Лиз-протокол по той же причине встроен, а не подключается с диска хоста.
+# Piped over ssh from the CI runner's checkout, like sdk-proof-on-host.sh and for the
+# same reason: the shared checkout on host B is exactly the state this script is about
+# to overwrite, and it may hold anything from a previous pipeline. The lease protocol
+# is inlined for the same reason rather than sourced from the host's disk.
 set -euo pipefail
 
 : "${DEXDO_SHA:?}" "${PIPELINE_ID:?}" "${TEST_DATABASE_URL:?}" "${E2E_ELAPSED_SECONDS:?}"
@@ -17,14 +17,14 @@ case "$PIPELINE_ID" in
   *[[:space:]]*) echo "FATAL: PIPELINE_ID must not contain whitespace: '$PIPELINE_ID'"; exit 64 ;;
 esac
 
-# Начало прогона В ЧАСАХ ЭТОГО ХОСТА, и вычисляется оно ПЕРВЫМ делом — до синка.
-# `E2E_ELAPSED_SECONDS` снят целиком по часам CI-раннера (разность двух его же
-# отсчётов), поэтому смещение часов раннера относительно хоста в результат не
-# входит; сравнивается метка с `raw_events.created_at`, который ставит Postgres
-# этого же хоста. Если снять `date` после `git fetch`/`checkout`, начало прогона
-# уедет вперёд на длительность синхронизации — секунды на тёплом хосте, минуты на
-# холодном clone. Направление безопасное (окно у́же, ложного красного нет), но это
-# ровно то смещение, которое здесь снимается одной строкой.
+# The run's start IN THIS HOST'S CLOCK, computed FIRST of all — before the sync.
+# `E2E_ELAPSED_SECONDS` is measured entirely against the CI runner's clock (the
+# difference of two of its own readings), so the runner-to-host clock offset does not
+# enter the result; the mark is compared against `raw_events.created_at`, which is set
+# by this same host's Postgres. Taking `date` after `git fetch`/`checkout` would push
+# the run's start forward by the sync duration — seconds on a warm host, minutes on a
+# cold clone. The direction is safe (a narrower window, no false red), but it is
+# exactly the offset removed here by one line.
 E2E_STARTED_AT=$(( $(date +%s) - E2E_ELAPSED_SECONDS ))
 export E2E_STARTED_AT TEST_DATABASE_URL
 
@@ -36,11 +36,12 @@ source "$HOME/.cargo/env"
 GUARD=/var/lock/dexdo-e2e.lock
 LEASE=/var/lock/dexdo-e2e.lease
 
-# Проверка владения — жёсткая, никогда `|| true`. Наблюдатель читает БД стенда;
-# если лиз уже не наш, стенд принадлежит другому пайплайну и его база к нашему
-# прогону отношения не имеет. Каждый отказ выходит через явный `exit` — по той же
-# причине, что и в образце (sdk-proof-on-host.sh): bash снимает `errexit` внутри
-# левой части `||`, так что падение сквозь него не остановило бы функцию.
+# The ownership check is hard, never `|| true`. The observer reads the stand's
+# database; if the lease is no longer ours, the stand belongs to another pipeline and
+# its database has nothing to do with our run. Every refusal exits through an explicit
+# `exit` — for the same reason as in the template (sdk-proof-on-host.sh): bash drops
+# `errexit` inside the left-hand side of `||`, so a failure through it would not stop
+# the function.
 lease_assert() {
   exec 9>"$GUARD"
   flock -w 30 9 || { echo "FATAL: guard busy (flock on $GUARD not acquired within 30s)"; exit 70; }
@@ -54,7 +55,7 @@ lease_assert() {
   exec 9>&-
 }
 
-lease_assert                                   # до первого касания общего чекаута
+lease_assert                                   # before first touching the shared checkout
 echo "==> sync dexdo @ ${DEXDO_SHA}"
 [ -d "$DIR/.git" ] || git clone "$REPO" "$DIR"
 git -C "$DIR" fetch --depth 1 origin "$DEXDO_SHA" && git -C "$DIR" checkout -f FETCH_HEAD
@@ -67,18 +68,18 @@ cd "$DIR"
 START=$(date +%s)
 FILTER='binary(e2e_observer)'
 
-# Дедлайна здесь НЕТ намеренно. Его значение живёт в одном месте — константе
-# `DEFAULT_DEADLINE_SECS` теста, — и оттуда же печатается вместе с худшим случаем
-# шага (два `#[ignore]`-теста при `--test-threads 1`, то есть сумма дедлайнов).
-# Второй источник той же величины разошёлся бы тихо: правка rust-стороны оставила
-# бы этот скрипт честно печатать неправду. Чтобы переопределить дедлайн на стенде,
-# добавить `OBSERVER_DEADLINE_SECS` в список переменных ssh-вызова в e2e.yml —
-# скрипт пробросит его, ничего не зная о значении.
+# There is deliberately NO deadline here. Its value lives in one place — the test's
+# `DEFAULT_DEADLINE_SECS` constant — and is printed from there together with the step's
+# worst case (two `#[ignore]` tests under `--test-threads 1`, i.e. the sum of the
+# deadlines). A second source of the same quantity would drift silently: editing the
+# Rust side would leave this script honestly printing an untruth. To override the
+# deadline on the stand, add `OBSERVER_DEADLINE_SECS` to the ssh call's variable list
+# in e2e.yml — the script forwards it while knowing nothing about the value.
 
-# Пустая выборка — не безобидный no-op: `--run-ignored only` по несовпавшему
-# фильтру выходит с нулём, и шаг отчитался бы об успехе, не проверив ничего —
-# ровно тот отказ, ради которого наблюдатель и заводится. stderr сохраняется:
-# «фильтр ничего не выбрал» и «крейт не собрался» по числу строк неразличимы.
+# An empty selection is not a harmless no-op: `--run-ignored only` with a filter that
+# matches nothing exits zero, and the step would report success having checked nothing
+# — exactly the failure mode the observer exists for. stderr is kept: "the filter
+# selected nothing" and "the crate did not build" are indistinguishable by line count.
 LIST_ERR=$(mktemp)
 N=$(cargo nextest list -p dodex-infrastructure --run-ignored only -E "$FILTER" 2>"$LIST_ERR" | grep -c '::' || true)
 if [ "$N" -lt 1 ]; then
@@ -90,27 +91,27 @@ if [ "$N" -lt 1 ]; then
 fi
 rm -f "$LIST_ERR"
 
-lease_assert                                   # непосредственно перед чтением БД
+lease_assert                                   # immediately before reading the database
 #
-# `--profile ci-e2e` берётся не по инерции. Его overrides
-# (`.config/nextest.toml`) называют бинари `dodex-api` и сюда не попадают;
-# что он реально даёт — `slow-timeout = 60s × terminate-after 10`, то есть жёсткие
-# 600 с на тест. Это не дубль дедлайна наблюдателя, а другой предел: дедлайн,
-# каким бы он ни был, закрывает НЕ-сходимость, но не зависший запрос —
-# `acquire_timeout` ограничивает только установку соединения, а выполнение
-# запроса не ограничивает ничто. 600 с и есть эта страховка.
+# `--profile ci-e2e` is not taken out of inertia. Its overrides
+# (`.config/nextest.toml`) name `dodex-api` binaries and do not apply here; what it
+# actually provides is `slow-timeout = 60s × terminate-after 10`, i.e. a hard 600 s per
+# test. That is not a duplicate of the observer's deadline but a different limit: the
+# deadline, whatever it is, covers NON-convergence but not a hung query —
+# `acquire_timeout` bounds only establishing a connection, and nothing bounds executing
+# a query. The 600 s is that insurance.
 #
-# `set +e` вокруг прогона — не стилистика: скрипт под `set -euo pipefail`, и
-# упавший `cargo nextest run` завершил бы его прямо на этой строке, так что ни
-# `RC=$?`, ни печать бюджета ниже не выполнились бы. Печать нужнее всего как раз
-# на красном прогоне, а первый прогон на стенде с наибольшей вероятностью красный.
-# Код возврата шага при этом не меняется — он восстанавливается явным `exit`.
+# The `set +e` around the run is not stylistic: the script runs under
+# `set -euo pipefail`, and a failing `cargo nextest run` would terminate it right on
+# that line, so neither `RC=$?` nor the budget print below would execute. The print is
+# needed most on a red run, and the first run on the stand is the most likely to be
+# red. The step's exit code is unchanged — it is restored by an explicit `exit`.
 set +e
 cargo nextest run --profile ci-e2e --color never -p dodex-infrastructure \
   --run-ignored only --test-threads 1 -E "$FILTER"
 RC=$?
 set -e
-# Бюджет пайплайна назван узким. `START` снят до `nextest list`, то есть число
-# включает компиляцию: она идёт именно там, а не в `run`.
+# The pipeline budget is described as tight. `START` is taken before `nextest list`,
+# so the number includes compilation: that is where it happens, not in `run`.
 echo "==> observer wall clock (compile + run): $(( $(date +%s) - START ))s, rc=$RC"
 exit "$RC"
