@@ -1394,16 +1394,14 @@ impl IndexerRepository {
         let mut force_retry = true; // first pass rewinds to the front
 
         loop {
-            let retry = force_retry || last_retry.elapsed() >= idle_interval;
-            force_retry = false;
             // Forward passes resume above the floor; a rate-limited retry pass
             // rewinds to the front to re-attempt the stuck set below the floor.
-            let mut after: Option<String> = if retry {
+            let (mut after, reset_timer) =
+                next_pass_start(force_retry, last_retry.elapsed(), idle_interval, &floor);
+            force_retry = false;
+            if reset_timer {
                 last_retry = tokio::time::Instant::now();
-                None
-            } else {
-                floor.clone()
-            };
+            }
 
             // Ceiling = highest pending chain_order now; bounds this pass so it
             // terminates even while capture keeps appending above it.
@@ -1589,6 +1587,30 @@ fn should_warn_unparseable_created_at(value: Option<&Value>, parsed: Option<f64>
     value.is_some() && parsed.is_none()
 }
 
+/// The pass-mode decision of `run_reprojection_loop`, extracted pure so a unit
+/// can pin it without a clock or a DB (`elapsed` is the caller's
+/// `last_retry.elapsed()`). Returns `(after, reset_timer)`: `after` is the
+/// pass's lower bound — the floor on a forward pass, `None` (the front) on a
+/// retry — and `reset_timer` is true exactly on the retry choice, never on a
+/// forward pass. This is the IX-FAIL-01 negative half: a regression passing
+/// `None` on every pass (or resetting the timer on forward passes, starving
+/// the retry) is caught here deterministically, where a wall-clock lower-bound
+/// assert on the live loop would flake — the timer's phase resets at the START
+/// of a retry pass, so a slow pass legally retries "too early" relative to any
+/// post-pass synchronization point.
+fn next_pass_start(
+    force_retry: bool,
+    elapsed: Duration,
+    idle_interval: Duration,
+    floor: &Option<String>,
+) -> (Option<String>, bool) {
+    if force_retry || elapsed >= idle_interval {
+        (None, true)
+    } else {
+        (floor.clone(), false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,6 +1640,52 @@ mod tests {
     fn handles_missing_value() {
         assert_eq!(parse_unix_seconds(None), None);
         assert_eq!(parse_unix_seconds(Some(&Value::Null)), None);
+    }
+
+    // IX-FAIL-01 is closed by a triple: (1) these units pin the loop's CHOICE
+    // of pass mode; (2) reproject_pending_from_honors_after_and_until_bounds
+    // (tests/reprojection.rs) pins that the method honors the bound it is
+    // given; (3) the loop test's upper bound (deferred_retry_rides_the_idle
+    // _interval_timer, same file) pins that a timer retry actually reaches a
+    // stuck row. No wall-clock lower bound is asserted anywhere — see
+    // `next_pass_start`'s doc for why such an assert flakes on correct code.
+
+    #[test]
+    fn next_pass_start_resumes_above_the_floor_on_a_forward_pass() {
+        let floor = Some("5f80co".to_string());
+        let (after, reset) =
+            next_pass_start(false, Duration::from_millis(299), Duration::from_millis(300), &floor);
+        assert_eq!(after, floor, "a forward pass must resume above the floor");
+        assert!(!reset, "the retry timer must NOT reset on a forward pass");
+    }
+
+    #[test]
+    fn next_pass_start_rewinds_to_the_front_when_the_timer_expires() {
+        let floor = Some("5f80co".to_string());
+        let (after, reset) =
+            next_pass_start(false, Duration::from_millis(300), Duration::from_millis(300), &floor);
+        assert_eq!(after, None, "an expired timer must rewind to the front");
+        assert!(reset, "the retry choice must reset the timer");
+    }
+
+    #[test]
+    fn next_pass_start_rewinds_on_force_retry_regardless_of_elapsed() {
+        let floor = Some("5f80co".to_string());
+        let (after, reset) =
+            next_pass_start(true, Duration::ZERO, Duration::from_millis(300), &floor);
+        assert_eq!(after, None, "force_retry (the first pass) must read from the front");
+        assert!(reset, "force_retry is a retry choice and must reset the timer");
+    }
+
+    #[test]
+    fn next_pass_start_with_no_floor_still_only_resets_on_retry() {
+        // A forward pass over an empty floor also reads from the front, but the
+        // timer reset must stay attached to the retry CHOICE, not to the
+        // resulting bound — resetting here would starve the rate-limited retry.
+        let (after, reset) =
+            next_pass_start(false, Duration::from_millis(1), Duration::from_millis(300), &None);
+        assert_eq!(after, None);
+        assert!(!reset, "a forward pass over an empty floor is not a retry");
     }
 
     #[test]

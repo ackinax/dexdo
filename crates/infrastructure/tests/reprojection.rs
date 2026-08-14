@@ -4247,6 +4247,155 @@ async fn run_reprojection_loop_drains_pending_and_retries_deferred() {
     purge(&pool, &cleanup).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn deferred_retry_rides_the_idle_interval_timer() {
+    // IX-FAIL-01's loop leg — an UPPER bound by construction, deliberately no
+    // lower bound (see next_pass_start's doc in indexer_repo.rs: the timer's
+    // phase resets at the START of a retry pass, so a wall-clock lower bound
+    // flakes on correct code). The triple closing the row: next_pass_start
+    // units (the loop's choice of pass mode), reproject_pending_from_honors_
+    // after_and_until_bounds (the method honors the bound), and this test (a
+    // timer retry actually reaches a row no forward pass can).
+    //
+    // Choreography. A Deferred child (parent invisible) and a marker row with
+    // a chain_order ABOVE the child are seeded committed; the parent's INSERT
+    // sits in a pre-opened, uncommitted transaction with a chain_order BELOW
+    // the child's. Once the marker is processed, the first pass's SELECT is
+    // provably behind (the child earned its Deferred there), and with
+    // batch_size=1000 that pass had no second SELECT — after its clean drain
+    // the floor is at/above the marker, so a forward pass can never reach the
+    // parent below it; only the timer retry (after = None) can. Residual
+    // assumption, accepted: a sweep error in that first pass would leave the
+    // floor unset and this test vacuously green — an under-assert, not a flake.
+    // Only then is the parent committed (INSERT already executed, the COMMIT
+    // is instant); t0 = that commit. The child must be applied within
+    // t0 + 2*idle_interval + allowance: a retry whose SELECT ran before the
+    // commit legally misses it, the next one arrives on the timer, and the
+    // 600ms allowance covers pass latency + scheduler jitter on a loaded CI.
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let test = "reproj_cadence";
+    // Padded chain_orders (5f80 + zero-left-pad to 28) order the three rows as
+    // parent < child < marker by msg_id length: 18 < 20 < 21 chars.
+    let oracle_addr = format!("0:{test}_oracle");
+    let marker_oracle_addr = format!("0:{test}_marker_oracle");
+    let evlist_addr = format!("0:{test}_evlist");
+    let msg_parent = format!("{test}-par");
+    let msg_child = format!("{test}-child");
+    let msg_marker = format!("{test}-marker");
+
+    let cleanup = [
+        ("delete from oracle_event_lists where address = $1", evlist_addr.as_str()),
+        ("delete from oracles where address = $1", oracle_addr.as_str()),
+        ("delete from oracles where address = $1", marker_oracle_addr.as_str()),
+        ("delete from raw_events where msg_id = $1", msg_parent.as_str()),
+        ("delete from raw_events where msg_id = $1", msg_child.as_str()),
+        ("delete from raw_events where msg_id = $1", msg_marker.as_str()),
+    ];
+    purge(&pool, &cleanup).await;
+
+    // The child: Deferred until its parent oracle exists.
+    insert_raw(
+        &pool,
+        &msg_child,
+        &oracle_addr,
+        "Oracle.OracleEventListDeployed",
+        &json!({
+            "eventListAddress": evlist_addr,
+            "index": "1",
+            "description": "Cadence test event list",
+        }),
+    )
+    .await;
+    // The marker: standalone, applies on the first pass, chain_order above the child.
+    insert_raw(
+        &pool,
+        &msg_marker,
+        &marker_oracle_addr,
+        "RootOracle.OracleDeployed",
+        &json!({
+            "oracle": marker_oracle_addr,
+            "pubkey": "0x0000000000000000000000000000000000000000000000000000000000005678",
+            "name": format!("{test}-marker-oracle"),
+        }),
+    )
+    .await;
+
+    // The parent, INSERTed but NOT committed: invisible to every SELECT until
+    // the commit below, and below the floor from the moment it lands.
+    let mut parent_tx = pool.begin().await.expect("open parent tx");
+    sqlx::query(
+        r#"insert into raw_events
+               (msg_id, chain_order, created_at_chain, src_address, dst_address,
+                event_type, body_json, decoded)
+           values ($1, $2, to_timestamp(1700000000), $3, $3,
+                   'RootOracle.OracleDeployed', '{}'::jsonb, $4)"#,
+    )
+    .bind(&msg_parent)
+    .bind(format!("5f80{msg_parent:0>28}"))
+    .bind(&oracle_addr)
+    .bind(json!({
+        "oracle": oracle_addr,
+        "pubkey": "0x0000000000000000000000000000000000000000000000000000000000009abc",
+        "name": format!("{test}-oracle"),
+    }))
+    .execute(&mut *parent_tx)
+    .await
+    .expect("insert parent inside open tx");
+
+    let idle_interval = Duration::from_millis(300);
+    let h = tokio::spawn(repo.clone().run_reprojection_loop(idle_interval, 1000));
+
+    // Wait for the marker: proof the first pass's SELECT (and Deferred verdict
+    // on the child) is behind us and the floor is at/above the marker.
+    let marker_applied = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if processed_at_is_set(&pool, &msg_marker).await {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    assert!(marker_applied, "the marker must be applied by the first pass within 3s");
+    assert!(
+        !processed_at_is_set(&pool, &msg_child).await,
+        "the child must still be Deferred while its parent is uncommitted"
+    );
+
+    // Commit the parent; from here only the timer retry can reach it.
+    parent_tx.commit().await.expect("commit parent");
+    let t0 = tokio::time::Instant::now();
+
+    let bound = idle_interval * 2 + Duration::from_millis(600);
+    let child_applied = {
+        let deadline = t0 + bound;
+        loop {
+            if processed_at_is_set(&pool, &msg_child).await {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    assert!(
+        child_applied,
+        "the timer retry must apply the below-floor parent and its deferred child \
+         within 2 idle intervals (+allowance) of the parent's commit"
+    );
+
+    h.abort();
+    let _ = h.await;
+    purge(&pool, &cleanup).await;
+}
+
 #[tokio::test]
 async fn identical_chain_order_both_rows_eventually_drain() {
     // Verifies that two pending rows sharing the same chain_order are both

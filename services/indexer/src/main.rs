@@ -337,6 +337,28 @@ fn apply_ingest_filters(
     (edges, stats)
 }
 
+/// The cursor decision for one drained page, extracted pure so a unit can pin
+/// it (IX-CAP-09): the cursor advances to the page's `endCursor` whenever one
+/// is present — `endCursor` comes from `page_info`, not from the edges, so a
+/// page whose every edge the ingest filters dropped still advances past the
+/// noise. Without an `endCursor` the cursor stays; `retained_edges` is the
+/// POST-filter count, so only a page that still carries edges earns the warn
+/// (the return value) — a fully filtered page with no `endCursor` is a silent
+/// no-op, deliberately: recurring noise pages would otherwise flood the log.
+fn advance_cursor(
+    cursor: &mut Option<String>,
+    end_cursor: Option<String>,
+    retained_edges: usize,
+) -> bool {
+    match end_cursor {
+        Some(end) => {
+            *cursor = Some(end);
+            false
+        }
+        None => retained_edges > 0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drain_events(
     client: &GraphqlClient,
@@ -372,9 +394,7 @@ async fn drain_events(
         stats.decoded += persisted.decoded;
         stats.undecoded += persisted.undecoded;
 
-        if let Some(end) = page.page_info.end_cursor.clone() {
-            *cursor = Some(end);
-        } else if !page.edges.is_empty() {
+        if advance_cursor(cursor, page.page_info.end_cursor.clone(), page.edges.len()) {
             warn!("graphql page has edges but missing endCursor; cursor not advanced");
         }
 
@@ -485,6 +505,37 @@ mod tests {
     #[test]
     fn ignored_type_drop_warning_is_disabled_for_expected_noop_floods() {
         assert!(ignored_type_drop_warning(10, 10).is_none());
+    }
+
+    #[test]
+    fn a_fully_filtered_page_still_advances_the_cursor() {
+        // IX-CAP-09: `endCursor` is read from `page_info`, never derived from
+        // the edges, so a page the ingest filters emptied entirely must still
+        // move the cursor — otherwise the capture loop would re-fetch the same
+        // noise page forever.
+        let mut cursor = Some("c1".to_string());
+        let warn = advance_cursor(&mut cursor, Some("c2".to_string()), 0);
+        assert_eq!(cursor.as_deref(), Some("c2"), "the dropped page must be passed, not re-read");
+        assert!(!warn, "advancing is the healthy path — no warn");
+    }
+
+    #[test]
+    fn a_fully_filtered_page_without_end_cursor_stays_silent() {
+        // The current silence is pinned DELIBERATELY: the warn keys on the
+        // post-filter edge count, so a page with edges but no endCursor warns,
+        // while a fully filtered one without endCursor says nothing and leaves
+        // the cursor alone. A gateway stuck emitting such pages is visible only
+        // through the cursor-age gauge, not the log — recorded here so a future
+        // reader finds a decision, not an accident.
+        let mut cursor = Some("c1".to_string());
+        let warn = advance_cursor(&mut cursor, None, 0);
+        assert_eq!(cursor.as_deref(), Some("c1"), "no endCursor — the cursor must not move");
+        assert!(!warn, "a fully filtered page without endCursor is a silent no-op");
+
+        // Contrast case, same function: edges retained + no endCursor => warn.
+        let mut cursor2 = Some("c1".to_string());
+        assert!(advance_cursor(&mut cursor2, None, 3), "retained edges without endCursor warn");
+        assert_eq!(cursor2.as_deref(), Some("c1"));
     }
 
     #[test]
