@@ -73,6 +73,7 @@ pub struct IndexerMetrics {
     inference_orders_open: Arc<AtomicU64>,
     inference_orders_filled: Arc<AtomicU64>,
     inference_orders_cancelled: Arc<AtomicU64>,
+    inference_orders_expired: Arc<AtomicU64>,
     inference_reconcile_failures: Arc<AtomicU64>,
     inference_wedged_books: Arc<AtomicU64>,
     metrics_refresh_failures: Arc<AtomicU64>,
@@ -120,6 +121,7 @@ impl IndexerMetrics {
         let inference_orders_open = Arc::new(AtomicU64::new(0));
         let inference_orders_filled = Arc::new(AtomicU64::new(0));
         let inference_orders_cancelled = Arc::new(AtomicU64::new(0));
+        let inference_orders_expired = Arc::new(AtomicU64::new(0));
         let inference_reconcile_failures = Arc::new(AtomicU64::new(0));
         let inference_wedged_books = Arc::new(AtomicU64::new(0));
         let metrics_refresh_failures = Arc::new(AtomicU64::new(0));
@@ -283,10 +285,11 @@ impl IndexerMetrics {
         let open_cache = Arc::clone(&inference_orders_open);
         let filled_cache = Arc::clone(&inference_orders_filled);
         let cancelled_cache = Arc::clone(&inference_orders_cancelled);
+        let expired_cache = Arc::clone(&inference_orders_expired);
         let inference_orders_gauge = meter
             .u64_observable_gauge("indexer_inference_orders")
             .with_description(
-                "Resting inference orders by status: open (live depth), filled, cancelled",
+                "Resting inference orders by status: open (live depth), filled, cancelled, expired",
             )
             .with_callback(move |observer| {
                 observer.observe(
@@ -300,6 +303,10 @@ impl IndexerMetrics {
                 observer.observe(
                     cancelled_cache.load(Ordering::Relaxed),
                     &[KeyValue::new("status", "cancelled")],
+                );
+                observer.observe(
+                    expired_cache.load(Ordering::Relaxed),
+                    &[KeyValue::new("status", "expired")],
                 );
             })
             .build();
@@ -357,6 +364,7 @@ impl IndexerMetrics {
             inference_orders_open,
             inference_orders_filled,
             inference_orders_cancelled,
+            inference_orders_expired,
             inference_reconcile_failures,
             inference_wedged_books,
             metrics_refresh_failures,
@@ -456,10 +464,11 @@ impl IndexerMetrics {
 
     /// Set the values reported by `indexer_inference_orders` — the count of
     /// resting inference orders in each status.
-    pub fn set_inference_order_counts(&self, open: u64, filled: u64, cancelled: u64) {
+    pub fn set_inference_order_counts(&self, open: u64, filled: u64, cancelled: u64, expired: u64) {
         self.inference_orders_open.store(open, Ordering::Relaxed);
         self.inference_orders_filled.store(filled, Ordering::Relaxed);
         self.inference_orders_cancelled.store(cancelled, Ordering::Relaxed);
+        self.inference_orders_expired.store(expired, Ordering::Relaxed);
     }
 
     /// Set the cumulative value reported by `indexer_inference_reconcile_failures`.
@@ -566,7 +575,11 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::data::Gauge;
+    use opentelemetry_sdk::metrics::PeriodicReader;
     use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::runtime;
+    use opentelemetry_sdk::testing::metrics::InMemoryMetricExporter;
 
     use super::select_endpoint;
     use super::IndexerMetrics;
@@ -653,7 +666,7 @@ mod tests {
         metrics.set_inference_market_states(11, 22, 33);
         metrics.set_inference_reference_price_lag_seconds(444);
         metrics.set_inference_sweep_lag_seconds(555);
-        metrics.set_inference_order_counts(60, 70, 80);
+        metrics.set_inference_order_counts(60, 70, 80, 90);
         metrics.set_inference_reconcile_failures(99);
         metrics.set_inference_wedged_books(13);
         for _ in 0..5 {
@@ -679,8 +692,64 @@ mod tests {
         assert_eq!(metrics.inference_orders_open.load(Ordering::Relaxed), 60);
         assert_eq!(metrics.inference_orders_filled.load(Ordering::Relaxed), 70);
         assert_eq!(metrics.inference_orders_cancelled.load(Ordering::Relaxed), 80);
+        assert_eq!(metrics.inference_orders_expired.load(Ordering::Relaxed), 90);
         assert_eq!(metrics.inference_reconcile_failures.load(Ordering::Relaxed), 99);
         assert_eq!(metrics.inference_wedged_books.load(Ordering::Relaxed), 13);
         assert_eq!(metrics.metrics_refresh_failures.load(Ordering::Relaxed), 5);
+    }
+
+    // `setters_update_cached_values` above reads the private atomic caches
+    // directly, so it stays green even if the gauge callback forgot to call
+    // `observer.observe(..., "expired")` — the cache would still hold 40, but
+    // the exported series would silently drop the fourth data point. This
+    // test builds a real reader so the callback actually runs, and asserts on
+    // what the OTLP export path produces.
+    // `PeriodicReader::builder(_, runtime::Tokio)` spawns its background export
+    // task via `tokio::spawn` and `force_flush` blocks the calling thread on a
+    // reply from that task. On a current-thread runtime (the `#[tokio::test]`
+    // default) that spawned task can never run while the calling thread is
+    // parked in `force_flush`, so the flush — and the test — hangs forever;
+    // `flavor = "multi_thread"` gives the spawned task its own thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exported_series_carries_all_four_status_buckets() {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone(), runtime::Tokio).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let meter = provider.meter("test");
+        let metrics = IndexerMetrics::new(&meter);
+
+        metrics.set_inference_order_counts(10, 20, 30, 40);
+        provider.force_flush().expect("force flush");
+
+        let resource_metrics = exporter.get_finished_metrics().expect("finished metrics");
+        let metric = resource_metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics.iter())
+            .flat_map(|sm| sm.metrics.iter())
+            .find(|m| m.name == "indexer_inference_orders")
+            .expect("indexer_inference_orders was exported");
+        let gauge = metric
+            .data
+            .as_any()
+            .downcast_ref::<Gauge<u64>>()
+            .expect("indexer_inference_orders is a gauge");
+        assert_eq!(gauge.data_points.len(), 4, "one data point per status bucket");
+
+        let value_for = |status: &str| {
+            gauge
+                .data_points
+                .iter()
+                .find(|dp| {
+                    dp.attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == "status" && kv.value.as_str() == status)
+                })
+                .unwrap_or_else(|| panic!("no data point for status={status}"))
+                .value
+        };
+        assert_eq!(value_for("open"), 10);
+        assert_eq!(value_for("filled"), 20);
+        assert_eq!(value_for("cancelled"), 30);
+        assert_eq!(value_for("expired"), 40);
     }
 }

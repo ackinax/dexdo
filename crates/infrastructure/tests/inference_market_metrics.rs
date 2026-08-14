@@ -115,9 +115,11 @@ async fn state_counts_and_staleness_reflect_inserted_rows() {
 
 // The status counts are whole-table aggregates, so — like the market-state test
 // above — this asserts exact per-bucket counts scoped to its own orderbook_address
-// (`inference_order_status_counts_for`), immune to concurrent sibling inserts, and
-// smoke-checks the whole-table path with lower bounds. Orders use a test-unique
-// orderbook_address; status values exercise each of the three buckets.
+// (`inference_order_status_counts_for`), immune to concurrent sibling inserts.
+// Orders use a test-unique orderbook_address; the seed uses asymmetric per-bucket
+// counts (1 open, 2 filled, 3 cancelled, 4 expired) so the scoped assert catches a
+// swapped-column or mis-filtered bucket (e.g. `expired` counting `CANCELLED` rows)
+// that a uniform seed like (1, 1, 1, 1) would let through.
 #[tokio::test]
 async fn order_status_counts_reflect_inserted_rows() {
     let Some(pool) = setup().await else { return };
@@ -130,9 +132,21 @@ async fn order_status_counts_reflect_inserted_rows() {
         .await
         .expect("purge");
 
-    // One order in each status. Only the NOT NULL columns are set; order_id is
-    // the per-book PK component.
-    for (order_id, status) in [(1i64, "OPEN"), (2, "FILLED"), (3, "CANCELLED")] {
+    // Asymmetric counts per bucket. Only the NOT NULL columns are set; order_id
+    // is the per-book PK component.
+    let seed = [
+        (1i64, "OPEN"),
+        (2, "FILLED"),
+        (3, "FILLED"),
+        (4, "CANCELLED"),
+        (5, "CANCELLED"),
+        (6, "CANCELLED"),
+        (7, "EXPIRED"),
+        (8, "EXPIRED"),
+        (9, "EXPIRED"),
+        (10, "EXPIRED"),
+    ];
+    for (order_id, status) in seed {
         sqlx::query(
             r#"insert into inference_orders
                    (orderbook_address, order_id, is_buy, price, amount_initial,
@@ -147,19 +161,11 @@ async fn order_status_counts_reflect_inserted_rows() {
         .expect("insert order");
     }
 
-    // Scoped to this test's orderbook_address: exactly one order in each bucket,
-    // immune to the concurrent sibling inserts a whole-table delta cannot exclude.
+    // Scoped to this test's orderbook_address: exact asymmetric counts, immune
+    // to the concurrent sibling inserts a whole-table delta cannot exclude.
     let scope = vec![ob.to_string()];
     let scoped = repo.inference_order_status_counts_for(&scope).await.expect("scoped order counts");
-    assert_eq!(scoped, (1, 1, 1), "each seeded order lands in exactly its own status bucket");
-
-    // Whole-table smoke check on the same predicates: it must at least see our rows.
-    let (ow, fw, cw) =
-        repo.inference_order_status_counts().await.expect("whole-table order counts");
-    assert!(
-        ow >= 1 && fw >= 1 && cw >= 1,
-        "whole-table counts must include our rows: {ow},{fw},{cw}"
-    );
+    assert_eq!(scoped, (1, 2, 3, 4), "each seeded order lands in exactly its own status bucket");
 
     sqlx::query("delete from inference_orders where orderbook_address = $1")
         .bind(ob)

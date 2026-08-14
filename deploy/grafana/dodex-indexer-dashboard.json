@@ -706,7 +706,7 @@
     {
       "type": "timeseries",
       "title": "Resting orders by status",
-      "description": "indexer_inference_orders{status}: open (live order-book depth), filled, cancelled.",
+      "description": "indexer_inference_orders{status}: open (live order-book depth), filled, cancelled, expired.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
       "id": 21,
@@ -719,7 +719,8 @@
         "overrides": [
           { "matcher": { "id": "byName", "options": "open" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
           { "matcher": { "id": "byName", "options": "filled" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "cancelled" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
+          { "matcher": { "id": "byName", "options": "cancelled" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "expired" }, "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] }
         ]
       },
       "options": {

@@ -201,15 +201,16 @@ impl IndexerRepository {
     const NO_VERDICT_WHERE: &'static str = r#"m.last_reconciled_at is null
                   and m.superseded_at is null
                   and (m.last_reconcile_failed_at is null or m.last_reconcile_error is null)"#;
-    /// Shared `count(*) filter (...)` projection for the three inference-order
-    /// status buckets, in `(open, filled, cancelled)` order. Shared by
+    /// Shared `count(*) filter (...)` projection for the four inference-order
+    /// status buckets, in `(open, filled, cancelled, expired)` order. Shared by
     /// `inference_order_status_counts` (whole-table) and
     /// `inference_order_status_counts_for` (scoped) for the same anti-drift
     /// reason as `MARKET_STATE_COUNTS_SELECT`.
     const ORDER_STATUS_COUNTS_SELECT: &'static str = r#"
         count(*) filter (where status = 'OPEN') as open,
         count(*) filter (where status = 'FILLED') as filled,
-        count(*) filter (where status = 'CANCELLED') as cancelled"#;
+        count(*) filter (where status = 'CANCELLED') as cancelled,
+        count(*) filter (where status = 'EXPIRED') as expired"#;
     /// Shared WHERE-clause fragment for "a `raw_events` row the projection loop
     /// will pick up": unprocessed, typed and decoded. `count_pending_projection`
     /// (whole-table), `projection_lag_seconds` (age of the oldest such row) and
@@ -1033,13 +1034,13 @@ impl IndexerRepository {
     }
 
     /// Resting inference orders grouped by status, backing
-    /// `indexer_inference_orders`. Returns `(open, filled, cancelled)` — the
-    /// three values of the `inference_orders.status` check constraint. `OPEN` is
-    /// live depth; `FILLED` and `CANCELLED` are terminal. The three buckets
+    /// `indexer_inference_orders`. Returns `(open, filled, cancelled, expired)`
+    /// — the four values of the `inference_orders.status` check constraint (see
+    /// `migrations/0002_inference_order_expired.sql`). The four buckets
     /// partition the table.
-    pub async fn inference_order_status_counts(&self) -> anyhow::Result<(i64, i64, i64)> {
+    pub async fn inference_order_status_counts(&self) -> anyhow::Result<(i64, i64, i64, i64)> {
         let sql = format!("select {} from inference_orders", Self::ORDER_STATUS_COUNTS_SELECT);
-        let row: (i64, i64, i64) = sqlx::query_as(&sql)
+        let row: (i64, i64, i64, i64) = sqlx::query_as(&sql)
             .fetch_one(&self.pool)
             .await
             .context("inference order status counts")?;
@@ -1053,12 +1054,12 @@ impl IndexerRepository {
     pub async fn inference_order_status_counts_for(
         &self,
         scope: &[String],
-    ) -> anyhow::Result<(i64, i64, i64)> {
+    ) -> anyhow::Result<(i64, i64, i64, i64)> {
         let sql = format!(
             "select {} from inference_orders where orderbook_address = any($1)",
             Self::ORDER_STATUS_COUNTS_SELECT
         );
-        let row: (i64, i64, i64) = sqlx::query_as(&sql)
+        let row: (i64, i64, i64, i64) = sqlx::query_as(&sql)
             .bind(scope)
             .fetch_one(&self.pool)
             .await
