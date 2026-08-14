@@ -169,6 +169,34 @@ async fn pending_events_gate_detects_unprojected_rows() {
         .await
         .unwrap();
     assert!(!r.pending_events_exist(ob).await.unwrap());
+    // Fourth state — the narrowing conjuncts (IX-REC-15). An undecodable row
+    // (event_type NULL, decoded NULL, processed_at NULL) must NOT close the
+    // sweep gate: it can never be projected, so it would wedge the sweep
+    // forever (the rationale documented at inference_read_repo.rs and
+    // indexer.md). The READ gate deliberately counts exactly such rows — its
+    // half of the asymmetry is pinned by
+    // gate_refuses_while_any_message_for_the_book_is_unprojected
+    // (inference_orders_repo.rs); this is the sweep half of IX-REC-28.
+    sqlx::query(
+        "insert into raw_events (msg_id, chain_order, src_address, event_type, body_json, decoded, processed_at)
+                 values ('pg-undecodable','co-u', $1, null,'{}'::jsonb, null, null)",
+    )
+    .bind(ob)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !r.pending_events_exist(ob).await.unwrap(),
+        "an undecodable row must not close the sweep gate — it can never be projected"
+    );
+    // Unlike pg-1 (left processed, harmless), this row is pending forever and
+    // its fresh created_at would land the book in the e2e observer's
+    // inference_books_with_events_since window — delete it, not just this
+    // test's next run's purge.
+    sqlx::query("delete from raw_events where msg_id='pg-undecodable'")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1612,6 +1640,63 @@ async fn sweep_repairs_token_contract_and_deadline_independently() {
     .await
     .unwrap();
     assert_eq!(before, after, "a repaired row must not be rewritten on every cycle");
+}
+
+#[tokio::test]
+async fn repair_conflates_a_sell_null_with_a_buy_null_when_the_getter_answers_zero() {
+    // IX-REC-18, pinned deliberately (not fixed). A SELL with a NULL
+    // token_contract whose getter answers the zero address is indistinguishable
+    // from a BUY's intentional NULL: the repair consults the getter's normalized
+    // answer, never the row's own is_buy (neither the candidate SELECT, nor the
+    // needs-nothing skip, nor the UPDATE reads it). So the SELL gap stays — no
+    // repair, no warn, no counter — and read-gate arm 1 (inference_read_repo.rs)
+    // is what keeps serving MarketInconsistent for exactly this row. Changing
+    // this is a reconciler-semantics decision, not a test's; the row's
+    // normative "repair must close the SELL gap" half stays unimplemented and
+    // the matrix keeps IX-REC-18 amber.
+    let Some(pool) = setup().await else { return };
+    let _guard = AT_HEAD_GATE_LOCK.lock().await;
+    let ob = "0:t_sweep_conflation";
+    seed_market(&pool, ob, true).await;
+    set_at_head(&pool, true).await;
+    sqlx::query("delete from raw_events where src_address=$1")
+        .bind(ob)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    open_sell_order(&pool, ob, 1).await; // SELL with NULL TC — the gap repair SHOULD close
+
+    let g = std::sync::Arc::new(FnGetter(|name: &str, _a: &Value| match name {
+        "getQueueSize" => Ok(json!({ "value0": "0" })),
+        "getStats" => Ok(json!({ "nextOrderId": "9" })),
+        // The getter answers what a BUY would answer: zero TC, zero deadline.
+        "getOrder" => Ok(json!({ "amount": "5", "tokenContract": ZERO_ADDRESS, "deadline": "0" })),
+        _ => Ok(json!({})),
+    }));
+    let r = InferenceReconciler::for_test_with_getter(pool.clone(), g);
+
+    let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "select updated_at from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    r.run_sweep_step(ob, "boc", false).await.unwrap();
+
+    let (tc, dl, after): (Option<String>, Option<String>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as(
+            "select token_contract, deadline::text, updated_at from inference_orders \
+             where orderbook_address=$1 and order_id=1",
+        )
+        .bind(ob)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(tc.is_none(), "the SELL's NULL token_contract stays NULL — the conflation");
+    assert!(dl.is_none(), "zero deadline normalizes to nothing to write");
+    assert_eq!(before, after, "no repair happened: the row was not touched at all");
 }
 
 #[tokio::test]
