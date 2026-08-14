@@ -212,6 +212,9 @@ mod tests {
     // defaults could not tell the difference, hence non-zero sentinels).
     #[tokio::test]
     async fn refresh_once_on_a_closed_pool_freezes_gauges_and_counts_eight_failures() {
+        // `make test` creates .env but does not export it; without this load
+        // the test silently skips under the canonical local flow.
+        let _ = dotenvy::dotenv();
         let url = match std::env::var("TEST_DATABASE_URL") {
             Ok(v) if !v.is_empty() => v,
             _ => {

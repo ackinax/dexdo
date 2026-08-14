@@ -13,3 +13,9 @@ dodex-infrastructure = { path = "../../crates/infrastructure" }
 dodex-logging = { path = "../../crates/logging" }
 dodex-metrics = { path = "../../crates/metrics" }
 
+# Dev-only: the DB-gated refresh-failure test reads TEST_DATABASE_URL from
+# .env, which `make test` creates but does not export — the same dotenvy
+# contract every other DB-gated test in the repo follows.
+[dev-dependencies]
+dotenvy.workspace = true
+
