@@ -220,10 +220,11 @@ async fn a_fail_closed_503_is_retryable_and_a_bad_request_is_not() {
     //
     // The URL here uses `tokenContract=` ON PURPOSE: the gate on unprojected
     // rows only fires when `token_contract.is_some() && side != BUY &&
-    // statuses ∋ LIVE` (the arm-1 predicate in
-    // `inference_read_repo::build_snapshot_query` — named, not line-numbered,
-    // because these references have drifted twice already). No scenario phase
-    // builds that shape; this is the only test that does.
+    // statuses ∋ LIVE` — the request-shape guard in
+    // `inference_read_repo::list_inference_orders_impl` (`asks_about_tc &&
+    // scopes_live_sells`), which gates all three fail-closed arms rather than
+    // being one of them. No scenario phase builds that shape; this is the only
+    // test that does.
     let Some((service, pool, _kek, _pn)) = common::setup().await else { return };
     let ob = "0:rmp_gate";
     purge(&pool, ob).await;

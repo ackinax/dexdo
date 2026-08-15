@@ -128,9 +128,12 @@ async fn the_pending_window_excludes_rows_ingested_before_the_run() {
     //
     // Exact sets come from the SCOPED variant, and the global counter is asserted
     // only one-sidedly (`>= 1`) further down. That split is deliberate:
-    // `count_undecodable_since` is the only method here without a scope, so any
-    // claim about ITS exact value — including a delta between two readings — is at
-    // the mercy of an outside writer. The competitor is known by name: `capture.rs`
+    // `count_undecodable_since` returns a bare count, so unlike the address list
+    // beside it its result cannot be narrowed to this test's rows after the fact
+    // (`pending_projection_since` is unscoped too, but it returns per-type rows the
+    // `count_of` closure above filters). Any claim about ITS exact value —
+    // including a delta between two readings — is therefore at the mercy of an
+    // outside writer. The competitor is known by name: `capture.rs`
     // (`persist_page_handles_mixed_decodable_and_undecodable_edges`) inserts an
     // undecodable row and then purges it, and a purge landing between two readings
     // breaks a delta even with a perfectly working window.

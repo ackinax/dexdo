@@ -150,6 +150,12 @@ async fn print_diagnostics(repo: &IndexerRepository, since: i64, elapsed: Durati
     // `[]` under `unwrap_or_default`, and "nobody is failing" is the single most
     // reassuring line this diagnostic emits. Same reason `count_undecodable_since`
     // above carries a `-1` sentinel.
+    //
+    // The cover is partial and the limit is worth knowing: it catches THIS query
+    // failing. If `inference_books_with_events_since` failed instead, `books` is
+    // `[]`, this query honestly returns `Ok([])` for an empty scope, and the same
+    // reassuring line appears — with `books in window 0` beside it as the only
+    // tell.
     let failing = match repo.inference_failing_books(&books).await {
         Ok(rows) => format!("{rows:?}"),
         Err(err) => format!("<query failed: {err}>"),

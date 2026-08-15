@@ -52,16 +52,19 @@ pub enum Probe<T> {
 /// TIME rather than time spent polling: a slow chain eats into it before the
 /// first read phase ever runs.
 ///
-/// WHERE the clock starts differs by binary, and the difference is load-bearing
-/// for the ceiling below. `e2e_inference` starts it ahead of every chain wait,
-/// as decision E describes. `e2e_inference_clob` and `e2e_inference_orders`
-/// start it AFTER their `wait_inference_book_live` — a read phase cannot
-/// possibly succeed before the book is live, so counting that wait against the
-/// read budget would spend it on a precondition. The cost is that their ceiling
-/// is `book-live wait + 240s + trailing chain waits`, which must stay under
-/// nextest's 600s `terminate-after`; at a ≤90s book-live wait it does, with
-/// room. Aligning all three either way is an open decision that needs a stand
-/// run to settle — do not "fix" one side to match the other from reading alone.
+/// WHERE the clock starts differs by binary, two to one. `e2e_inference` and
+/// `e2e_inference_clob` start it ahead of every chain wait, as decision E
+/// describes — in clob the wait sits inside the `deploy_book` helper, which is
+/// called after `ReadBudget::start()`, so reading the helper's own line number
+/// as the order is a mistake this comment made once already.
+/// `e2e_inference_orders` is the exception: it starts the clock after its
+/// `wait_inference_book_live`, so its ceiling is
+/// `max(chain-so-far, 240s) + trailing chain waits` rather than the plain sum —
+/// with up to ~290s of chain before the first read phase there, the budget is
+/// the smaller term. That lands near 380s, under nextest's 600s
+/// `terminate-after`, with room. Aligning it with the other two is an open
+/// decision that needs a stand run to settle — do not "fix" one side to match
+/// the other from reading alone.
 ///
 /// The worst case is therefore not the sum `chain + 240s`;
 /// it is `max(chain-so-far, 240s)` at the point the last read phase starts,
