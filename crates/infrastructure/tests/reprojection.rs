@@ -4372,7 +4372,15 @@ async fn deferred_retry_rides_the_idle_interval_timer() {
     parent_tx.commit().await.expect("commit parent");
     let t0 = tokio::time::Instant::now();
 
-    let bound = idle_interval * 2 + Duration::from_millis(600);
+    // The bound is deliberately loose. What this test proves is that a timer retry
+    // REACHES a row no forward pass can — the parent sits below the floor — and how
+    // promptly it arrives is not asserted here and cannot be: the timer's phase
+    // resets at the start of a retry pass, which is why the lower half of the claim
+    // is carried by the `next_pass_start` units instead. A tight wall-clock bound on
+    // a current_thread runtime sharing one Postgres with the rest of the suite buys
+    // no extra proof and flakes under load; six intervals plus two seconds is still
+    // orders of magnitude below a broken timer, which never fires at all.
+    let bound = idle_interval * 6 + Duration::from_secs(2);
     let child_applied = {
         let deadline = t0 + bound;
         loop {

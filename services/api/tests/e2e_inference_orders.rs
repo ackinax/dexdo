@@ -319,20 +319,62 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
         signer(),
     )
     .await;
-    // Give it the time a placement that worked would have needed.
-    tokio::time::sleep(Duration::from_secs(20)).await;
 
-    let after_stale = dex.inference_get_stats(&ob).await.expect("stats after the expired buy");
-    if after_stale.order_count != before_stale.order_count {
+    // A POSITIVE CONTROL, not a wait. The claim here is a negative — the book
+    // must not rest a buy whose deadline has passed — and a fixed sleep proves
+    // it only if the chain is never slower than the sleep. It is not: on a
+    // loaded stand the stale placement can land after the window and the test
+    // goes green over a real defect. So a placement that MUST work is issued
+    // after it, and the counters are polled until THAT one moves them. Once a
+    // later message has been processed, the earlier one demonstrably had its
+    // chance, and the assertions below are about the book's verdict rather than
+    // about the clock. `finish` cancels every resting order, so the control
+    // leaves nothing behind.
+    let control_deadline = now_unix() + 3600;
+    place_buy(
+        &dex,
+        &note.address,
+        &model_hash,
+        WORSE_PRICE,
+        WORSE_ESCROW,
+        control_deadline,
+        signer(),
+    )
+    .await;
+
+    let mut after_stale = None;
+    for _ in 0..POLL_TICKS {
+        let stats = dex.inference_get_stats(&ob).await.expect("stats while polling the control");
+        if stats.next_order_id > before_stale.next_order_id {
+            after_stale = Some(stats);
+            break;
+        }
+        tokio::time::sleep(POLL_TICK).await;
+    }
+    let Some(after_stale) = after_stale else {
         failures.push(format!(
-            "the book rested a buy whose deadline had passed: order count {} -> {}",
+            "the control placement never moved nextOrderId within {}s — this run measured the \
+             chain, not the deadline check, so the stale-deadline claim is unproven rather \
+             than disproven",
+            POLL_TICKS as u64 * POLL_TICK.as_secs()
+        ));
+        finish(&dex, &note.address, &model_hash, signer(), failures).await;
+        return;
+    };
+
+    // Both counters moved by EXACTLY the control. A move of two means the stale
+    // buy rested alongside it.
+    if after_stale.order_count != before_stale.order_count + 1 {
+        failures.push(format!(
+            "order count moved from {} to {} — the control placement accounts for exactly one, \
+             so anything else means the book also rested the buy whose deadline had passed",
             before_stale.order_count, after_stale.order_count
         ));
     }
-    if after_stale.next_order_id != before_stale.next_order_id {
+    if after_stale.next_order_id != before_stale.next_order_id + 1 {
         failures.push(format!(
-            "the book gave an id to a buy whose deadline had passed: next id {} -> {}; the id is \
-             assigned past the validation that was supposed to refuse it",
+            "next id moved from {} to {} — the control placement accounts for exactly one. The \
+             stale buy is refused before tvm.accept(), so it must never take an id",
             before_stale.next_order_id, after_stale.next_order_id
         ));
     }
