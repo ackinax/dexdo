@@ -14,7 +14,11 @@
 
 comment on column inference_orders.deadline is
     'Unix seconds after which the book may expire this order; NULL when the chain '
-    'value is 0, i.e. good-till-cancel. Never compare it to the clock to derive a '
+    'value is 0. NULL means good-till-cancel only on a BUY: the contract rejects a '
+    'zero-deadline SELL offer as malformed, so NULL on a SELL row is missing data, '
+    'not a GTC ask. A subscription BUY is not a third case — its term is fixed at one '
+    'month in the contract and the order carries no duration of its own, so its NULL '
+    'is the GTC one and is permanent. Never compare it to the clock to derive a '
     'status — elapsed time alone closes nothing. The single exception is the '
     'InferenceRefunded projector: the chain has already removed the order there, and '
     'the deadline only says whether the cause was expiry (continuation expiry emits '

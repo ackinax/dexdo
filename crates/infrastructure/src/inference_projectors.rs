@@ -28,7 +28,9 @@ pub(crate) const ZERO_ADDRESS: &str =
     "0:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Map the chain's "absent" encodings onto SQL NULL: a BUY placement carries the zero
-/// address for `tokenContract`, and a resting SELL carries deadline 0.
+/// address for `tokenContract`, and a GTC BUY carries deadline 0. Not a SELL — the
+/// contract rejects a zero-deadline offer as malformed, so a NULL `deadline` on a SELL
+/// row is a gap the reconciler probe fills, never an intentional value.
 pub(crate) fn non_zero_address(raw: Option<&str>) -> Option<&str> {
     raw.filter(|a| *a != ZERO_ADDRESS)
 }
@@ -142,8 +144,9 @@ async fn upsert_resting_order(
                    amount_remaining = excluded.amount_remaining,
                    is_subscription = excluded.is_subscription,
                    note_address = excluded.note_address,
-                   -- NULL-preserving: a replayed SubscriptionPlaced carries no deadline,
-                   -- and neither may erase a value the reconciler recovered from chain.
+                   -- NULL-preserving: a replayed placement may carry NULL where the
+                   -- reconciler has since recovered a value from chain, and a replay
+                   -- may never erase it.
                    token_contract = coalesce(excluded.token_contract, inference_orders.token_contract),
                    deadline = coalesce(excluded.deadline, inference_orders.deadline),
                    status = 'OPEN',
@@ -404,12 +407,15 @@ async fn apply_filled_decrement(
 }
 
 /// Records the deal link a `Filled` uniquely carries: the TokenContract
-/// (`sellerTC`) ↔ its market (`orderbook_address`), seller note (the SELL leg,
-/// `is_buy=false`), and buyer note (`buyerNote`). Upserts so the row survives
+/// (`sellerTC`) ↔ its market (`orderbook_address`), seller note (`sellerNote` from
+/// the event, falling back to a walk of the SELL leg when the event predates the
+/// field), and buyer note (`buyerNote`). Upserts so the row survives
 /// whether the deal was first seen here or via an earlier TokenContract.* event.
-/// On a well-formed `Filled`, `sellerTC` is always present; its absence signals
-/// ABI drift, so that one case alone is logged and skipped with `Ok(())` (not
-/// `Err`): `apply_filled_decrement` has already mutated rows in this transaction,
+/// On a well-formed `Filled`, `sellerTC` is always present and non-zero. It reaches
+/// this function through `non_zero_address`, so `None` here covers two chain states
+/// at once — the field missing (ABI drift) and the field carrying the zero address —
+/// which is why the log names the observation rather than guessing the cause. Either
+/// way that one case is logged and skipped with `Ok(())` (not `Err`): `apply_filled_decrement` has already mutated rows in this transaction,
 /// and failing the event over a decoder/ABI mismatch would defer it forever. A
 /// genuine DB error in the queries below still propagates — the reprojection
 /// savepoint isolates and retries the event.
@@ -421,7 +427,7 @@ async fn link_deal_from_filled(
         warn!(
             orderbook_address = %f.ob,
             chain_order = %f.chain_order,
-            "InferenceFilled event missing mandatory sellerTC field; inference_deals orderbook/seller link skipped — possible ABI drift"
+            "InferenceFilled carried no usable sellerTC (field absent, or present as the zero address); inference_deals orderbook/seller link skipped"
         );
         return Ok(());
     };
@@ -628,9 +634,12 @@ pub async fn repair_expired_inference_orphan(
                     "inference Filled orphan past cutoff: neither leg present, trade direction unrecoverable; match omitted from the public tape",
                 ),
             }
-            // The Filled carries sellerTC + buyerNote; record the deal link even on
-            // the orphan path (orderbook + buyer are leg-independent; seller resolves
-            // from the SELL leg when present) — the normal deferred path never reruns.
+            // The Filled carries sellerTC + sellerNote + buyerNote; record the deal
+            // link even on the orphan path — every one of them comes off the event
+            // itself, which is why this works with no leg present at all. The SELL-leg
+            // walk is only the fallback for events older than the `sellerNote` field,
+            // and it is exactly the case the orphan path cannot satisfy. The normal
+            // deferred path never reruns.
             link_deal_from_filled(tx, &f).await?;
             outcome
         }

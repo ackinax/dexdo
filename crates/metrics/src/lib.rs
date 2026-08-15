@@ -6,8 +6,9 @@
 //! path, and so the OpenTelemetry dependency stays out of crates that don't
 //! emit metrics.
 //!
-//! Exposes `orders_created_event_cnt` and `order_partially_filled_event_cnt`
-//! as observable counters pushed over OTLP. When no OTLP endpoint env var is
+//! Exposes nineteen observable counters and gauges pushed over OTLP — ingestion,
+//! the projection pipeline, the DB pool and the inference markets; the catalogue
+//! with what each one measures is in `docs/tech-specs/indexer.md`. When no OTLP endpoint env var is
 //! set, `init()` returns `None` and nothing is collected.
 
 use std::env;
