@@ -347,20 +347,30 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
                     GetOutcome::Fatal(why) => Probe::Fatal(why),
                     GetOutcome::Ok(body) => {
                         let all = body["orders"].as_array().cloned().unwrap_or_default();
-                        // Poll for PRESENCE of the fact — the order left OPEN,
+                        // Poll for PRESENCE of the fact — the order left `LIVE`,
                         // i.e. some terminal verdict was projected — and leave
                         // WHICH verdict to the asserts below. Requiring
                         // "CANCELLED" here instead would report a wrong terminal
                         // status (an EXPIRED where a CANCELLED belongs) as an
                         // expired budget, which names the indexer's speed for
                         // what is actually a projector defect.
+                        //
+                        // `LIVE`, not `OPEN`: `OPEN` is the DB value, and the
+                        // wire carries the public name
+                        // (`OrderStatus::as_public`). Comparing against `OPEN`
+                        // here is always true, which would make this poll return
+                        // on the placement itself and drop the wait for the
+                        // cancel entirely — see the neighbour check below, which
+                        // reads `LIVE` for the same reason.
                         let settled = all.iter().find(|o| {
                             o["orderId"].as_str() == Some(want.as_str())
-                                && o["status"].as_str() != Some("OPEN")
+                                && o["status"].as_str() != Some("LIVE")
                         });
                         match settled {
                             Some(_) => Probe::Ready(all),
-                            None => Probe::Pending(format!("order {want} still OPEN or absent")),
+                            None => Probe::Pending(format!(
+                                "order {want} still LIVE or absent from /orders"
+                            )),
                         }
                     }
                 }

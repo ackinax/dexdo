@@ -143,11 +143,18 @@ async fn snapshot(repo: &IndexerRepository, since: i64) -> anyhow::Result<Result
 async fn print_diagnostics(repo: &IndexerRepository, since: i64, elapsed: Duration) {
     let books = repo.inference_books_with_events_since(since).await.unwrap_or_default();
     let undecodable = repo.count_undecodable_since(since).await.unwrap_or(-1);
-    let failing = repo.inference_failing_books(&books).await.unwrap_or_default();
+    // Rendered, not defaulted: an empty list and a failed query both print as
+    // `[]` under `unwrap_or_default`, and "nobody is failing" is the single most
+    // reassuring line this diagnostic emits. Same reason `count_undecodable_since`
+    // above carries a `-1` sentinel.
+    let failing = match repo.inference_failing_books(&books).await {
+        Ok(rows) => format!("{rows:?}"),
+        Err(err) => format!("<query failed: {err}>"),
+    };
     eprintln!(
         "observer: {}s; books in window {}; undecodable rows {undecodable} \
          (diagnostic, not a failure; -1 means the query itself failed); \
-         failing with a reason: {failing:?}",
+         failing with a reason: {failing}",
         elapsed.as_secs(),
         books.len()
     );

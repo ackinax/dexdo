@@ -119,6 +119,12 @@ indexed data; the indexer rebuilds the read-model from chain with no operator
 backfill step, but market-data endpoints will read empty until ingestion
 catches back up (see [Verify](#verify)).
 
+The inference-indexer waves edited migrations `0005`–`0007` in place while they
+were still unreleased; production and `dev` never recorded their checksums, but
+a stand or long-lived test database that ran an earlier wave branch does need
+this wipe. See
+[`docs/migrations/wave6-0005-0007-rewrite.md`](../../docs/migrations/wave6-0005-0007-rewrite.md).
+
 ### Rollout order: stop the stack, then wipe, then deploy
 
 Stop the running stack **before** wiping the database, and only deploy the

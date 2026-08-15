@@ -249,9 +249,9 @@ async fn a_verdict_needs_a_reason_and_a_superseded_book_needs_none() {
     let failing_without = "0:obsq_failing_without";
     let superseded = "0:obsq_superseded";
     let discovering = "0:obsq_discovering";
-    let recovered = "0:obsq_recovered";
+    let broke_after_visible = "0:obsq_broke_after_visible";
     let scope: Vec<String> =
-        [visible, failing_with, failing_without, superseded, discovering, recovered]
+        [visible, failing_with, failing_without, superseded, discovering, broke_after_visible]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -261,11 +261,16 @@ async fn a_verdict_needs_a_reason_and_a_superseded_book_needs_none() {
     seed_book(&pool, failing_without, false, true, None, false).await;
     seed_book(&pool, superseded, false, false, None, true).await;
     seed_book(&pool, discovering, false, false, None, false).await;
-    // Failed once, reconciled since — and still carrying the old text, because
-    // 0006 deliberately does not clear it on success. This is the common shape
-    // on the stand, not a corner case: `NoBoc` stamps a failure on practically
-    // every book before its first BOC.
-    seed_book(&pool, recovered, true, true, Some("NoBoc"), false).await;
+    // Visible AND carrying a failure mark. On chain this shape means one thing
+    // only — the book worked and then broke: the visibility stamp
+    // (`advance_sweep_and_maybe_stamp`) clears `last_reconcile_failed_at` in the
+    // same UPDATE, so "failed, then recovered through discovery" cannot produce
+    // it, while `stamp_failure` writes the mark without touching
+    // `last_reconciled_at`. It is also the class no gauge can show: the
+    // `failing` bucket counts this book as `visible`. Hence it MUST appear in the
+    // observer's list below — hiding it would leave the most alarming state with
+    // no line of output anywhere.
+    seed_book(&pool, broke_after_visible, true, true, Some("getOrder reverted"), false).await;
 
     let repo = IndexerRepository::new(pool.clone());
     let mut without = repo.inference_books_without_verdict(&scope).await.unwrap();
@@ -280,12 +285,15 @@ async fn a_verdict_needs_a_reason_and_a_superseded_book_needs_none() {
     let failing = repo.inference_failing_books(&scope).await.unwrap();
     assert_eq!(
         failing,
-        vec![(failing_with.to_string(), "getVersion reverted".to_string())],
-        "the printed failing list carries the reason, and holds ONLY books that are \
-         still invisible: `recovered` reconciled after its failure and must not be \
-         reported as failing just because 0006 keeps the old text. Without the \
-         `last_reconciled_at is null` clause this list disagrees with the `failing` \
-         bucket of indexer_inference_markets and the observer names healthy books"
+        vec![
+            (broke_after_visible.to_string(), "getOrder reverted".to_string()),
+            (failing_with.to_string(), "getVersion reverted".to_string()),
+        ],
+        "the printed failing list carries the reason and is deliberately WIDER than \
+         the `failing` gauge bucket: it must hold the never-visible book AND the one \
+         that broke after becoming visible. Adding `last_reconciled_at is null` here \
+         to match the bucket would drop the second — the class no gauge can show, \
+         since the bucket counts it as `visible`"
     );
 
     sqlx::query("delete from inference_markets where orderbook_address = any($1)")

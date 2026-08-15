@@ -1281,13 +1281,24 @@ impl IndexerRepository {
     /// stamps a failure, and without the distribution of reasons "failing with a
     /// reason" reads stricter than it actually is.
     ///
-    /// `last_reconciled_at is null` is part of the predicate for the same reason
-    /// it is part of `MARKET_STATE_COUNTS_SELECT`'s `failing` bucket, and this
-    /// list must agree with that gauge. The error text is deliberately NOT
-    /// cleared on success (see `migrations/0006_inference_reconcile_error.sql`),
-    /// and `NoBoc` stamps a failure on practically every book before its first
-    /// BOC — so without this clause the observer would print books that
-    /// reconciled successfully an hour ago as currently failing.
+    /// Deliberately WIDER than `MARKET_STATE_COUNTS_SELECT`'s `failing` bucket:
+    /// it carries no `last_reconciled_at is null`. A book that became visible and
+    /// only then started failing is the most alarming class there is, and it is
+    /// the one the gauge cannot show — the bucket counts it as `visible`. It
+    /// reaches this list because `stamp_failure` writes the mark without touching
+    /// `last_reconciled_at`, while the visibility stamp
+    /// (`advance_sweep_and_maybe_stamp`) clears the mark in the same UPDATE, so
+    /// "failed, then recovered through discovery" is already absent here.
+    ///
+    /// KNOWN GAP, and the reason this predicate is not tightened: a clean
+    /// *refresh* cycle does not clear the mark either, so a single transient
+    /// failure after visibility leaves a book named here until its next
+    /// discovery. The schema has no "currently failing" fact for a visible book;
+    /// until it gains one (clear the mark on a clean refresh cycle, or compare
+    /// `last_reconcile_failed_at` against `last_swept_at`/`reference_price_at`),
+    /// this list errs toward naming a recovered book rather than staying silent
+    /// about a broken one. The observer prints it as diagnostics, never fails on
+    /// it, so the cost of the false positive is a line of output.
     pub async fn inference_failing_books(
         &self,
         scope: &[String],
@@ -1296,7 +1307,6 @@ impl IndexerRepository {
             r#"select m.orderbook_address, m.last_reconcile_error
                  from inference_markets m
                 where m.orderbook_address = any($1)
-                  and m.last_reconciled_at is null
                   and m.last_reconcile_failed_at is not null
                   and m.last_reconcile_error is not null
                   and m.superseded_at is null

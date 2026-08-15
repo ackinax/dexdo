@@ -322,8 +322,9 @@ async fn inference_partial_fill_leaves_remainder() {
             }
         }
 
-        // Both legs: the taker's BUY rests with 2 ticks left out of its
-        // original 4. `buy_id` is an `Option`: the chain phase above leaves
+        // The taker leg: its BUY rests with 2 ticks left out of the original 4.
+        // The maker leg is not re-read — see the phase comment above.
+        // `buy_id` is an `Option`: the chain phase above leaves
         // it `None` when the match never funded the TokenContract, and that
         // failure is already recorded there. There is nothing to duplicate,
         // so this phase simply does not run.
