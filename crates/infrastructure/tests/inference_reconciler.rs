@@ -1856,22 +1856,136 @@ async fn a_clean_cycle_clears_a_failure_mark_left_by_an_earlier_one() {
     assert!(text_after.is_none(), "the text goes with its timestamp — a text alone is stale");
     assert!(still_visible, "clearing a failure must not touch visibility");
 
-    // Idempotent and quiet: an unmarked book is not rewritten, so a clean cycle
-    // does not churn `updated_at` on every book it touches.
-    let before: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("select updated_at from inference_markets where orderbook_address = $1")
+    // Idempotent and quiet: an unmarked book is not rewritten, so a clean pass does
+    // not churn the row of every book it touches.
+    //
+    // The witness is `xmin`, not `updated_at`. This schema has no triggers at all
+    // (`grep 'create trigger' migrations/` is empty) and `clear_failure`'s UPDATE
+    // does not set `updated_at`, so an `updated_at` comparison holds whatever the
+    // `where` clause does — it would pass with the clause deleted, which is the one
+    // thing it is supposed to catch. `xmin` is the transaction that wrote the live
+    // row version, so it changes on ANY rewrite: drop `and last_reconcile_failed_at
+    // is not null` and the UPDATE matches, writes a new version, and this goes red.
+    let before: String =
+        sqlx::query_scalar("select xmin::text from inference_markets where orderbook_address = $1")
             .bind(ob)
             .fetch_one(&pool)
             .await
             .unwrap();
     r.clear_failure(ob).await.unwrap();
-    let after: chrono::DateTime<chrono::Utc> =
-        sqlx::query_scalar("select updated_at from inference_markets where orderbook_address = $1")
+    let after: String =
+        sqlx::query_scalar("select xmin::text from inference_markets where orderbook_address = $1")
             .bind(ob)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(before, after, "clearing an unmarked book must be a full no-op");
+    assert_eq!(before, after, "clearing an unmarked book must not rewrite the row");
+
+    sqlx::query("delete from inference_markets where orderbook_address = $1")
+        .bind(ob)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+/// The two tests below hold the CALL in place, not just the query. The test above
+/// calls `clear_failure` directly, so deleting the only call site left the suite
+/// green with nothing but an unused-function warning — verified by deleting it.
+/// The call now lives at the tail of `refresh_against_boc`, which
+/// `reconcile_refresh_with_boc` reaches; `run_once`'s `Ok(_)` arm never was
+/// reachable here, because `reconcile_refresh` fetches the BOC over GraphQL.
+#[tokio::test]
+async fn a_refresh_pass_that_completes_clears_the_book_it_refreshed() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:t_refresh_clears";
+    seed_market(&pool, ob, true).await;
+    // Price DUE, sweep FRESH: the pass does real work (a re-price) and then falls
+    // through to the clear, rather than clearing after doing nothing.
+    sqlx::query(
+        "update inference_markets
+            set reference_price = 12345, reference_price_at = now() - interval '2 hours',
+                last_swept_at = now(),
+                last_reconcile_failed_at = now(), last_reconcile_error = 'getStats reverted'
+          where orderbook_address = $1",
+    )
+    .bind(ob)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let g = std::sync::Arc::new(FnGetter(|name: &str, _a: &Value| match name {
+        "getWeeklyMedianPrice" => Ok(json!({"value0":"0x270f"})),
+        _ => Ok(json!({})),
+    }));
+    InferenceReconciler::for_test_with_getter(pool.clone(), g)
+        .reconcile_refresh_with_boc(ob, "boc")
+        .await
+        .expect("a clean refresh must not error");
+
+    let (marked, text, priced): (bool, Option<String>, Option<String>) = sqlx::query_as(
+        "select last_reconcile_failed_at is not null, last_reconcile_error, reference_price::text
+           from inference_markets where orderbook_address = $1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(priced.as_deref(), Some("9999"), "the pass must have actually re-priced");
+    assert!(!marked, "a completed refresh pass must clear the mark of the book it refreshed");
+    assert!(text.is_none(), "the reason text goes with its timestamp");
+
+    sqlx::query("delete from inference_markets where orderbook_address = $1")
+        .bind(ob)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_refresh_pass_that_errors_leaves_the_mark_standing() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:t_refresh_keeps_mark";
+    seed_market(&pool, ob, true).await;
+    let stamped_at = "2020-01-01T00:00:00Z";
+    sqlx::query(
+        "update inference_markets
+            set reference_price_at = now() - interval '2 hours', last_swept_at = now(),
+                last_reconcile_failed_at = $2::timestamptz, last_reconcile_error = 'getStats reverted'
+          where orderbook_address = $1",
+    )
+    .bind(ob)
+    .bind(stamped_at)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The price refresh is the first thing the pass does and it propagates with `?`,
+    // so the clear at the tail is never reached. Without that ordering the mark
+    // would be cleared by a pass that failed — the exact false "recovered" the
+    // observer's failing-books list must never show.
+    let g = std::sync::Arc::new(FnGetter(|name: &str, _a: &Value| match name {
+        "getWeeklyMedianPrice" => Err(anyhow::anyhow!("getter unavailable")),
+        _ => Ok(json!({})),
+    }));
+    let outcome = InferenceReconciler::for_test_with_getter(pool.clone(), g)
+        .reconcile_refresh_with_boc(ob, "boc")
+        .await;
+    assert!(outcome.is_err(), "a getter error must propagate, not be swallowed into a clean pass");
+
+    let (marked, text): (bool, Option<String>) = sqlx::query_as(
+        "select last_reconcile_failed_at is not null, last_reconcile_error
+           from inference_markets where orderbook_address = $1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(marked, "a failed pass must leave the mark standing");
+    assert_eq!(
+        text.as_deref(),
+        Some("getStats reverted"),
+        "and must leave the earlier reason readable"
+    );
 
     sqlx::query("delete from inference_markets where orderbook_address = $1")
         .bind(ob)

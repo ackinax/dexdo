@@ -259,15 +259,11 @@ impl InferenceReconciler {
                     stats.skipped += 1;
                     self.stamp_failure_logged(&book.orderbook_address, Self::NO_BOC_REASON).await;
                 }
-                Ok(_) => {
-                    stats.refreshed += 1;
-                    // A refresh that completed without an error is the evidence the
-                    // mark was missing: `NoBoc` stays a failure (the account is not
-                    // on chain yet — unchanged semantics) and `Err` obviously does.
-                    // Only this arm means "the most recent cycle worked", which is
-                    // precisely what a cleared mark asserts.
-                    self.clear_failure_logged(&book.orderbook_address).await;
-                }
+                // The mark is cleared inside `refresh_against_boc`, not here: this
+                // arm is unreachable from the test suite (`reconcile_refresh` goes
+                // through the GraphQL BOC fetch), so a clear written here is a
+                // production behaviour no test can hold in place.
+                Ok(_) => stats.refreshed += 1,
                 Err(err) => {
                     stats.failed += 1;
                     self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
@@ -867,12 +863,9 @@ impl InferenceReconciler {
         Ok(())
     }
 
-    /// Stamps the reconcile-failure backoff, logging — not swallowing — a write
-    /// error. If the backoff stamp itself fails, the book keeps re-entering the
-    /// queue every tick with no cooldown, so a silent drop would hide a book
-    /// spinning without backoff. Used by `run_once` where the outcome is already
-    /// a failure and there is nothing further to propagate.
-    /// Clear the failure mark after a cycle that completed without a single `Err`.
+    /// Clear the failure mark for ONE book whose refresh pass just completed
+    /// without an error. Per book, not per cycle: the tick that clears this one
+    /// can stamp a failure on the next book in the same batch.
     ///
     /// Without this the mark means "failed at least once, ever". The visibility
     /// stamp clears it (`advance_sweep_and_maybe_stamp`), but a plain refresh never
@@ -882,15 +875,21 @@ impl InferenceReconciler {
     /// getter error after a book went visible marked it for the rest of the row's
     /// life. That ambiguity is what made the observer's failing-books predicate
     /// unwinnable: either it named recovered books, or it hid the ones that broke
-    /// after becoming visible. With this, a standing mark means "the most recent
-    /// cycle failed".
+    /// after becoming visible.
+    ///
+    /// What a standing mark means therefore depends on where the book is. For a
+    /// VISIBLE book it means the most recent refresh failed — this is its only
+    /// caller, and Queue B is the only queue a visible book enters. For a
+    /// DISCOVERING one it still means "failed at least once since seeding": Queue A
+    /// clears nothing, so a book that failed once and now keeps missing its sweep
+    /// gates (`Ok(WaitingGates)`) stays marked until the visibility stamp lands.
     ///
     /// `last_reconcile_error` is cleared together with the timestamp: 0006 keeps the
     /// text so an operator can read the last failure, and a text whose timestamp is
     /// gone is exactly the stale artefact that made the text untrustworthy.
     ///
     /// The `where` clause makes this a no-op for the common case — an unmarked book
-    /// is not rewritten, so `updated_at` does not churn on every clean cycle.
+    /// is not rewritten, so the row is not touched on every clean pass.
     pub async fn clear_failure(&self, ob: &str) -> anyhow::Result<()> {
         sqlx::query(
             "update inference_markets
@@ -911,6 +910,11 @@ impl InferenceReconciler {
         }
     }
 
+    /// Stamps the reconcile-failure backoff, logging — not swallowing — a write
+    /// error. If the backoff stamp itself fails, the book keeps re-entering the
+    /// queue every tick with no cooldown, so a silent drop would hide a book
+    /// spinning without backoff. Used where the outcome is already a failure and
+    /// there is nothing further to propagate.
     async fn stamp_failure_logged(&self, ob: &str, error: &str) {
         if let Err(e) = self.stamp_failure(ob, error).await {
             warn!(ob = %ob, ?e, "failed to stamp inference reconcile backoff");
@@ -1050,6 +1054,15 @@ impl InferenceReconciler {
             // does not touch last_swept_at, so the book stays sweep-due next tick.
             let _ = self.run_sweep_step(ob, boc, /* discovery= */ false).await?;
         }
+        // Reaching here IS the clean pass, and it is the last thing this function
+        // does — every `?` above returns early, so no path clears a mark on a book
+        // that failed. `NoBoc` never arrives (it is decided in `reconcile_refresh`
+        // before the BOC exists) and stays a failure on purpose: the account is not
+        // on chain yet. The clear lives here rather than in `run_once`'s `Ok(_)` arm
+        // because this is the deepest point both the production path and the
+        // BOC-injecting test seam pass through — in `run_once` it would be
+        // untestable, and the mark is what the observer's failing-books list reads.
+        self.clear_failure_logged(ob).await;
         Ok(DiscoveryOutcome::Stamped) // "handled" — reuse the enum; mapped to `refreshed` in run_once
     }
 

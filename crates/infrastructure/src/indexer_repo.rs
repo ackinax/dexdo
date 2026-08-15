@@ -1339,12 +1339,19 @@ impl IndexerRepository {
     /// (`advance_sweep_and_maybe_stamp`) clears the mark in the same UPDATE, so
     /// "failed, then recovered through discovery" is already absent here.
     ///
-    /// The mark means "the most recent cycle failed", which is what makes this
-    /// predicate honest without further clauses. Three writers keep it that way:
-    /// the visibility stamp clears it (`advance_sweep_and_maybe_stamp`), a clean
-    /// refresh cycle clears it (`clear_failure`), and `stamp_failure` sets it. A
-    /// book that failed and recovered therefore leaves this list on its next clean
-    /// cycle, while one that broke after becoming visible stays in it.
+    /// For a VISIBLE book the mark means "the most recent refresh failed", which is
+    /// what makes this predicate honest without further clauses. Three writers keep
+    /// it that way: the visibility stamp clears it (`advance_sweep_and_maybe_stamp`),
+    /// a refresh pass that completes clears it (`clear_failure`, at the tail of
+    /// `refresh_against_boc`), and `stamp_failure` sets it. A book that failed and
+    /// recovered therefore leaves this list on its next clean pass, while one that
+    /// broke after becoming visible stays in it.
+    ///
+    /// For a DISCOVERING book it still means "failed at least once since seeding":
+    /// Queue A clears nothing, so a book that failed and now keeps missing its sweep
+    /// gates stays named here until the visibility stamp lands. That is the weaker
+    /// reading, and it is the right one to keep — a book stuck in discovery is worth
+    /// naming whether its last tick failed or merely made no progress.
     ///
     /// `NoBoc` remains a failure on purpose: the account is not on chain yet, and
     /// the observer prints the reason text so a routine `NoBoc` reads as what it

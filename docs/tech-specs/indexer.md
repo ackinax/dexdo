@@ -500,8 +500,6 @@ exists (select 1 from oracle_events oe
            and oe.meta_reconciled_at is null)
 ```
 
-**The mark means "the most recent cycle failed", not "failed once, ever."** Three writers keep it that way for an inference book: the visibility stamp clears it (`advance_sweep_and_maybe_stamp`), a Queue B refresh that completes without an error clears it (`clear_failure`), and `stamp_failure` sets it. That matters because a visible book can never return to discovery — `select_discovery_candidates` requires `last_reconciled_at IS NULL`, and both sites that null it set `superseded_at` in the same UPDATE — so before the refresh-side clear, one transient getter error after a book went visible marked it for the rest of the row's life, and the observer's `failing` list had to choose between naming recovered books and hiding broken ones. `NoBoc` still counts as a failure: the account is not on chain yet, and the reason text is what tells a routine `NoBoc` from an outage.
-
 Two anti-starvation outcomes share the failure-backoff path with the market reconciler (`last_reconcile_failed_at`, 5-minute cooldown):
 
 - **`NoBoc`** — the OracleEventList account BOC is not yet available from the gateway.
@@ -513,6 +511,8 @@ The inference reconciler is the third reconciler — a sixth long-running indexe
 
 - **Queue A — Discovery** (`last_reconciled_at IS NULL`): newly seeded books that need identity + static columns filled.
 - **Queue B — Refresh** (already-reconciled rows): periodic re-fetch of the reference price and sweep of phantom open orders.
+
+**What a standing `last_reconcile_failed_at` means depends on which queue the book is in.** For a VISIBLE book (Queue B) it means the most recent refresh failed, not "failed once, ever". Three writers keep it that way: the visibility stamp clears it (`advance_sweep_and_maybe_stamp`), a refresh pass that reaches the end of `refresh_against_boc` clears it (`clear_failure`), and `stamp_failure` sets it. That matters because a visible book can never return to discovery — `select_discovery_candidates` requires `last_reconciled_at IS NULL`, and both sites that null it set `superseded_at` in the same UPDATE — so before the refresh-side clear, one transient getter error after a book went visible marked it for the rest of the row's life, and the observer's `failing` list had to choose between naming recovered books and hiding broken ones. For a DISCOVERING book (Queue A) the older, weaker reading still holds — "failed at least once since seeding" — because no Queue A outcome clears the mark: a book that failed once and then keeps missing its sweep gates stays marked until the visibility stamp lands. `NoBoc` counts as a failure in both queues: the account is not on chain yet, and the reason text is what tells a routine `NoBoc` from an outage.
 
 **Config knobs** (all under `indexer:` in `config/indexer.<env>.yaml`):
 
