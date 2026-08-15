@@ -52,8 +52,29 @@ test-group = 'serial-inference-reconciler'
 # would fail having said nothing about the window. Skipping when two snapshots
 # disagree — the trick used by `projection_lag_seconds_*` — therefore does not
 # apply here: only a reader has nothing to lose, and this test writes.
+#
+# `capture` is here for the same reason and was missed when this group was
+# written. Three of its tests assert `processed_at IS NULL` on rows `persist_page`
+# just wrote — that assertion IS the subject ("capture must not project"), so an
+# unbounded drain landing between the write and the read turns the test red for
+# somebody else's work. Worse than a flake for the inference case: projecting
+# `InferenceOrderPlaced` seeds `inference_markets` / `inference_orders` rows the
+# test does not know to delete, so a race leaks them into the shared database
+# permanently.
 [[profile.default.overrides]]
-filter = 'binary(observer_queries)'
+filter = 'binary(observer_queries) | binary(capture)'
+test-group = 'serial-reprojection'
+
+# Same exposure, different crate, so it cannot ride the filter above:
+# `refresh_once_on_a_live_pool_…` seeds one decoded `raw_events` row and drains it
+# through its own bounded `reproject_pending_from` to make the unknown-events
+# gauge non-zero. Between the insert and that drain the row is globally visible,
+# and `reprojection`'s unbounded drain would take it first — leaving the bounded
+# drain with nothing and the assertion on `stats.unknown` red. Scoped to the one
+# test rather than the binary: the other seventeen are pure unit tests that touch
+# no database and have no reason to queue behind anything.
+[[profile.default.overrides]]
+filter = 'binary_id(=dodex-indexer::bin/dodex-indexer) & test(refresh_once_on_a_live_pool)'
 test-group = 'serial-reprojection'
 
 [test-groups]

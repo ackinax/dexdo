@@ -87,12 +87,22 @@ async fn persist_page_stores_a_real_inference_body_as_a_decoded_row() {
     let decoder = Decoder::new().expect("decoder");
     let msg_id = "cap-real-inference-1";
     let orderbook = "0:cap_real_inference_book";
+    // The order-book rows are purged too, at BOTH ends. This test writes a globally
+    // visible pending row and then asserts it is still unprojected, so the one thing
+    // that can go wrong is somebody projecting it first — and projecting
+    // `InferenceOrderPlaced` seeds an `inference_markets` and an `inference_orders`
+    // row under this address. The nextest group makes that race impossible today;
+    // purging makes its leftovers recoverable if the group is ever loosened, instead
+    // of stranding two rows in the shared database forever.
+    let cleanup: [(&str, &str); 3] = [
+        ("delete from raw_events where msg_id = $1", msg_id),
+        ("delete from inference_orders where orderbook_address = $1", orderbook),
+        ("delete from inference_markets where orderbook_address = $1", orderbook),
+    ];
+    purge(&pool, &cleanup).await;
     purge(
         &pool,
-        &[
-            ("delete from raw_events where msg_id = $1", msg_id),
-            ("delete from indexer_cursors where stream_name = $1", INFERENCE_BODY_TEST_STREAM),
-        ],
+        &[("delete from indexer_cursors where stream_name = $1", INFERENCE_BODY_TEST_STREAM)],
     )
     .await;
 
@@ -135,7 +145,7 @@ async fn persist_page_stores_a_real_inference_body_as_a_decoded_row() {
         "body_json must hold the base64 verbatim"
     );
 
-    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
+    purge(&pool, &cleanup).await;
 }
 
 #[tokio::test]
