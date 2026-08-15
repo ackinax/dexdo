@@ -606,6 +606,13 @@ impl IndexerRepository {
         // both survive a rollback, so firing them mid-pass would double-warn the
         // same row once a later Err forces the savepointed replay.
         let mut unknown_warnings: Vec<(String, String)> = Vec::new();
+        // Same reason, same discipline, for the two counters this pass owns: an
+        // `AtomicU64` bumped inside the transaction survives its rollback, and the
+        // savepointed replay re-processes the very same rows. Bumped mid-pass, one
+        // dropped orphan would be reported as two the moment any LATER row in the
+        // batch errored — and `indexer_inference_orphans_dropped` carries an alert
+        // whose threshold is zero, so the over-count is not cosmetic.
+        let mut orphans_dropped = 0u64;
 
         for row in rows {
             stats.scanned += 1;
@@ -658,7 +665,7 @@ impl IndexerRepository {
                         };
                         match repaired {
                             Ok(()) => {
-                                self.inference_orphans_dropped.fetch_add(1, Ordering::Relaxed);
+                                orphans_dropped += 1;
                                 to_mark.push(row.id); // mark processed so it stops looping
                                 stats.applied += 1;
                             }
@@ -683,7 +690,6 @@ impl IndexerRepository {
                     unknown_warnings.push((row.msg_id.clone(), event.event_type.clone()));
                     to_mark.push(row.id);
                     stats.unknown += 1;
-                    self.unknown_events.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
                     // The optimistic transaction is now aborted; discard it and
@@ -720,10 +726,14 @@ impl IndexerRepository {
 
         Self::mark_processed(&mut tx, &to_mark).await?;
         tx.commit().await.context("reproject(fast) tx commit")?;
-        // Durably committed — now (and only now) emit the unknown-type warnings
-        // and record first-sightings, in chain_order. A crash between the commit
-        // and this loop loses only log lines (and the first-sighting dedup),
-        // never projection state: the rows are already marked processed.
+        // Durably committed — now (and only now) emit the unknown-type warnings,
+        // record first-sightings, and bump the counters, in chain_order. A crash
+        // between the commit and here loses only log lines (and the first-sighting
+        // dedup) and under-counts by one batch; before the commit it would have
+        // over-counted every batch that fell back, which is the worse direction for
+        // a counter an alert reads.
+        self.unknown_events.fetch_add(unknown_warnings.len() as u64, Ordering::Relaxed);
+        self.inference_orphans_dropped.fetch_add(orphans_dropped, Ordering::Relaxed);
         for (msg_id, event_type) in &unknown_warnings {
             self.warn_unknown(msg_id, event_type);
         }
@@ -752,6 +762,11 @@ impl IndexerRepository {
             ..Default::default()
         };
         let mut to_mark: Vec<i64> = Vec::new();
+        // Buffered until the outer commit, for the same reason as in the fast path:
+        // a savepoint release is not a commit, and an atomic bumped before the outer
+        // transaction lands survives its rollback.
+        let mut orphans_dropped = 0u64;
+        let mut unknown_seen = 0u64;
 
         for row in rows {
             stats.scanned += 1;
@@ -800,7 +815,7 @@ impl IndexerRepository {
                         match repaired {
                             Ok(()) => {
                                 sp.commit().await.context("reproject savepoint release")?;
-                                self.inference_orphans_dropped.fetch_add(1, Ordering::Relaxed);
+                                orphans_dropped += 1;
                                 to_mark.push(row.id); // mark processed so it stops looping
                                 stats.applied += 1;
                             }
@@ -827,7 +842,7 @@ impl IndexerRepository {
                     sp.commit().await.context("reproject savepoint release")?;
                     to_mark.push(row.id);
                     stats.unknown += 1;
-                    self.unknown_events.fetch_add(1, Ordering::Relaxed);
+                    unknown_seen += 1;
                 }
                 Err(err) => {
                     drop(sp);
@@ -844,6 +859,8 @@ impl IndexerRepository {
 
         Self::mark_processed(&mut tx, &to_mark).await?;
         tx.commit().await.context("reproject tx commit")?;
+        self.unknown_events.fetch_add(unknown_seen, Ordering::Relaxed);
+        self.inference_orphans_dropped.fetch_add(orphans_dropped, Ordering::Relaxed);
         Ok(stats)
     }
 

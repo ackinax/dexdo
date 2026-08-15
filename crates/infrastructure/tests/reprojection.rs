@@ -3135,6 +3135,16 @@ async fn fast_path_falls_back_and_isolates_poison_row() {
     assert!(processed_at_is_set(&pool, clean_msg).await, "clean row marked despite the fallback");
     assert!(!processed_at_is_set(&pool, poison_msg).await, "poison row stays pending");
     assert_eq!(repo.projection_fallback_count(), 1, "the batch fell back exactly once");
+    // The COUNTER gets the same treatment as the warning below, and for the same
+    // reason: the rolled-back fast pass saw this row too. An `AtomicU64` bumped
+    // inside the transaction survives its rollback, so counting at the match arm
+    // reports one unknown event as two whenever a later row in the batch forces the
+    // replay. This repo is freshly constructed, so 1 is its whole history.
+    assert_eq!(
+        repo.unknown_events_count(),
+        1,
+        "one unknown row, one count — the rolled-back fast pass must not have counted it too"
+    );
 
     let captured: Vec<CapturedEvent> = events.lock().unwrap().clone();
     // The branch actually taken: the optimistic pass logged its fallback.
