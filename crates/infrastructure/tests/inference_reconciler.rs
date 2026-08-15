@@ -1666,12 +1666,24 @@ async fn repair_conflates_a_sell_null_with_a_buy_null_when_the_getter_answers_ze
         .unwrap();
 
     open_sell_order(&pool, ob, 1).await; // SELL with NULL TC — the gap repair SHOULD close
+                                         // POSITIVE CONTROL. Every assert about order 1 below is a negative — the row
+                                         // was not touched — and a sweep that never ran satisfies all of them: a
+                                         // refused gate, a getter never called, an early return would each leave the
+                                         // test green while proving nothing. Order 2 is a row the SAME pass MUST
+                                         // repair, so a no-op pass turns this test red on the control instead of
+                                         // passing it vacuously.
+    open_sell_order(&pool, ob, 2).await;
 
-    let g = std::sync::Arc::new(FnGetter(|name: &str, _a: &Value| match name {
+    let g = std::sync::Arc::new(FnGetter(|name: &str, a: &Value| match name {
         "getQueueSize" => Ok(json!({ "value0": "0" })),
         "getStats" => Ok(json!({ "nextOrderId": "9" })),
-        // The getter answers what a BUY would answer: zero TC, zero deadline.
-        "getOrder" => Ok(json!({ "amount": "5", "tokenContract": ZERO_ADDRESS, "deadline": "0" })),
+        "getOrder" => Ok(match a.get("id").and_then(|v| v.as_str()) {
+            // Order 1: the getter answers what a BUY would answer — zero TC, zero
+            // deadline. This is the conflation under test.
+            Some("1") => json!({ "amount": "5", "tokenContract": ZERO_ADDRESS, "deadline": "0" }),
+            // Order 2: a real answer, so the repair has something to write.
+            _ => json!({ "amount": "5", "tokenContract": "0:control-tc", "deadline": "0" }),
+        }),
         _ => Ok(json!({})),
     }));
     let r = InferenceReconciler::for_test_with_getter(pool.clone(), g);
@@ -1697,6 +1709,22 @@ async fn repair_conflates_a_sell_null_with_a_buy_null_when_the_getter_answers_ze
     assert!(tc.is_none(), "the SELL's NULL token_contract stays NULL — the conflation");
     assert!(dl.is_none(), "zero deadline normalizes to nothing to write");
     assert_eq!(before, after, "no repair happened: the row was not touched at all");
+
+    // The control: the same pass repaired the row whose getter answered. Without
+    // this the three negatives above are satisfied by a sweep that never ran.
+    let control_tc: Option<String> = sqlx::query_scalar(
+        "select token_contract from inference_orders where orderbook_address=$1 and order_id=2",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        control_tc.as_deref(),
+        Some("0:control-tc"),
+        "the sweep pass did not run at all — the negatives above prove nothing until this \
+         control row is repaired"
+    );
 }
 
 #[tokio::test]

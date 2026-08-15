@@ -618,7 +618,10 @@ async fn probe_burned_is_terminal_close() {
 async fn a_tick_finalized_with_only_its_own_fields_still_inserts_the_row() {
     // A GUARD, green today. It catches lenient reading being turned strict:
     // strictness here would mean ABI drift halting the whole settlement rather
-    // than losing a single column.
+    // than losing a single column — a payload missing a field it does not own must
+    // still project. Two ways it goes red: a strict DTO makes `project` return
+    // `Err` and the `Applied` assert fails, and a projector that stops inserting
+    // leaves the count at 0.
     let Some(pool) = setup().await else { return };
     let tc = "0:tc_dto_lenient";
     for table in ["inference_ticks", "inference_deals"] {

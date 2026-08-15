@@ -127,6 +127,15 @@ fn no_in_scope_event_may_be_dropped_at_ingest() {
     // reprojection brings such an event back. For the inference scope that means a
     // permanently wrong read model, and a decision of that weight should not be made
     // by editing one line of config.
+    //
+    // It has been read as unfalsifiable — the two namespaces look disjoint, since
+    // IGNORABLE_EVENT_TYPES holds only `OrderBook.*` and `PMP.*`. They are disjoint
+    // by CONTENT today, not by construction: the scope includes named
+    // `PrivateNote.*` and `OracleEventList.*` entries, and nothing stops one of
+    // those being added to the ignorable list — `no_op_event_arms.rs` records that
+    // `PMP.StakeForfeited` was deliberately kept out of it, so the question does get
+    // asked. Verified by adding `PrivateNote.InferenceOrderRemoved` to that const:
+    // this test goes red.
     let scope = in_scope_event_types();
     for t in IGNORABLE_EVENT_TYPES {
         assert!(

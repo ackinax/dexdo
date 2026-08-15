@@ -398,7 +398,12 @@ fn emitted_events_match_their_emit_sites() {
     assert_eq!(
         actual, expected,
         "an emit routes somewhere the manifest does not say. Whatever reads that `dst` is now \
-         being handed a different payload than it was written for"
+         being handed a different payload than it was written for. A key present on the left \
+         and absent on the right is a constant emitted to but missing from the manifest — \
+         either new, or declared in a form `declared_event_ids` does not recognise. A separate \
+         `every_emit_resolves_to_a_manifest_row` used to assert that case alone; it was removed \
+         because its failures are a strict subset of this one's — it could never be the only \
+         red — and its diagnosis lives here instead"
     );
 }
 
@@ -429,21 +434,5 @@ fn every_id_carries_one_payload() {
         stale.is_empty(),
         "these are listed as known collisions but no longer collide — drop them from \
          KNOWN_SHARED: {stale:?}"
-    );
-}
-
-#[test]
-fn every_emit_resolves_to_a_manifest_row() {
-    let (sites, unresolved) = emit_sites();
-    assert!(unresolved.is_empty(), "unresolved emit destinations: {unresolved:#?}");
-
-    let known: BTreeSet<&str> = MANIFEST.iter().map(|e| e.konst).collect();
-    let missing: BTreeSet<String> =
-        sites.iter().map(|s| s.konst.clone()).filter(|k| !known.contains(k.as_str())).collect();
-
-    assert!(
-        missing.is_empty(),
-        "these constants are emitted to but absent from the manifest — either they are new, or \
-         they are declared in a form `declared_event_ids` does not recognise: {missing:?}"
     );
 }
