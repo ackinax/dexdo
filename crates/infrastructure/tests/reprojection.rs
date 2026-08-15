@@ -4565,21 +4565,34 @@ async fn projection_lag_seconds_empty_queue_is_zero() {
     // exactly the eligible shape, and from that moment this test skips on every
     // later run without saying so: green, and checking nothing.
     //
-    // AGE is the discriminator, not a list of msg_id prefixes. A prefix list
-    // would need updating whenever a test seeds under a new name, and the one
-    // that forgot would be exactly the leaker nobody hears about — the same
-    // silence this is meant to end. A concurrent sibling's row is seconds old
-    // and is about to be cleaned by its own test; a leak is from a previous run
-    // and never will be. This whole crate's suite finishes in well under a
-    // minute, so nothing legitimately holds a row eligible-and-unprojected for
-    // ten.
+    // AGE is the discriminator, not a list of msg_id prefixes. A prefix list would
+    // need updating whenever a test seeds under a new name, and the one that forgot
+    // would be exactly the leaker nobody hears about — the same silence this is
+    // meant to end.
+    //
+    // The threshold is a DAY, not the ten minutes this first carried, and the reason
+    // is that siblings deliberately BACKDATE `created_at`. `created_at` is the age of
+    // the row as written, not the wall-clock time anyone has been holding it: an
+    // aged-ingest fixture is an hour "old" the instant it is inserted. Two files do
+    // this today — `observer_queries.rs` seeds at 7200s and `inference_projectors.rs`
+    // at 3600s — and only the first is pinned to this binary's nextest group, so at
+    // ten minutes the second could turn this red for doing its job. A day clears
+    // every deliberate backdate in the crate by a factor of twelve.
+    //
+    // What that costs is detection latency, not detection: a leak is never cleaned by
+    // anyone, so on a long-lived shared database it crosses the threshold and is
+    // named. On a per-run CI Postgres nothing survives to reach a day — but nothing
+    // reached ten minutes there either, so the check was always the shared-database
+    // one. If a sibling ever backdates past a day, it must be added to the group
+    // rather than this bound raised again: past that point the two cases stop being
+    // distinguishable by age at all.
     let stale: Vec<(String, i64)> = sqlx::query_as(
         "select msg_id, extract(epoch from now() - created_at)::bigint
            from raw_events
           where processed_at is null
             and event_type is not null
             and decoded is not null
-            and created_at < now() - interval '10 minutes'
+            and created_at < now() - interval '1 day'
           order by created_at
           limit 20",
     )
@@ -4589,16 +4602,16 @@ async fn projection_lag_seconds_empty_queue_is_zero() {
 
     assert!(
         stale.is_empty(),
-        "eligible rows have been pending for over ten minutes: {stale:?} (msg_id, age in \
-         seconds). Nothing in this suite holds a row that long, so these are leaks from a \
-         test that died before its cleanup. They make the empty-queue contract untestable \
-         for every later run on this database — delete them, and give the leaking test a \
-         purge that survives a panic (a prefix purge at its start, as observer_queries.rs \
-         does)"
+        "eligible rows have been pending for over a day: {stale:?} (msg_id, age in \
+         seconds). Every deliberate backdate in this crate is two hours or less, so these \
+         are leaks from a test that died before its cleanup. They make the empty-queue \
+         contract untestable for every later run on this database — delete them, and give \
+         the leaking test a purge that survives a panic (a prefix purge at its start, as \
+         observer_queries.rs does)"
     );
     eprintln!(
-        "skipping the empty-queue assert: {pending_before}/{pending_after} pending rows, all \
-         of them fresh enough to be a concurrent sibling's"
+        "skipping the empty-queue assert: {pending_before}/{pending_after} pending rows, none \
+         of them older than a day, so each is a sibling's own fixture or its leftovers"
     );
 }
 

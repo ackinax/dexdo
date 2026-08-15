@@ -300,6 +300,7 @@ mod tests {
     // is in the table.
     #[tokio::test]
     async fn refresh_once_on_a_live_pool_fills_every_gauge_from_its_own_query() {
+        let _ = dotenvy::dotenv();
         let url = match std::env::var("TEST_DATABASE_URL") {
             Ok(v) if !v.is_empty() => v,
             _ => {
@@ -363,9 +364,54 @@ mod tests {
             .expect("insert order");
         }
 
+        // One decoded row whose type no projector claims, drained through this very
+        // repo so its in-process counter is non-zero before the refresh runs. Without
+        // it `set_unknown_events(repo.unknown_events_count())` would be asserted as
+        // 0 == 0, which holds however the two sides are wired — and this is the only
+        // place the repo-to-gauge hop for this metric is covered at all. The
+        // chain_order sorts above the "5f80…" space every other fixture uses and the
+        // drain is bounded to it, so exactly this row is taken.
+        let unknown_msg = "refresh_once_live-unknown-msg";
+        let unknown_after = "zzzz_refresh_once_live_0";
+        let unknown_chain = "zzzz_refresh_once_live_1";
+        sqlx::query("delete from raw_events where msg_id = $1")
+            .bind(unknown_msg)
+            .execute(&pool)
+            .await
+            .expect("purge unknown probe");
+        sqlx::query(
+            "insert into raw_events
+                 (msg_id, chain_order, created_at_chain, src_address, dst_address,
+                  event_type, body_json, decoded)
+             values ($1, $2, now(), 'refresh_once_live.src', null,
+                     'Test.RefreshOnceUnknownProbe', '{}'::jsonb, '{}'::jsonb)",
+        )
+        .bind(unknown_msg)
+        .bind(unknown_chain)
+        .execute(&pool)
+        .await
+        .expect("insert unknown probe");
+
         let repo = IndexerRepository::new(pool.clone());
+        let drained = repo
+            .reproject_pending_from(1000, Some(unknown_after), Some(unknown_chain))
+            .await
+            .expect("drain the unknown probe");
+        assert_eq!(drained.unknown, 1, "the probe must reach the Unknown arm");
+
         let (_provider, metrics) = IndexerMetrics::new_in_memory_for_tests();
         refresh_once(&repo, &metrics, "refresh_once_live_test_stream").await;
+
+        // The repo-to-gauge hop, both halves named: non-zero (so the assert is not
+        // 0 == 0) and equal to what the repo holds (so a gauge wired to a different
+        // counter is red).
+        let unknown_gauge = metrics.unknown_events_value();
+        assert_eq!(
+            unknown_gauge,
+            repo.unknown_events_count(),
+            "the unknown-events gauge must carry the repo's own count"
+        );
+        assert!(unknown_gauge >= 1, "the drained probe must have reached the gauge");
 
         assert_eq!(
             metrics.metrics_refresh_failures_count(),
@@ -404,5 +450,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup orders");
+        sqlx::query("delete from raw_events where msg_id = $1")
+            .bind(unknown_msg)
+            .execute(&pool)
+            .await
+            .expect("cleanup unknown probe");
     }
 }

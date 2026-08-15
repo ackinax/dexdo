@@ -795,6 +795,14 @@ async fn a_real_buyer_bond_funded_body_is_skeleton_only() {
 
 #[tokio::test]
 async fn a_real_seller_bond_funded_body_is_skeleton_only() {
+    // The arm ignores its payload, so the two `is_none` assertions below cannot fail
+    // whatever that payload says — they restate the schema, not a behaviour. What
+    // carries this test is the `Applied` assertion: drop the arm and the outcome is
+    // `Unknown`, which marks the row processed and loses it for good, and the
+    // `fetch_one` that follows finds no skeleton row to read. Both failures are real
+    // and both are named here so the next reader does not mistake the negatives for
+    // the whole test. (Wave 7 first annotated `a_tick_finalized_…` instead — same
+    // verdict, wrong test; this is the one the review meant.)
     let Some(pool) = setup().await else { return };
     let tc = "0:tc_real_seller_bond_funded";
     sqlx::query("delete from inference_deals where token_contract_address=$1")

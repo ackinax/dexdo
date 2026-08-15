@@ -7,7 +7,8 @@
 -- processed rows.
 --
 -- The index is full rather than partial, and that is a deliberate price: `raw_events`
--- is the most write-heavy table in the schema, and an eighth btree on it costs writes.
+-- is the most write-heavy table in the schema, and a tenth btree on it costs writes
+-- (seven explicit indexes from 0001, plus the primary key and the msg_id unique).
 -- It is taken because there is no predicate that would narrow it without losing the
 -- point: a run window needs rows in any processing state. Its users are the e2e
 -- observer (`pending_projection_since`, `count_undecodable_since`,

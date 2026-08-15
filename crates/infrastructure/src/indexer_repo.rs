@@ -72,9 +72,10 @@ pub struct IndexerRepository {
     decode_errors: Arc<AtomicU64>,
     /// Running count of decoded rows that matched no projector arm
     /// (`ProjectionOutcome::Unknown`). `Unknown` marks the row processed and never
-    /// retries it, and the `warn!` beside it is deduplicated to once per type per
-    /// process, so without this counter a new contract event is decoded, dropped
-    /// and leaves no trace: backlog 0, decode_errors 0, observer green. Distinct
+    /// retries it, and the `warn!` beside it is demoted to the noise target after
+    /// the first sighting of each type (`warn_unknown`), so without this counter a
+    /// new contract event is decoded, dropped and leaves no trace anywhere an
+    /// operator looks: backlog 0, decode_errors 0, observer green. Distinct
     /// from `decode_errors` and `decode_ambiguous_collisions` in the way that
     /// matters most — those rows keep their payload and stay replayable, these do
     /// not. Shared across clones via `Arc`, like `decode_errors`.
@@ -654,7 +655,7 @@ impl IndexerRepository {
                                 warn!(
                                     msg_id = %row.msg_id,
                                     event_type = ?event.event_type,
-                                    "orphan past cutoff dead-lettered: parent lies outside the captured history; the range-to-book linkage is lost for this event"
+                                    "orphan past cutoff dead-lettered: the parent never arrived — it lies outside the captured history, or its sibling EventAdded row is captured but not projected; the range-to-book linkage is lost for this event"
                                 );
                                 Ok(())
                             }
@@ -803,7 +804,7 @@ impl IndexerRepository {
                                 warn!(
                                     msg_id = %row.msg_id,
                                     event_type = ?event.event_type,
-                                    "orphan past cutoff dead-lettered: parent lies outside the captured history; the range-to-book linkage is lost for this event"
+                                    "orphan past cutoff dead-lettered: the parent never arrived — it lies outside the captured history, or its sibling EventAdded row is captured but not projected; the range-to-book linkage is lost for this event"
                                 );
                                 Ok(())
                             }
