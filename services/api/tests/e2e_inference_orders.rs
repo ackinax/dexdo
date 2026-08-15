@@ -47,8 +47,12 @@
 // as `_opNonce` on a note: a counter that moves exactly where the thing under
 // test succeeded, and nowhere else.
 //
-// The control is the pair of buys above: they advance the counter and the
-// count, which is what makes their standing still afterwards mean something.
+// A negative needs a positive control, and this one is a second buy issued
+// AFTER the stale one, with a deadline far in the future, that the book must
+// accept. The test then reads which of the two took the contested id — the
+// deadline stored on that order names its owner. Not "did the counter move":
+// that question has a wrong answer available to it whenever the poll lands
+// between the two messages.
 //
 //   cargo test -p dodex-api --test e2e_inference_orders -- --ignored --nocapture
 //
@@ -304,9 +308,8 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
     // ── a buy whose deadline has already passed ───────────────────────────
     //
     // Refused by the book before it accepts the message, so nothing about it
-    // reaches the queue where ids are handed out. Both of the book's counters
-    // therefore have to stand exactly still — and they are the same two the
-    // pair of accepted buys above moved.
+    // reaches the queue where ids are handed out. The next id the book hands out
+    // must therefore go to the NEXT accepted placement, not to this one.
     let before_stale = dex.inference_get_stats(&ob).await.expect("stats before the expired buy");
     let stale_deadline = now_unix().saturating_sub(STALE_BY);
     place_buy(
@@ -325,11 +328,19 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
     // it only if the chain is never slower than the sleep. It is not: on a
     // loaded stand the stale placement can land after the window and the test
     // goes green over a real defect. So a placement that MUST work is issued
-    // after it, and the counters are polled until THAT one moves them. Once a
-    // later message has been processed, the earlier one demonstrably had its
-    // chance, and the assertions below are about the book's verdict rather than
-    // about the clock. `finish` cancels every resting order, so the control
-    // leaves nothing behind.
+    // after it. `finish` cancels every resting order, so the control leaves
+    // nothing behind.
+    //
+    // What is read is the CONTESTED ID, not a counter. Polling "has next_order_id
+    // moved" breaks on the first increment whoever caused it: if the book
+    // regresses and rests the stale buy, the counter walks before → +1 (stale) →
+    // +2 (control), and a tick landing in the gap between the two messages reads
+    // +1 and satisfies both "moved by exactly one" assertions — green on precisely
+    // the defect this exists to catch, and likelier on the loaded stand that
+    // motivated the control in the first place. Reading which placement TOOK
+    // `before_stale.next_order_id` has no such gap: exactly one of the two can
+    // own it, its deadline says which, and neither the poll cadence nor the chain's
+    // speed can change the answer.
     let control_deadline = now_unix() + 3600;
     place_buy(
         &dex,
@@ -342,41 +353,68 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
     )
     .await;
 
-    let mut after_stale = None;
+    // Poll the contested id until SOMETHING owns it. A book that has not handed it
+    // out yet answers with an unreadable or zeroed order (the getter either reverts
+    // on the missing key or returns a default-constructed struct — both are "not
+    // yet", and neither can be mistaken for a resting order, whose deadline is
+    // always non-zero here).
+    let contested_id = before_stale.next_order_id;
+    let mut owner_deadline = None;
     for _ in 0..POLL_TICKS {
-        let stats = dex.inference_get_stats(&ob).await.expect("stats while polling the control");
-        if stats.next_order_id > before_stale.next_order_id {
-            after_stale = Some(stats);
+        if let Ok(order) = dex.inference_get_order(&ob, contested_id).await
+            && order.deadline != 0
+        {
+            owner_deadline = Some(order.deadline);
             break;
         }
         tokio::time::sleep(POLL_TICK).await;
     }
-    let Some(after_stale) = after_stale else {
+    let Some(owner_deadline) = owner_deadline else {
         failures.push(format!(
-            "the control placement never moved nextOrderId within {}s — this run measured the \
-             chain, not the deadline check, so the stale-deadline claim is unproven rather \
-             than disproven",
+            "nothing took order id {contested_id} within {}s — the control placement never \
+             landed, so this run measured the chain rather than the deadline check and the \
+             stale-deadline claim is unproven rather than disproven",
             POLL_TICKS as u64 * POLL_TICK.as_secs()
         ));
         finish(&dex, &note.address, &model_hash, signer(), failures).await;
         return;
     };
 
-    // Both counters moved by EXACTLY the control. A move of two means the stale
-    // buy rested alongside it.
-    if after_stale.order_count != before_stale.order_count + 1 {
+    if owner_deadline == stale_deadline {
         failures.push(format!(
-            "order count moved from {} to {} — the control placement accounts for exactly one, \
-             so anything else means the book also rested the buy whose deadline had passed",
-            before_stale.order_count, after_stale.order_count
+            "order id {contested_id} carries deadline {stale_deadline}, which is the buy whose \
+             deadline had already passed — the book rested it and pushed the control to \
+             {}. It is refused before tvm.accept(), so it must never take an id",
+            contested_id + 1
         ));
-    }
-    if after_stale.next_order_id != before_stale.next_order_id + 1 {
+    } else if owner_deadline != control_deadline {
         failures.push(format!(
-            "next id moved from {} to {} — the control placement accounts for exactly one. The \
-             stale buy is refused before tvm.accept(), so it must never take an id",
-            before_stale.next_order_id, after_stale.next_order_id
+            "order id {contested_id} carries deadline {owner_deadline}, which is neither the \
+             stale buy's {stale_deadline} nor the control's {control_deadline} — something \
+             else placed into this book during the test and the check below is not scoped \
+             to what it thinks it is"
         ));
+    } else {
+        // The control owns the contested id, so both messages have been processed
+        // and the counters are settled: the control accounts for exactly one, and
+        // the stale buy for none. Read them only now — asked earlier, the same
+        // numbers would be racing the second message.
+        let after_stale =
+            dex.inference_get_stats(&ob).await.expect("stats once the control took its id");
+        if after_stale.order_count != before_stale.order_count + 1 {
+            failures.push(format!(
+                "order count moved from {} to {} — the control placement accounts for exactly \
+                 one, so anything else means the book rested a second order in this window",
+                before_stale.order_count, after_stale.order_count
+            ));
+        }
+        if after_stale.next_order_id != before_stale.next_order_id + 1 {
+            failures.push(format!(
+                "next id moved from {} to {} — the control took {contested_id} and nothing \
+                 else may have taken one",
+                before_stale.next_order_id, after_stale.next_order_id
+            ));
+        }
     }
 
     // ---- read model: the cancel arrived ----
