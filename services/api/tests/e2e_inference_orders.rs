@@ -28,10 +28,11 @@
 // in-process) until `/orders` reports the cancelled id as CANCELLED, then
 // asserts on BOTH orders — the neighbour staying LIVE is the load-bearing
 // half, since `cancelAllInferenceOrders` would make that same assertion a
-// coin flip. Skipped (with a printed reason) when TEST_DATABASE_URL is
-// absent, and its failures join `failures` like every other check here —
-// nothing in it may panic before the note's resting orders are cleared by
-// `finish`.
+// coin flip. Runs only where E2E_READ_MODEL=1 (an indexer is filling the read
+// model) AND TEST_DATABASE_URL is reachable: unset E2E_READ_MODEL skips it with
+// a printed reason, set with no database is a failure rather than a skip. Its
+// failures join `failures` like every other check here — nothing in it may panic
+// before the note's resting orders are cleared by `finish`.
 //
 // ## A deadline already past
 //
@@ -190,9 +191,27 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
     // See `read_model::read_phases_enabled` — the shellnet lane sets
     // TEST_DATABASE_URL for a Postgres nobody writes to, and running the read phase
     // there burns the whole budget proving the lane has no indexer.
+    // An opt-in that cannot be honoured is a FAILURE, not a skip. Being told to run
+    // the read phase and finding no database means the one lane that can check the
+    // read model did not check it — and a printed line on a green run is exactly
+    // how that goes unnoticed. Not set at all is the ordinary case and stays quiet.
     let read: Option<std::sync::Arc<salvo::Service>> = if read_phases_enabled() {
-        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s))
+        let service = common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
+        if service.is_none() {
+            failures.push(
+                "E2E_READ_MODEL asks for the read phase, but common::setup() found no database \
+                 (TEST_DATABASE_URL unset, empty, or unreachable). This is the only lane that \
+                 runs an indexer, so skipping here leaves the read model unchecked on the one \
+                 run that could check it"
+                    .to_string(),
+            );
+        }
+        service
     } else {
+        eprintln!(
+            "[e2e_orders] read phase skipped: E2E_READ_MODEL is not set, so no indexer is filling \
+             the read model on this lane"
+        );
         None
     };
     if read.is_none() {

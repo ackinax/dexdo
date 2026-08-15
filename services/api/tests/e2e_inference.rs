@@ -5,9 +5,12 @@
 // The chain phases assert what the BOOK holds; the read phases assert that it
 // reached the read model and the public API. They are different claims: a
 // getter can be right while projection is broken, which is exactly the gap
-// wave 3 exists to close. Read phases are skipped (with a printed reason) when
-// TEST_DATABASE_URL is absent, and their failures join `failures` like every
-// other — nothing here may panic before the orders are cancelled.
+// wave 3 exists to close. The read phases need TWO things — E2E_READ_MODEL=1
+// (an indexer is filling the read model) and a reachable TEST_DATABASE_URL — and
+// run only where both hold. Unset E2E_READ_MODEL skips them with a printed
+// reason; set with no database is a failure, not a skip. Their failures join
+// `failures` like every other — nothing here may panic before the orders are
+// cancelled.
 //
 // The note is the on-chain participant: it deploys a fresh per-model
 // `InferenceOrderBook` (the book code is baked into the note at deploy), then
@@ -145,9 +148,27 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
     // See `read_model::read_phases_enabled` — the shellnet lane sets
     // TEST_DATABASE_URL for a Postgres nobody writes to, and running the read phases
     // there burns the whole budget proving the lane has no indexer.
+    // An opt-in that cannot be honoured is a FAILURE, not a skip. Being told to run
+    // the read phases and finding no database means the one lane that can check the
+    // read model did not check it — and a printed line on a green run is exactly
+    // how that goes unnoticed. Not set at all is the ordinary case and stays quiet.
     let read: Option<std::sync::Arc<salvo::Service>> = if read_phases_enabled() {
-        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s))
+        let service = common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
+        if service.is_none() {
+            failures.push(
+                "E2E_READ_MODEL asks for the read phases, but common::setup() found no database \
+                 (TEST_DATABASE_URL unset, empty, or unreachable). This is the only lane that \
+                 runs an indexer, so skipping here leaves the read model unchecked on the one \
+                 run that could check it"
+                    .to_string(),
+            );
+        }
+        service
     } else {
+        eprintln!(
+            "[e2e_inference] read phases skipped: E2E_READ_MODEL is not set, so no indexer is filling \
+             the read model on this lane"
+        );
         None
     };
     if read.is_none() {

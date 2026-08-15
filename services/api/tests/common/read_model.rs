@@ -103,8 +103,14 @@ pub const PROBE_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
 ///
 /// `E2E_READ_MODEL` is the second fact, set only where an indexer is running
 /// (`.woodpecker/e2e.yml`). The gate is deliberately NOT inside `common::setup()`:
-/// seventeen ordinary API test files call that, and they seed their own rows —
-/// they need a database, not an indexer.
+/// seventeen API test files call that, and the fourteen that are not these three
+/// binaries seed their own rows — they need a database, not an indexer.
+///
+/// The two facts fail in opposite directions on purpose. `E2E_READ_MODEL` unset is
+/// the ordinary case on every lane but one, and skips quietly. `E2E_READ_MODEL` set
+/// with no reachable database is an instruction that cannot be carried out on the
+/// only lane that could carry it out, so each caller pushes a failure rather than
+/// printing a line onto a green run.
 pub fn read_phases_enabled() -> bool {
     read_phases_enabled_from(std::env::var("E2E_READ_MODEL").ok().as_deref())
 }
