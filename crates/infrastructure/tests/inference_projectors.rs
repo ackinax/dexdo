@@ -676,6 +676,113 @@ async fn a_refund_without_its_parent_defers() {
     tx.commit().await.unwrap();
 }
 
+/// Clause 3 of the "may be closed" predicate, and the only one with no test:
+/// `CANCELLED` qualifies ONLY with a `swept_at` mark. Both directions are asserted
+/// here because one alone cannot fail usefully — relaxing the clause to a bare
+/// `status = 'CANCELLED'` leaves the sweep-marked half green, and that is the
+/// dangerous direction.
+///
+/// The distinction is what the mark means. The sweep writes `CANCELLED` as a GUESS,
+/// because the order vanished from the book — and expiry is one way to vanish, so a
+/// refund correcting it to `EXPIRED` is the sweep being told what actually happened.
+/// A cancel with `swept_at` NULL came from `InferenceOrderCancelled`: the chain said
+/// the owner cancelled, and a refund arriving afterwards does not make that untrue.
+#[tokio::test]
+async fn a_refund_corrects_a_swept_cancel_but_not_a_real_one() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_cancel_kinds";
+    clean(&pool, ob).await;
+
+    // Both rows are past their deadline, so only the sweep mark separates them.
+    for (order_id, swept) in [(1i64, true), (2, false)] {
+        sqlx::query(
+            r#"insert into inference_orders
+                   (orderbook_address, order_id, is_buy, price, amount_initial,
+                    amount_remaining, status, deadline, swept_at, last_chain_order)
+               values ($1, $2, true, 5, 10, 10, 'CANCELLED', 1699999999,
+                       case when $3 then now() else null end, 'a0')"#,
+        )
+        .bind(ob)
+        .bind(order_id)
+        .bind(swept)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &node(ob, "a1")).await, ProjectionOutcome::Applied);
+    assert_eq!(project(&mut tx, &refunded("2"), &node(ob, "a2")).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let rows: Vec<(i64, String, bool)> = sqlx::query_as(
+        "select order_id::bigint, status, swept_at is null
+           from inference_orders where orderbook_address = $1 order by order_id",
+    )
+    .bind(ob)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(1, "EXPIRED".to_string(), true), (2, "CANCELLED".to_string(), true)],
+        "the swept cancel is corrected to EXPIRED and loses its provisional mark; the real \
+         cancel stands"
+    );
+}
+
+/// The missing-chain-time branch, and the ordering it sits behind.
+///
+/// Without a time the projector cannot tell expiry from a finished taker, so it
+/// declines to guess, leaves the row alone and returns Applied — closing falls to the
+/// sweep. But that early return is placed AFTER the parent lookup on purpose: reached
+/// first, an orphan would be marked Applied and dropped, and a placement arriving
+/// later would open an order this refund can never close. Both halves are asserted
+/// together because the bug is the ORDER of two branches that are individually
+/// correct, and swapping them is invisible to either one alone.
+#[tokio::test]
+async fn a_refund_without_chain_time_declines_to_guess_but_still_defers_an_orphan() {
+    let Some(pool) = setup().await else { return };
+    let ob = "0:ref_no_time";
+    clean(&pool, ob).await;
+    let timeless = EventNode { created_at: None, ..node(ob, "a1") };
+
+    // No parent AND no time: the parent check must win, or the orphan is lost.
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(
+        project(&mut tx, &refunded("1"), &timeless).await,
+        ProjectionOutcome::Deferred,
+        "the parent is checked FIRST — an Applied here drops the orphan out of the age-based \
+         dead letter and a late placement would open an order this refund can never close"
+    );
+    tx.commit().await.unwrap();
+
+    // Parent present, still no time: applied, and the row is untouched — including
+    // updated_at, so a no-op does not lie to an observer.
+    place_with_deadline(&pool, ob, "1", true, "1699999999", "a0").await;
+    let before: (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "select status, updated_at from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    assert_eq!(project(&mut tx, &refunded("1"), &timeless).await, ProjectionOutcome::Applied);
+    tx.commit().await.unwrap();
+
+    let after: (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "select status, updated_at from inference_orders where orderbook_address=$1 and order_id=1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before.0, "OPEN", "precondition");
+    assert_eq!(after, before, "no time means no guess: the row is left entirely to the sweep");
+}
+
 // A GUARD, green before the change too — and the ONLY test that turns red if someone
 // gives the projector a `CANCELLED` branch for a deadline that has not passed. That is
 // exactly the scenario it is absent for; this is an extension of the existing
