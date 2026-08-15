@@ -423,29 +423,35 @@ mod tests {
         let (_disc, visible, _failing) = metrics.inference_market_states_value();
         assert!(visible >= 1, "the seeded visible book must reach the market-state gauge");
 
-        // The staleness pair is the swap this test exists for, and the sharp check is
-        // AGREEMENT WITH THE SOURCE, not the seeded magnitudes. Both sides are read
-        // from the same whole-table query, so a sibling writing between them is the
-        // only way they can differ innocently — and exchanging the two `set_` calls
-        // makes them differ every time, whatever else is in the table.
+        // The staleness pair is the swap this test exists for, and it is pinned from ONE
+        // sample — a BAND on each gauge, not agreement with a second read.
         //
-        // The magnitudes alone would not do it. They are lower bounds against a
-        // whole-table maximum, so a 20-year row left behind by ANOTHER test's panic
-        // (inference_market_metrics seeds the same ages under its own addresses and
-        // purges only those) satisfies them permanently, even if this test's own seed
-        // never landed. They stay below as evidence the seed reached the gauge; the
-        // equality is what pins the wiring.
-        let (repo_price_lag, repo_sweep_lag) =
-            repo.inference_staleness_seconds().await.expect("whole-table staleness");
+        // Comparing the gauge against a later `inference_staleness_seconds()` was the
+        // obvious pin and it is unusable, for two reasons that have nothing to do with
+        // the wiring. `STALENESS_SELECT` is `extract(epoch from now() - min(...))::bigint`
+        // and `now()` is transaction time, so two reads are two clocks and the truncated
+        // whole second flips whenever the boundary falls between them. And
+        // `inference_market_metrics` — which runs in parallel, deliberately — inserts and
+        // then deletes its own 20-year row, so between the two reads `min()` can change
+        // WHICH row it comes from, moving the value by the gap between the two tests'
+        // seeds. No serial group fixes the first of those.
+        //
+        // The band does the same job without a second read. The seed is asymmetric by
+        // 10 years and both gauges are maxima over the table, so exchanging the two
+        // `set_` calls moves each outside its own band: the price gauge would report the
+        // sweep maximum (under 20 years) and the sweep gauge the price maximum (at least
+        // 20). The upper bound is the load-bearing half and it rests on one fact — no
+        // row anywhere in this workspace carries a sweep age near 20 years. A future
+        // fixture that breaks that turns this red, which is the right outcome: it would
+        // also destroy the assertion below it.
         let price_lag = metrics.inference_reference_price_lag_seconds_value();
         let sweep_lag = metrics.inference_sweep_lag_seconds_value();
-        assert_eq!(
-            (price_lag, sweep_lag),
-            (repo_price_lag.max(0) as u64, repo_sweep_lag.max(0) as u64),
-            "each staleness gauge must carry its own column from the query behind it"
-        );
         assert!(price_lag >= PRICE_AGE_SECS, "reference-price lag gauge: {price_lag}");
-        assert!(sweep_lag >= SWEEP_AGE_SECS, "sweep lag gauge: {sweep_lag}");
+        assert!(
+            (SWEEP_AGE_SECS..PRICE_AGE_SECS).contains(&sweep_lag),
+            "sweep lag gauge must report the sweep column: {sweep_lag} is outside \
+             [{SWEEP_AGE_SECS}, {PRICE_AGE_SECS})"
+        );
 
         let (open, filled, _cancelled, expired) = metrics.inference_order_counts_value();
         assert!(

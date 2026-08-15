@@ -83,9 +83,11 @@ pub struct IndexerRepository {
     /// Running count of event bodies left undecoded because their id collides
     /// across ABIs and no `dst` route disambiguated it (the `AmbiguousCollision`
     /// decode outcome). Distinct from a benign unknown id and from a hard decode
-    /// error. Unreachable today (the only colliding id, `OrderCancelled`, has a
-    /// route); a non-zero value means a new colliding ABI was added without a
-    /// route — alert on it. Shared across clones via `Arc`.
+    /// error. Unreachable today: the collision `decoder.rs` names as REAL is
+    /// `ContractDeployed`, declared byte-identically by `RootModel` and
+    /// `TokenContract`, and both sides carry a mandatory `dst` route. A non-zero
+    /// value means a new colliding ABI was added without a route — alert on it.
+    /// Shared across clones via `Arc`.
     decode_ambiguous_collisions: Arc<AtomicU64>,
     /// Running count of hard inference reconcile failures (`Err` outcomes from
     /// discovery or refresh — not `NoBoc`, which is a benign skip). Bumped by the

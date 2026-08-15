@@ -3193,11 +3193,20 @@ async fn a_dropped_orphan_is_counted_once_across_a_fallback() {
     let orphan_chain = "zzzz_reproj_orphandbl_1_orphan";
     let poison_chain = "zzzz_reproj_orphandbl_2_poison";
     let stream = "reproj_orphan_dbl_stream";
+    let deal_tc = "0:reproj_orphan_dbl_tc";
 
+    // `inference_deals` is in here because the orphan path UPSERTS it: a Filled
+    // records its deal link (sellerTC as the PK) whether or not either leg is
+    // present, which is the whole point of that path. The first version of this test
+    // borrowed a neighbour's "0:s" and left a row behind — and because the upsert
+    // advances last_chain_order through `greatest()`, it did not merely leak, it
+    // pinned a `zzzz_` chain order onto ANOTHER test's fixture row for good. Hence
+    // both halves: addresses nothing else uses, and a delete for the row they make.
     let cleanup: Vec<(&str, &str)> = vec![
         ("delete from live_orders where orderbook_address = $1", book),
         ("delete from inference_orders where orderbook_address = $1", ob),
         ("delete from inference_markets where orderbook_address = $1", ob),
+        ("delete from inference_deals where token_contract_address = $1", deal_tc),
         ("delete from raw_events where msg_id = $1", orphan_msg),
         ("delete from raw_events where msg_id = $1", poison_msg),
         ("delete from indexer_cursors where stream_name = $1", stream),
@@ -3213,7 +3222,9 @@ async fn a_dropped_orphan_is_counted_once_across_a_fallback() {
         orphan_chain,
         ob,
         "InferenceOrderBook.InferenceFilled",
-        &json!({"makerId":"901","takerId":"902","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"}),
+        &json!({"makerId":"901","takerId":"902","ticks":"1","clearingPrice":"1",
+            "sellerTC":"0:reproj_orphan_dbl_tc","buyerNote":"0:reproj_orphan_dbl_buyer",
+            "sellerNote":"0:reproj_orphan_dbl_seller"}),
     )
     .await;
     sqlx::query("update raw_events set created_at = now() - interval '1 hour' where msg_id = $1")

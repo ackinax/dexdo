@@ -537,11 +537,14 @@ impl IndexerMetrics {
         self.metrics_refresh_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Test-only snapshot getters: plain atomic reads of the caches written by
-    // the refresh loop's eight fallible DB-backed sections, plus the failure
-    // counter itself — what the indexer's refresh-failure test asserts on
-    // (its sentinels are unreadable from another crate otherwise). Same
-    // precedent as `IndexerRepository::decode_errors_count`: `#[doc(hidden)]`,
+    // Test-only snapshot getters: plain atomic reads of every cache the refresh
+    // loop writes — what the indexer's refresh tests assert on (its sentinels are
+    // unreadable from another crate otherwise). Ten of the thirteen mirror the
+    // eight fallible DB-backed sections (two sections fill two caches each); the
+    // other three are not DB-backed at all — `metrics_refresh_failures_count` is
+    // the loop's own error counter, `metrics_refresh_passes_count` its heartbeat,
+    // and `unknown_events_value` an in-process count the loop only copies across.
+    // Same precedent as `IndexerRepository::decode_errors_count`: `#[doc(hidden)]`,
     // no features or cfg bridges. Tuple getters mirror the tuple setters.
 
     #[doc(hidden)]

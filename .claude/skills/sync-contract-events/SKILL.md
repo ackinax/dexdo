@@ -7,7 +7,7 @@ description: Use when the smart contracts have been updated — a contracts sync
 
 Audit what the backend must change after a contract update. Two distinct event identities drive everything:
 
-- **ABI signature id** (32-bit hash of the event name + input types) — how the decoder recognizes a body. Built at **compile time**: `crates/infrastructure/src/decoder.rs` embeds the ABIs via `include_str!` (`DEX_ABIS`: RootOracle, Oracle, OracleEventList, PMP, OrderBook, RootPN, PrivateNote, Nullifier; `INFERENCE_ABIS`: InferenceOrderBook, TokenContract). `RootModel` is loaded too (it resolves the `ContractDeployed` id collision with `TokenContract` — see `add_route`); `SuperRoot`'s ABI exists in the repo but is NOT loaded. Changing an `.abi.json` requires rebuild + redeploy.
+- **ABI signature id** (32-bit hash of the event name + input types) — how the decoder recognizes a body. Built at **compile time**: `crates/infrastructure/src/decoder.rs` embeds the ABIs via `include_str!` (`DEX_ABIS`: RootOracle, Oracle, OracleEventList, PMP, OrderBook, RootPN, PrivateNote, Nullifier; `INFERENCE_ABIS`: InferenceOrderBook, TokenContract, RootModel). RootModel is in that list for a load-bearing reason — it resolves the `ContractDeployed` id collision with `TokenContract` via `add_route`. `SuperRoot`'s ABI exists in the repo but is NOT loaded. Changing an `.abi.json` requires rebuild + redeploy.
 - **EVENT_ID constant** (`contracts/dex/modifiers/modifiers.sol`, e.g. `OB_QUEUED = 159`) — the external `dst` each event is emitted to (`:{id:064x}`). Used by the ingest ignore-filter (`config::ignored_event_dsts`) and by decoder dst routes for colliding signature ids.
 
 Two scripts ship with this skill: `diff-events.sh` (ABI event sets, Step 1) and
