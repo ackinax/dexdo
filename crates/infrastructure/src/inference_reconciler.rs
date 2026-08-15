@@ -259,7 +259,15 @@ impl InferenceReconciler {
                     stats.skipped += 1;
                     self.stamp_failure_logged(&book.orderbook_address, Self::NO_BOC_REASON).await;
                 }
-                Ok(_) => stats.refreshed += 1,
+                Ok(_) => {
+                    stats.refreshed += 1;
+                    // A refresh that completed without an error is the evidence the
+                    // mark was missing: `NoBoc` stays a failure (the account is not
+                    // on chain yet — unchanged semantics) and `Err` obviously does.
+                    // Only this arm means "the most recent cycle worked", which is
+                    // precisely what a cleared mark asserts.
+                    self.clear_failure_logged(&book.orderbook_address).await;
+                }
                 Err(err) => {
                     stats.failed += 1;
                     self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
@@ -864,6 +872,45 @@ impl InferenceReconciler {
     /// queue every tick with no cooldown, so a silent drop would hide a book
     /// spinning without backoff. Used by `run_once` where the outcome is already
     /// a failure and there is nothing further to propagate.
+    /// Clear the failure mark after a cycle that completed without a single `Err`.
+    ///
+    /// Without this the mark means "failed at least once, ever". The visibility
+    /// stamp clears it (`advance_sweep_and_maybe_stamp`), but a plain refresh never
+    /// did, and a visible book cannot go back through discovery —
+    /// `select_discovery_candidates` requires `last_reconciled_at is null`, and both
+    /// sites that null it set `superseded_at` in the same UPDATE. So one transient
+    /// getter error after a book went visible marked it for the rest of the row's
+    /// life. That ambiguity is what made the observer's failing-books predicate
+    /// unwinnable: either it named recovered books, or it hid the ones that broke
+    /// after becoming visible. With this, a standing mark means "the most recent
+    /// cycle failed".
+    ///
+    /// `last_reconcile_error` is cleared together with the timestamp: 0006 keeps the
+    /// text so an operator can read the last failure, and a text whose timestamp is
+    /// gone is exactly the stale artefact that made the text untrustworthy.
+    ///
+    /// The `where` clause makes this a no-op for the common case — an unmarked book
+    /// is not rewritten, so `updated_at` does not churn on every clean cycle.
+    pub async fn clear_failure(&self, ob: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "update inference_markets
+                set last_reconcile_failed_at = null, last_reconcile_error = null
+              where orderbook_address = $1
+                and last_reconcile_failed_at is not null",
+        )
+        .bind(ob)
+        .execute(&self.pool)
+        .await
+        .context("clear inference reconcile failure")?;
+        Ok(())
+    }
+
+    async fn clear_failure_logged(&self, ob: &str) {
+        if let Err(e) = self.clear_failure(ob).await {
+            warn!(ob = %ob, ?e, "failed to clear inference reconcile failure mark");
+        }
+    }
+
     async fn stamp_failure_logged(&self, ob: &str, error: &str) {
         if let Err(e) = self.stamp_failure(ob, error).await {
             warn!(ob = %ob, ?e, "failed to stamp inference reconcile backoff");

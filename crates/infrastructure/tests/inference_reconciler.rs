@@ -1787,6 +1787,72 @@ async fn sweep_still_cancels_phantoms_and_partially_filled_buy_takers() {
 }
 
 #[tokio::test]
+async fn a_clean_cycle_clears_a_failure_mark_left_by_an_earlier_one() {
+    // The state this covers is the one the observer could not describe: a book that
+    // went visible, failed once, and then recovered. Before this, nothing cleared
+    // the mark for a visible book — `select_discovery_candidates` requires
+    // `last_reconciled_at is null`, and both sites that null it set `superseded_at`
+    // in the same UPDATE, so a visible row never returns to discovery. The mark
+    // therefore meant "failed at least once, ever", and the observer's predicate
+    // had to choose between naming recovered books and hiding broken ones. With the
+    // clear on a clean cycle it means "the most recent cycle failed", and both
+    // readings become correct.
+    let Some(pool) = setup().await else { return };
+    let ob = "0:t_clear_failure";
+    seed_market(&pool, ob, true).await;
+
+    let r = InferenceReconciler::for_test(pool.clone());
+    r.stamp_failure(ob, "getOrder reverted").await.unwrap();
+    let (marked, text): (bool, Option<String>) = sqlx::query_as(
+        "select last_reconcile_failed_at is not null, last_reconcile_error
+           from inference_markets where orderbook_address = $1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(marked && text.as_deref() == Some("getOrder reverted"), "precondition");
+
+    r.clear_failure(ob).await.unwrap();
+
+    let (still_marked, text_after, still_visible): (bool, Option<String>, bool) = sqlx::query_as(
+        "select last_reconcile_failed_at is not null, last_reconcile_error,
+                last_reconciled_at is not null
+           from inference_markets where orderbook_address = $1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!still_marked, "a clean cycle must clear the timestamp");
+    assert!(text_after.is_none(), "the text goes with its timestamp — a text alone is stale");
+    assert!(still_visible, "clearing a failure must not touch visibility");
+
+    // Idempotent and quiet: an unmarked book is not rewritten, so a clean cycle
+    // does not churn `updated_at` on every book it touches.
+    let before: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select updated_at from inference_markets where orderbook_address = $1")
+            .bind(ob)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    r.clear_failure(ob).await.unwrap();
+    let after: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("select updated_at from inference_markets where orderbook_address = $1")
+            .bind(ob)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after, "clearing an unmarked book must be a full no-op");
+
+    sqlx::query("delete from inference_markets where orderbook_address = $1")
+        .bind(ob)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn a_reconcile_failure_records_its_reason() {
     // The observer is a DB-tail step and does not read logs. If the reason lives
     // only in the logs, "failing with a reason" (IX-SEQ-10) is checkable only as

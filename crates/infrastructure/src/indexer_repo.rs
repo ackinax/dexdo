@@ -1339,19 +1339,16 @@ impl IndexerRepository {
     /// (`advance_sweep_and_maybe_stamp`) clears the mark in the same UPDATE, so
     /// "failed, then recovered through discovery" is already absent here.
     ///
-    /// KNOWN GAP, and the reason this predicate is not tightened: a clean
-    /// *refresh* cycle does not clear the mark either, and for a visible book
-    /// NOTHING does — `select_discovery_candidates` requires
-    /// `last_reconciled_at is null`, and both sites that null it set
-    /// `superseded_at` in the same UPDATE, so a visible row never returns to
-    /// discovery. A single transient failure after visibility — a benign `NoBoc`
-    /// on a refresh tick included — therefore names the book here for the rest of
-    /// its life. The schema has no "currently failing" fact for a visible book;
-    /// until it gains one (clear the mark on a clean refresh cycle, or compare
-    /// `last_reconcile_failed_at` against `last_swept_at`/`reference_price_at`),
-    /// this list errs toward naming a recovered book rather than staying silent
-    /// about a broken one. The observer prints it as diagnostics, never fails on
-    /// it, so the cost of the false positive is a line of output.
+    /// The mark means "the most recent cycle failed", which is what makes this
+    /// predicate honest without further clauses. Three writers keep it that way:
+    /// the visibility stamp clears it (`advance_sweep_and_maybe_stamp`), a clean
+    /// refresh cycle clears it (`clear_failure`), and `stamp_failure` sets it. A
+    /// book that failed and recovered therefore leaves this list on its next clean
+    /// cycle, while one that broke after becoming visible stays in it.
+    ///
+    /// `NoBoc` remains a failure on purpose: the account is not on chain yet, and
+    /// the observer prints the reason text so a routine `NoBoc` reads as what it
+    /// is rather than as an outage.
     pub async fn inference_failing_books(
         &self,
         scope: &[String],
