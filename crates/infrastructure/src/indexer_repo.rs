@@ -29,7 +29,7 @@ use crate::projectors::ProjectionOutcome;
 
 /// The capture loop's cursor stream name. The orphan dead-letter reads its
 /// `at_head` flag to avoid dropping an orphan whose parent may still be ahead of
-/// the cursor during a backfill (see `is_expired_inference_orphan`).
+/// the cursor during a backfill (see `is_dead_letterable_orphan`).
 pub const CAPTURE_STREAM: &str = "blockchain_events";
 
 #[derive(Debug, Clone)]
@@ -154,9 +154,17 @@ impl IndexerRepository {
         // the read model to repair; the row is dropped with a `warn!` naming the
         // loss.
         //
-        // Matched by FULL name, not by contract prefix: `OracleEventList.EventAdded`
-        // from the same contract is deliberately absent — its parent arrives
-        // legitimately later.
+        // Entries are matched by `starts_with`, so an entry may be either a full
+        // event name or a contract prefix, and the two carry different promises.
+        // `OracleEventList.RangeEventAdded` is a FULL name on purpose: its
+        // sibling `OracleEventList.EventAdded` must NOT be dead-letterable —
+        // that parent arrives legitimately later, and dropping it would kill a
+        // market silently. `InferenceOrderBook.` above is a prefix on purpose
+        // too: every event the book can defer is a depth update whose parent
+        // `OrderPlaced` lies outside the captured history, so a future book
+        // event inherits the same verdict rather than becoming pending forever.
+        // Adding a full name here is therefore a narrow decision; adding a
+        // prefix authorises every present and future event of that contract.
         "OracleEventList.RangeEventAdded",
     ];
     /// Shared subquery for "addresses that emitted at least one event inside the
@@ -1272,6 +1280,14 @@ impl IndexerRepository {
     /// prints these even when it passes: `NoBoc` is a benign outcome that also
     /// stamps a failure, and without the distribution of reasons "failing with a
     /// reason" reads stricter than it actually is.
+    ///
+    /// `last_reconciled_at is null` is part of the predicate for the same reason
+    /// it is part of `MARKET_STATE_COUNTS_SELECT`'s `failing` bucket, and this
+    /// list must agree with that gauge. The error text is deliberately NOT
+    /// cleared on success (see `migrations/0006_inference_reconcile_error.sql`),
+    /// and `NoBoc` stamps a failure on practically every book before its first
+    /// BOC — so without this clause the observer would print books that
+    /// reconciled successfully an hour ago as currently failing.
     pub async fn inference_failing_books(
         &self,
         scope: &[String],
@@ -1280,6 +1296,7 @@ impl IndexerRepository {
             r#"select m.orderbook_address, m.last_reconcile_error
                  from inference_markets m
                 where m.orderbook_address = any($1)
+                  and m.last_reconciled_at is null
                   and m.last_reconcile_failed_at is not null
                   and m.last_reconcile_error is not null
                   and m.superseded_at is null

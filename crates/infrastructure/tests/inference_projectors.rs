@@ -684,9 +684,9 @@ async fn a_refund_without_its_parent_defers() {
 //
 // On chain a fully filled taker BUY produces `Placed(2)` -> `Filled(1,2)` ->
 // `Refunded(2, leftover)` (`:1183`; the event goes out even with `leftover == 0`). The
-// maker leg was lost at capture, so the fill defers and the drain moves on
-// (`indexer_repo.rs:522` leaves the row unmarked and takes the next one) — the refund
-// is applied BEFORE its own fill.
+// maker leg was lost at capture, so the fill defers and the drain moves on (the
+// `Deferred` arms of `reproject_pending_from` leave the row unmarked and take the next
+// one) — the refund is applied BEFORE its own fill.
 #[tokio::test]
 async fn a_refund_between_a_deferred_fill_and_its_retry_does_not_steal_the_terminal_status() {
     let Some(pool) = setup().await else { return };
@@ -1191,7 +1191,7 @@ async fn expired_orphans_dropped_all_four_types_using_ingest_age_not_chain_time(
     let refunded = serde_json::json!({"orderId":"904","note":"0:b","amount":"1"});
     // (a)-(b'') aged-ingest orphans of ALL FOUR deferrable types => dropped.
     //
-    // THIS IS A GREEN GUARD, not a red-first test. The `is_expired_inference_orphan`
+    // THIS IS A GREEN GUARD, not a red-first test. The `is_dead_letterable_orphan`
     // gate admits any `InferenceOrderBook.*`, and both drain paths match `Ok(_)`, i.e.
     // they mark the row processed even on a `Nothing` outcome. So new types drain even
     // without arms. The value lies elsewhere: the test turns red if the gate is ever

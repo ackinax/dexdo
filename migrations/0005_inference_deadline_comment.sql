@@ -1,16 +1,16 @@
 -- 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 --
--- Комментарий 0002 запрещал выводить статус из `deadline` и обещал, что ордер
--- остаётся OPEN до `InferenceOrderExpired`. Второе неверно: continuation,
--- возобновившийся после дедлайна (`InferenceOrderBook.sol:1355-1372`), эмитит
--- ТОЛЬКО `InferenceRefunded` — события истечения для этого пути нет вообще.
+-- The 0002 comment forbade deriving a status from `deadline` and promised that an
+-- order stays OPEN until `InferenceOrderExpired`. The second half is wrong: a
+-- continuation resumed past its deadline (`InferenceOrderBook.sol:1355-1372`) emits
+-- ONLY `InferenceRefunded` — there is no expiry event on that path at all.
 --
--- Первый запрет остаётся в силе и сформулирован точнее: сравнивать дедлайн с
--- ЧАСАМИ по-прежнему нельзя, время само по себе ничего не закрывает. Сравнение
--- разрешено ровно в одном месте — при обработке `InferenceRefunded`, где цепь
--- уже сообщила, что ордер из книги исчез, и дедлайн лишь отвечает ПОЧЕМУ:
--- `_finalizeTaker` физически недостижим после дедлайна, обе ветки истечения —
--- до него.
+-- The first prohibition still stands, stated more precisely: comparing the deadline
+-- to the CLOCK is still forbidden, since elapsed time by itself closes nothing. The
+-- comparison is allowed in exactly one place — the `InferenceRefunded` projector,
+-- where the chain has already reported that the order left the book and the deadline
+-- only answers WHY: `_finalizeTaker` is physically unreachable past the deadline, and
+-- both expiry branches are unreachable before it.
 
 comment on column inference_orders.deadline is
     'Unix seconds after which the book may expire this order; NULL when the chain '

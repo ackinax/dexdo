@@ -1,13 +1,13 @@
 -- 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 --
--- Причина отказа реконсайлера жила только в логах: `stamp_failure` принимала один
--- аргумент — адрес книги, — а таблица держала лишь отметку времени и счётчик
--- попыток. Для оператора это означало поход в логи пода за ответом на вопрос
--- «почему эта книга не видна», а для DB-tail проверок — что «failing с причиной»
--- недоказуемо в принципе: у них нет доступа к логам.
+-- The reconciler's failure reason lived only in the logs: `stamp_failure` took a
+-- single argument — the book's address — while the table held just a timestamp and an
+-- attempt counter. For an operator that meant digging through pod logs to answer "why
+-- is this book not visible", and for DB-tail checks it meant "failing with a reason"
+-- was unprovable in principle: they have no access to logs.
 --
--- NULL здесь законен и означает «отказов не было»; он же остаётся у строк,
--- отказавших до этой миграции.
+-- NULL is legitimate here and means "there were no failures"; it also remains on rows
+-- that failed before this migration.
 
 alter table inference_markets add column last_reconcile_error text;
 

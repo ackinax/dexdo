@@ -264,8 +264,10 @@ async fn inference_partial_fill_leaves_remainder() {
     // parties: the traffic is a self-trade — `seller_note == buyer_note` by
     // construction (see the file header). Such a claim would also pass if one
     // leg were simply copied into both columns. What self-trade does NOT rule
-    // out is asserted instead: both LEGS (two distinct orders) moved, the
-    // trade landed on the tape, and its direction is right.
+    // out is asserted instead: the trade landed on the tape with the right
+    // direction, and the TAKER leg moved — 4 placed, 2 filled, 2 still resting.
+    // The maker leg is deliberately not re-read from `/orders`: it is the same
+    // note under a self-trade, so its row would add no independent fact here.
     if let Some(service) = read.as_ref() {
         let trades = poll_read_with("IX-SEQ-03 trade in /trades", budget.left(), || {
             let service = std::sync::Arc::clone(service);

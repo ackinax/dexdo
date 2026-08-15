@@ -739,8 +739,9 @@ async fn apply_inference_order_expired(
 /// The row is therefore closed ONLY past the deadline and only into `EXPIRED`.
 /// There is deliberately no `CANCELLED` branch here. The refund knows nothing
 /// about whether the taker filled — `InferenceFilled` knows that, and if it is
-/// deferred over a missing leg the drain still moves on
-/// (`indexer_repo.rs:522`), so the refund would be applied BEFORE its own fill.
+/// deferred over a missing leg the drain still moves on (the `Deferred` arms of
+/// `reproject_pending_from` leave the row unmarked and take the next one), so the
+/// refund would be applied BEFORE its own fill.
 /// Closing the row would leave a filled order cancelled forever: on the fill's
 /// retry the terminal guard in `apply_filled_decrement` forbids both the
 /// decrement and the transition to `FILLED`.

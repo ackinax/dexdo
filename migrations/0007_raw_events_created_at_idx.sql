@@ -1,25 +1,29 @@
 -- 2026 (c) Copyright Contributors to the GOSH DAO. All rights reserved.
 --
--- Окно по времени ПРИЁМА. До этой миграции по `raw_events` можно было спросить
--- «что пришло по цепному времени» (`raw_events_created_at_chain_idx`), но не
--- «что приехало за последние N минут»: единственный индекс по `created_at`
--- отсутствовал, а оба индекса по `src_address` частичные по `processed_at is
--- null` и обработанные строки не видят.
+-- A window over INGEST time. Before this migration `raw_events` could answer "what
+-- arrived by chain time" (`raw_events_created_at_chain_idx`) but not "what arrived in
+-- the last N minutes": there was no index on `created_at` at all, and both
+-- `src_address` indexes are partial on `processed_at is null` and cannot see
+-- processed rows.
 --
--- Индекс полный, не частичный, и это осознанная плата: `raw_events` — самая
--- пишущая таблица схемы, и восьмой btree на ней стоит записи. Берётся потому,
--- что предиката, который сузил бы его без потери смысла, здесь нет: окну прогона
--- нужны строки в любом состоянии обработки. Пользуются им наблюдатель e2e
--- (`pending_projection_since`, `count_undecodable_since`,
--- `inference_books_with_events_since`, `inference_anchored_books_since`) и
--- оператор, у которого до сих пор не было способа спросить «что приехало за
--- последний час» иначе как полным сканом.
+-- The index is full rather than partial, and that is a deliberate price: `raw_events`
+-- is the most write-heavy table in the schema, and an eighth btree on it costs writes.
+-- It is taken because there is no predicate that would narrow it without losing the
+-- point: a run window needs rows in any processing state. Its users are the e2e
+-- observer (`pending_projection_since`, `count_undecodable_since`,
+-- `inference_books_with_events_since`, `inference_anchored_books_since`) and an
+-- operator who until now had no way to ask "what arrived in the last hour" other than
+-- a full scan.
 --
--- Построение берёт SHARE на `raw_events` и блокирует запись на своё время.
--- `CONCURRENTLY` здесь невозможен: `sqlx::migrate!` крутит миграцию в
--- транзакции. Работающую систему это не стоит — индексер применяет миграции до
--- старта своих циклов (`services/indexer/src/main.rs:46`), — но `raw_events`
--- это та самая таблица, ради распухания которой заведён staging-diag, и на
--- крупной базе деплой заметно удлинится. Ожидать этого, а не расследовать.
+-- Building it takes a SHARE lock on `raw_events` and blocks writes for its duration.
+-- `CONCURRENTLY` is deliberately NOT used, and it is not unavailable: sqlx runs a
+-- migration outside a transaction when its file opens with `-- no-transaction`
+-- (sqlx-core `migrate::source`), which is what `create index concurrently` needs. It
+-- is declined because a concurrent build that fails leaves an INVALID index behind,
+-- which then has to be found and dropped by hand — a worse failure mode than a slow
+-- deploy for an index this cheap to build. The blocking build costs a running system
+-- nothing anyway: the indexer applies migrations before starting its loops
+-- (`services/indexer/src/main.rs`). On a large database expect the deploy to take
+-- noticeably longer, rather than investigating it.
 
 create index raw_events_created_at_idx on raw_events (created_at);

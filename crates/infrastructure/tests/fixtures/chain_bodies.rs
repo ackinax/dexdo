@@ -161,9 +161,11 @@ pub const HARVESTED_INFERENCE_REFUNDED_DECODED: &str = r#"{"note":"0:a803c512a54
 // candidates. Recorded for Task 7.
 //
 // `dst` matters here in a way it does not for `InferenceOrderBook.*`:
-// `TokenContract.ContractDeployed` collides on event id with
-// `RootModel.ContractDeployed` (`decoder.rs`'s route table, event id 732 vs
-// 703), so decoding it without `dst` returns `AmbiguousCollision`. The `dst`
+// `TokenContract.ContractDeployed` and `RootModel.ContractDeployed` have
+// byte-identical signatures and therefore ONE shared body id; only the external
+// `dst` separates them (`decoder.rs`'s route table: 732 routes to the deal,
+// 703 to the root model). Decoding without `dst` returns `AmbiguousCollision`,
+// since both loaded ABIs claim that id. The `dst`
 // recorded below is the gateway-encoded string exactly as `raw_events` and the
 // decoder's route table use it (`:` + event id as 64 lowercase hex digits,
 // `config::event_type_dst`) — passing it uniformly to every constant below is

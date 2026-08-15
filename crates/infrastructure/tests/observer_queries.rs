@@ -249,16 +249,23 @@ async fn a_verdict_needs_a_reason_and_a_superseded_book_needs_none() {
     let failing_without = "0:obsq_failing_without";
     let superseded = "0:obsq_superseded";
     let discovering = "0:obsq_discovering";
-    let scope: Vec<String> = [visible, failing_with, failing_without, superseded, discovering]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let recovered = "0:obsq_recovered";
+    let scope: Vec<String> =
+        [visible, failing_with, failing_without, superseded, discovering, recovered]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
 
     seed_book(&pool, visible, true, false, None, false).await;
     seed_book(&pool, failing_with, false, true, Some("getVersion reverted"), false).await;
     seed_book(&pool, failing_without, false, true, None, false).await;
     seed_book(&pool, superseded, false, false, None, true).await;
     seed_book(&pool, discovering, false, false, None, false).await;
+    // Failed once, reconciled since — and still carrying the old text, because
+    // 0006 deliberately does not clear it on success. This is the common shape
+    // on the stand, not a corner case: `NoBoc` stamps a failure on practically
+    // every book before its first BOC.
+    seed_book(&pool, recovered, true, true, Some("NoBoc"), false).await;
 
     let repo = IndexerRepository::new(pool.clone());
     let mut without = repo.inference_books_without_verdict(&scope).await.unwrap();
@@ -274,7 +281,11 @@ async fn a_verdict_needs_a_reason_and_a_superseded_book_needs_none() {
     assert_eq!(
         failing,
         vec![(failing_with.to_string(), "getVersion reverted".to_string())],
-        "the printed failing list carries the reason: without it the step is green but unreadable"
+        "the printed failing list carries the reason, and holds ONLY books that are \
+         still invisible: `recovered` reconciled after its failure and must not be \
+         reported as failing just because 0006 keeps the old text. Without the \
+         `last_reconciled_at is null` clause this list disagrees with the `failing` \
+         bucket of indexer_inference_markets and the observer names healthy books"
     );
 
     sqlx::query("delete from inference_markets where orderbook_address = any($1)")

@@ -347,14 +347,20 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
                     GetOutcome::Fatal(why) => Probe::Fatal(why),
                     GetOutcome::Ok(body) => {
                         let all = body["orders"].as_array().cloned().unwrap_or_default();
-                        let done = all.iter().any(|o| {
+                        // Poll for PRESENCE of the fact — the order left OPEN,
+                        // i.e. some terminal verdict was projected — and leave
+                        // WHICH verdict to the asserts below. Requiring
+                        // "CANCELLED" here instead would report a wrong terminal
+                        // status (an EXPIRED where a CANCELLED belongs) as an
+                        // expired budget, which names the indexer's speed for
+                        // what is actually a projector defect.
+                        let settled = all.iter().find(|o| {
                             o["orderId"].as_str() == Some(want.as_str())
-                                && o["status"].as_str() == Some("CANCELLED")
+                                && o["status"].as_str() != Some("OPEN")
                         });
-                        if done {
-                            Probe::Ready(all)
-                        } else {
-                            Probe::Pending(format!("order {want} not CANCELLED yet"))
+                        match settled {
+                            Some(_) => Probe::Ready(all),
+                            None => Probe::Pending(format!("order {want} still OPEN or absent")),
                         }
                     }
                 }
@@ -369,11 +375,10 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
                 match by_id(&cancelled_id) {
                     None => failures.push(format!("order {cancelled_id} missing from /orders")),
                     Some(o) => {
-                        // Defensive re-read: `poll_read_with`'s `Probe::Ready`
-                        // condition above already required this order to be
-                        // CANCELLED, so this cannot fail in practice. Kept for
-                        // the same reason `finish` is kept — a cheap check
-                        // that costs nothing to state explicitly.
+                        // THE status assert, not a defensive re-read: the poll
+                        // above waits only for the order to leave OPEN, so a
+                        // wrong terminal verdict lands here — named as a wrong
+                        // status rather than reported as a read-model timeout.
                         if o["status"].as_str() != Some("CANCELLED") {
                             failures.push(format!(
                                 "cancelled order: want CANCELLED, got {}",

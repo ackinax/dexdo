@@ -23,7 +23,7 @@
 //! (`specs/2026-08-13-wave4-harvest.md`, Task 1 Step 4), not from this test's own first
 //! run. That is a deliberate exception to the "assert from an independent source, not
 //! from the first green run" rule that governs the body-decoding tests in this same
-//! wave (`decode_real_bodies.rs`, `decode_candidates.rs`): there the assert is on ABI
+//! wave (`decode_real_bodies.rs`): there the assert is on ABI
 //! parsing, which has an independent source (the ABI/contract source and a second
 //! decoder). Here the assert is on the STATE of one specific account at one specific
 //! moment — there is no independent source for that, only the recorded run. The
