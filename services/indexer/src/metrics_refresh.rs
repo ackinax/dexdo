@@ -142,7 +142,9 @@ async fn refresh_once(repo: &IndexerRepository, metrics: &IndexerMetrics, cursor
 
 #[cfg(test)]
 mod tests {
+    use dodex_infrastructure::config::DatabaseSection;
     use dodex_infrastructure::config::METRIC_CRITICAL_EVENT_TYPES;
+    use dodex_infrastructure::database;
     use dodex_infrastructure::indexer_repo::IndexerRepository;
     use dodex_metrics::IndexerMetrics;
 
@@ -263,5 +265,116 @@ mod tests {
             "order-status buckets must freeze"
         );
         assert_eq!(metrics.inference_wedged_books_value(), 25, "wedged-books must freeze");
+    }
+
+    // The counterpart of the closed-pool test above: there only the eight Err arms
+    // run, so every Ok arm — and every tuple decode inside it — goes unexercised.
+    // The components are all i64 on the way in and u64 on the way out, so swapping
+    // `price_lag` with `sweep_lag`, or two market-state buckets, compiles and passes
+    // the whole suite. This seeds rows whose buckets and ages DIFFER, so a swap
+    // changes a number that is asserted.
+    //
+    // Lower bounds rather than equality: the gauges are whole-table and siblings
+    // write to the same database, so the seeded rows can only add to a bucket, never
+    // remove from one, and can only make a staleness maximum larger.
+    #[tokio::test]
+    async fn refresh_once_on_a_live_pool_fills_every_gauge_from_its_own_query() {
+        let url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(v) if !v.is_empty() => v,
+            _ => {
+                eprintln!("skipping: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let cfg = DatabaseSection {
+            url,
+            max_connections: 2,
+            min_connections: 0,
+            connect_timeout_ms: 5_000,
+        };
+        let pool = database::build_pool(&cfg).await.expect("TEST_DATABASE_URL connect");
+        database::run_migrations(&pool).await.expect("run migrations");
+
+        let ob = "refresh_once_live.book";
+        sqlx::query("delete from inference_markets where orderbook_address = $1")
+            .bind(ob)
+            .execute(&pool)
+            .await
+            .expect("purge market");
+        sqlx::query("delete from inference_orders where orderbook_address = $1")
+            .bind(ob)
+            .execute(&pool)
+            .await
+            .expect("purge orders");
+        sqlx::query(
+            r#"insert into inference_markets
+                   (orderbook_address, last_reconciled_at, reference_price_at, last_swept_at)
+               values ($1, now(), now() - interval '700 seconds', now() - interval '200 seconds')"#,
+        )
+        .bind(ob)
+        .execute(&pool)
+        .await
+        .expect("insert visible market");
+        // Asymmetric buckets: 1 OPEN, 2 FILLED, 0 CANCELLED, 3 EXPIRED.
+        for (order_id, status) in [
+            (1i64, "OPEN"),
+            (2, "FILLED"),
+            (3, "FILLED"),
+            (4, "EXPIRED"),
+            (5, "EXPIRED"),
+            (6, "EXPIRED"),
+        ] {
+            sqlx::query(
+                r#"insert into inference_orders
+                       (orderbook_address, order_id, is_buy, price, amount_initial,
+                        amount_remaining, status, last_chain_order)
+                   values ($1, $2, true, 100, 100, 100, $3, $2::text)"#,
+            )
+            .bind(ob)
+            .bind(order_id)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("insert order");
+        }
+
+        let repo = IndexerRepository::new(pool.clone());
+        let (_provider, metrics) = IndexerMetrics::new_in_memory_for_tests();
+        refresh_once(&repo, &metrics, "refresh_once_live_test_stream").await;
+
+        assert_eq!(
+            metrics.metrics_refresh_failures_count(),
+            0,
+            "a live pool must not bump the failure counter"
+        );
+
+        let (_disc, visible, _failing) = metrics.inference_market_states_value();
+        assert!(visible >= 1, "the seeded visible book must reach the market-state gauge");
+
+        // The two staleness ages are the swap this test exists for: the seed makes
+        // the price age (>=700s) strictly larger than the sweep age (>=200s), and a
+        // whole-table maximum can only grow, so an exchanged pair breaks the second
+        // assert.
+        let price_lag = metrics.inference_reference_price_lag_seconds_value();
+        let sweep_lag = metrics.inference_sweep_lag_seconds_value();
+        assert!(price_lag >= 700, "reference-price lag gauge: {price_lag}");
+        assert!(sweep_lag >= 200, "sweep lag gauge: {sweep_lag}");
+
+        let (open, filled, _cancelled, expired) = metrics.inference_order_counts_value();
+        assert!(
+            open >= 1 && filled >= 2 && expired >= 3,
+            "order buckets: {open}/{filled}/{expired}"
+        );
+
+        sqlx::query("delete from inference_markets where orderbook_address = $1")
+            .bind(ob)
+            .execute(&pool)
+            .await
+            .expect("cleanup market");
+        sqlx::query("delete from inference_orders where orderbook_address = $1")
+            .bind(ob)
+            .execute(&pool)
+            .await
+            .expect("cleanup orders");
     }
 }
