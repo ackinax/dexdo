@@ -477,7 +477,7 @@ The repository ships a ready dashboard and alert rules under `deploy/grafana/`:
 | File | What it is | How to use |
 | --- | --- | --- |
 | [`deploy/grafana/dodex-indexer-dashboard.json`](../deploy/grafana/dodex-indexer-dashboard.json) | Grafana dashboard covering every indexer metric — ingestion (`raw_events` counters), projection pipeline (backlog/lag/cursor age/fallbacks), DB pool, and inference markets (state, order depth, reconcile failures, price/sweep staleness) | Grafana → Dashboards → Import → Upload JSON; pick your Prometheus when prompted |
-| [`deploy/grafana/provisioning/alerting/dodex-indexer-alerts.yaml`](../deploy/grafana/provisioning/alerting/dodex-indexer-alerts.yaml) | 19 Grafana-managed alert rules (projection/cursor lag, decode errors, refresh-loop liveness, inference markets `failing`, reference-price & sweep staleness, dropped orphans), warning→critical | Copy to Grafana's `/etc/grafana/provisioning/alerting/` and restart Grafana |
+| [`deploy/grafana/provisioning/alerting/dodex-indexer-alerts.yaml`](../deploy/grafana/provisioning/alerting/dodex-indexer-alerts.yaml) | 20 Grafana-managed alert rules (projection/cursor lag, decode errors, unclaimed events, refresh-loop liveness, inference markets `failing`, reference-price & sweep staleness, dropped orphans), warning→critical | Copy to Grafana's `/etc/grafana/provisioning/alerting/` and restart Grafana |
 
 Three setup notes, also documented in the files themselves:
 
