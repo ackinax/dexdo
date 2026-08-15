@@ -127,46 +127,37 @@ struct PendingRow {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What [`IndexerRepository::dead_letter_verdict`] says about a deferred row: not
+/// admitted, or admitted with the repair path that applies to it. Carrying the
+/// path in the verdict is the point — see that function for the drift a bare
+/// `bool` allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeadLetterVerdict {
+    /// Stays Deferred: the type is not dead-letterable, the row has not reached
+    /// the cutoff, or capture is not at head.
+    NotDeadLetterable,
+    /// An `InferenceOrderBook.*` depth update — the book's own repair runs before
+    /// the row is dropped.
+    Book,
+    /// `OracleEventList.RangeEventAdded` — it annotates a row it does not create,
+    /// so there is no partial state to correct, only a loss to name.
+    RangeEvent,
+}
+
 impl IndexerRepository {
-    /// Event types whose deferral is allowed to end in a dead letter, and why
-    /// each one is here. This is an ALLOW-LIST on purpose: the cutoff asserts
-    /// "this parent will never arrive", which is a claim about a specific parent,
-    /// not a property of deferral in general. `projectors.rs` defers in fourteen
-    /// places and nearly all of them wait for something that legitimately arrives
-    /// later — `PMPDeployed` waits for its `token_type` to show up in
-    /// `ref_tokens`, and `TimingsSet`, `PoolsFrozen`, `Resolved` and the
-    /// cancellation events wait for their own `PMPDeployed`. At the 30-minute
-    /// production cutoff (`indexer.yaml.j2`), dead-lettering those would kill a
-    /// market silently and permanently: the row is marked processed and never
-    /// re-asked (IX-FAIL-06).
-    const DEAD_LETTERABLE: &'static [&'static str] = &[
-        // The book's own events. The parent `InferenceOrderPlaced` is captured
-        // from the same address in the same stream, so if it has not arrived by
-        // the cutoff with capture at head, it was dropped and is not coming.
-        // `repair_expired_inference_orphan` fixes depth on whichever leg is
-        // present before the row is dropped.
-        "InferenceOrderBook.",
-        // The range binding. `RangeEventAdded` annotates an `oracle_events` row
-        // it does not create, and its parents (`OracleEventListDeployed`,
-        // `EventAdded`) come from an oracle list that may have been deployed
-        // BEFORE this deployment's capture cursor ever started — in which case
-        // they are not late, they lie outside the captured history. Nothing in
-        // the read model to repair; the row is dropped with a `warn!` naming the
-        // loss.
-        //
-        // Entries are matched by `starts_with`, so an entry may be either a full
-        // event name or a contract prefix, and the two carry different promises.
-        // `OracleEventList.RangeEventAdded` is a FULL name on purpose: its
-        // sibling `OracleEventList.EventAdded` must NOT be dead-letterable —
-        // that parent arrives legitimately later, and dropping it would kill a
-        // market silently. `InferenceOrderBook.` above is a prefix on purpose
-        // too: every event the book can defer is a depth update whose parent
-        // `OrderPlaced` lies outside the captured history, so a future book
-        // event inherits the same verdict rather than becoming pending forever.
-        // Adding a full name here is therefore a narrow decision; adding a
-        // prefix authorises every present and future event of that contract.
-        "OracleEventList.RangeEventAdded",
-    ];
+    /// The dead letter is an ALLOW-LIST decision, not a property of deferral in
+    /// general: the cutoff asserts "this parent will never arrive", which is a
+    /// claim about a specific parent. `projectors.rs` defers in fourteen places
+    /// and nearly all of them wait for something that legitimately arrives later
+    /// — `PMPDeployed` waits for its `token_type` to show up in `ref_tokens`, and
+    /// `TimingsSet`, `PoolsFrozen`, `Resolved` and the cancellation events wait
+    /// for their own `PMPDeployed`. At the 30-minute production cutoff
+    /// (`indexer.yaml.j2`), dead-lettering those would kill a market silently and
+    /// permanently: the row is marked processed and never re-asked (IX-FAIL-06).
+    ///
+    /// The list itself lives in [`Self::dead_letter_verdict`], which is also what
+    /// picks the repair path — one decision rather than an allow-list here and a
+    /// separate `starts_with` at each call site.
     /// Shared subquery for "addresses that emitted at least one event inside the
     /// run window". Shared by `inference_books_with_events_since` and
     /// `inference_anchored_books_since`: their window predicate must be
@@ -611,34 +602,43 @@ impl IndexerRepository {
                     stats.applied += 1;
                 }
                 Ok(ProjectionOutcome::Deferred) => {
-                    if Self::is_dead_letterable_orphan(
+                    let verdict = Self::dead_letter_verdict(
                         &row,
                         self.inference_orphan_cutoff,
                         capture_at_head,
-                    ) {
+                    );
+                    if verdict != DeadLetterVerdict::NotDeadLetterable {
                         // Repair the present resting leg(s) before dropping the row
                         // whose parent will never arrive (the repair emits the warn
                         // naming the data consequence). A repair DB error aborts this
                         // optimistic batch like a projector error; the savepointed
                         // replay then isolates the row.
-                        let repaired = if event.event_type.starts_with("InferenceOrderBook.") {
-                            crate::inference_projectors::repair_expired_inference_orphan(
-                                &mut tx, &event, &node,
-                            )
-                            .await
-                            .map(|_| ())
-                        } else {
-                            // Nothing in the read model to repair: `RangeEventAdded`
-                            // annotates a row it does not create, so with the parent
-                            // gone there is no partial state to correct. The loss is
-                            // still named — a silent drop is indistinguishable from a
-                            // row that was never captured at all.
-                            warn!(
-                                msg_id = %row.msg_id,
-                                event_type = ?event.event_type,
-                                "orphan past cutoff dead-lettered: parent lies outside the captured history; nothing in the read model to repair"
-                            );
-                            Ok(())
+                        let repaired = match verdict {
+                            DeadLetterVerdict::Book => {
+                                crate::inference_projectors::repair_expired_inference_orphan(
+                                    &mut tx, &event, &node,
+                                )
+                                .await
+                                .map(|_| ())
+                            }
+                            DeadLetterVerdict::RangeEvent => {
+                                // Nothing in the read model to repair:
+                                // `RangeEventAdded` annotates a row it does not
+                                // create, so with the parent gone there is no
+                                // partial state to correct. The loss is still
+                                // named — a silent drop is indistinguishable from
+                                // a row that was never captured at all.
+                                warn!(
+                                    msg_id = %row.msg_id,
+                                    event_type = ?event.event_type,
+                                    "orphan past cutoff dead-lettered: parent lies outside the captured history; the range-to-book linkage is lost for this event"
+                                );
+                                Ok(())
+                            }
+                            DeadLetterVerdict::NotDeadLetterable => unreachable!(
+                                "the verdict gates this branch: a row that is not \
+                                 dead-letterable never reaches it"
+                            ),
                         };
                         match repaired {
                             Ok(()) => {
@@ -751,26 +751,34 @@ impl IndexerRepository {
                     stats.applied += 1;
                 }
                 Ok(ProjectionOutcome::Deferred) => {
-                    if Self::is_dead_letterable_orphan(
+                    let verdict = Self::dead_letter_verdict(
                         &row,
                         self.inference_orphan_cutoff,
                         capture_at_head,
-                    ) {
+                    );
+                    if verdict != DeadLetterVerdict::NotDeadLetterable {
                         // Repair the present leg(s) inside this row's savepoint, then
                         // release it; a repair error rolls back only this row.
-                        let repaired = if event.event_type.starts_with("InferenceOrderBook.") {
-                            crate::inference_projectors::repair_expired_inference_orphan(
-                                &mut sp, &event, &node,
-                            )
-                            .await
-                            .map(|_| ())
-                        } else {
-                            warn!(
-                                msg_id = %row.msg_id,
-                                event_type = ?event.event_type,
-                                "orphan past cutoff dead-lettered: parent lies outside the captured history; nothing in the read model to repair"
-                            );
-                            Ok(())
+                        let repaired = match verdict {
+                            DeadLetterVerdict::Book => {
+                                crate::inference_projectors::repair_expired_inference_orphan(
+                                    &mut sp, &event, &node,
+                                )
+                                .await
+                                .map(|_| ())
+                            }
+                            DeadLetterVerdict::RangeEvent => {
+                                warn!(
+                                    msg_id = %row.msg_id,
+                                    event_type = ?event.event_type,
+                                    "orphan past cutoff dead-lettered: parent lies outside the captured history; the range-to-book linkage is lost for this event"
+                                );
+                                Ok(())
+                            }
+                            DeadLetterVerdict::NotDeadLetterable => unreachable!(
+                                "the verdict gates this branch: a row that is not \
+                                 dead-letterable never reaches it"
+                            ),
                         };
                         match repaired {
                             Ok(()) => {
@@ -821,28 +829,51 @@ impl IndexerRepository {
         Ok(stats)
     }
 
-    /// Returns `true` when a deferred row has reached the dead-letter cutoff: its
-    /// type is in [`Self::DEAD_LETTERABLE`], its **ingest** age
+    /// What the dead-letter rule says about a deferred row — and, for a row it
+    /// admits, WHICH repair path applies.
+    ///
+    /// A row is admitted when its type is dead-letterable, its **ingest** age
     /// (`now() - raw_events.created_at`) exceeds the configured cutoff, AND the
     /// capture stream has drained to the chain tip (`capture_at_head`). The
     /// `at_head` requirement keeps a parent that is merely still-ahead in an
     /// in-progress backfill from being mistaken for one that was permanently
     /// dropped at capture — "the parent will never arrive" is only declared once
     /// capture has reached head.
-    fn is_dead_letterable_orphan(
+    ///
+    /// Returned instead of a bare `bool` on purpose. Both call sites used to
+    /// re-derive the repair path with a second, independent
+    /// `starts_with("InferenceOrderBook.")`, so a new entry admitted by the first
+    /// check would fall into the second's "nothing to repair" branch — silently,
+    /// and precisely for the type the allow-list was extended to protect. One
+    /// decision, taken once, removes that class of drift.
+    fn dead_letter_verdict(
         row: &PendingRow,
         cutoff: std::time::Duration,
         capture_at_head: bool,
-    ) -> bool {
-        capture_at_head
-            && row
-                .event_type
-                .as_deref()
-                .is_some_and(|t| Self::DEAD_LETTERABLE.iter().any(|p| t.starts_with(p)))
-            && (chrono::Utc::now() - row.created_at)
-                .to_std()
-                .map(|age| age > cutoff)
-                .unwrap_or(false)
+    ) -> DeadLetterVerdict {
+        if !capture_at_head {
+            return DeadLetterVerdict::NotDeadLetterable;
+        }
+        let aged =
+            (chrono::Utc::now() - row.created_at).to_std().map(|age| age > cutoff).unwrap_or(false);
+        if !aged {
+            return DeadLetterVerdict::NotDeadLetterable;
+        }
+        // The two arms are the two entries of the old allow-list, and they carry
+        // different promises. `InferenceOrderBook.` is a PREFIX on purpose: every
+        // event the book can defer is a depth update whose parent `OrderPlaced`
+        // lies outside the captured history, so a future book event inherits the
+        // same verdict rather than becoming pending forever.
+        // `OracleEventList.RangeEventAdded` is a FULL name on purpose: its sibling
+        // `OracleEventList.EventAdded` must NOT be dead-letterable — that parent
+        // arrives legitimately later, and dropping it would kill a market
+        // silently. Adding a full name here is a narrow decision; adding a prefix
+        // authorises every present and future event of that contract.
+        match row.event_type.as_deref() {
+            Some(t) if t.starts_with("InferenceOrderBook.") => DeadLetterVerdict::Book,
+            Some("OracleEventList.RangeEventAdded") => DeadLetterVerdict::RangeEvent,
+            _ => DeadLetterVerdict::NotDeadLetterable,
+        }
     }
 
     /// The unknown-event warning: normal target on the first sighting of an
@@ -1645,6 +1676,74 @@ fn next_pass_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `PendingRow` with only the fields the verdict reads.
+    fn pending_row_for_test(
+        event_type: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> PendingRow {
+        PendingRow {
+            id: 1,
+            msg_id: "m".to_string(),
+            chain_order: "co".to_string(),
+            src_address: None,
+            dst_address: None,
+            event_type: Some(event_type.to_string()),
+            decoded: None,
+            ts: None,
+            created_at,
+        }
+    }
+
+    /// The verdict names the repair path, not just admission — which is the whole
+    /// reason it replaced a `bool`. Admission and repair used to be two independent
+    /// `starts_with` checks, so a type the first admitted could reach the second's
+    /// "nothing to repair" branch silently.
+    #[test]
+    fn dead_letter_verdict_names_the_repair_path_not_just_admission() {
+        let cutoff = std::time::Duration::from_secs(1);
+        let old = chrono::Utc::now() - chrono::Duration::seconds(3600);
+
+        let book = pending_row_for_test("InferenceOrderBook.InferenceFilled", old);
+        assert_eq!(
+            IndexerRepository::dead_letter_verdict(&book, cutoff, true),
+            DeadLetterVerdict::Book
+        );
+        // The prefix covers a type nobody has written a projector for yet: that is
+        // what "prefix on purpose" means, and it must hold for a future event too.
+        let future_book = pending_row_for_test("InferenceOrderBook.SomethingNewInV5", old);
+        assert_eq!(
+            IndexerRepository::dead_letter_verdict(&future_book, cutoff, true),
+            DeadLetterVerdict::Book
+        );
+
+        let range = pending_row_for_test("OracleEventList.RangeEventAdded", old);
+        assert_eq!(
+            IndexerRepository::dead_letter_verdict(&range, cutoff, true),
+            DeadLetterVerdict::RangeEvent
+        );
+        // The sibling from the SAME contract must not be admitted: its parent
+        // arrives legitimately later, and dead-lettering it kills a market
+        // silently. This is the assert that makes "full name, not prefix" real.
+        let sibling = pending_row_for_test("OracleEventList.EventAdded", old);
+        assert_eq!(
+            IndexerRepository::dead_letter_verdict(&sibling, cutoff, true),
+            DeadLetterVerdict::NotDeadLetterable
+        );
+
+        // Not at head: nothing is dead-letterable, whatever the type — a parent
+        // still ahead in a backfill is not a parent that will never arrive.
+        assert_eq!(
+            IndexerRepository::dead_letter_verdict(&book, cutoff, false),
+            DeadLetterVerdict::NotDeadLetterable
+        );
+        // Fresh: the cutoff refuses it, not the type.
+        let fresh = pending_row_for_test("InferenceOrderBook.InferenceFilled", chrono::Utc::now());
+        assert_eq!(
+            IndexerRepository::dead_letter_verdict(&fresh, cutoff, true),
+            DeadLetterVerdict::NotDeadLetterable
+        );
+    }
 
     #[test]
     fn parses_integer_unix_seconds() {
