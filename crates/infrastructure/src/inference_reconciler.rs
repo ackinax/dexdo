@@ -625,12 +625,23 @@ impl InferenceReconciler {
         // and the row is left alone. A good-till-cancel bid answers zero on both, so it
         // is never repaired — correctly, because a zero there is the value, not a gap.
         //
-        // WHICH non-zero-on-chain NULL this repair recovers is NOT established here, and
-        // two review rounds have now produced a confident wrong answer to that question
-        // by reasoning from this file instead of reading `InferenceOrderBook.sol`. Do not
-        // add a third. `upsert_resting_order` is the only writer of these rows and it
-        // decodes both fields from mandatory ABI inputs; establish the reachable case
-        // from the contract and the projector before describing it.
+        // WHICH NULL this repair recovers, established from the contract and from git
+        // rather than from this file — two earlier attempts to answer it by reasoning
+        // from the Rust alone were both wrong:
+        //
+        // Not a live race with the placement. `placeSellOffer` passes `msg.sender` as the
+        // order's TokenContract (`InferenceOrderBook.sol:1605` into `_enqueuePlace`'s
+        // `tc`, and `msg.sender` is verified to be that contract two lines earlier),
+        // `InferenceOrderPlaced` carries `e.tokenContract` verbatim from that queue entry,
+        // and `apply_inference_order_placed` decodes it strictly. So for anything the
+        // current projector writes, a SELL's `token_contract` is never NULL and a BUY's
+        // always is — there is no window in which the indexer "does not know it yet".
+        //
+        // The reachable case is LEGACY ROWS. Before 9350896 `upsert_resting_order` did not
+        // write `token_contract` at all, so every row it inserted has NULL there, SELL
+        // included. Nothing backfilled them: this repair is their migration path, and the
+        // getter supplies what the placement never recorded. `deadline` arrived in the
+        // same commit and reaches its non-NULL values the same way.
         let mut to_cancel: Vec<String> = Vec::new();
         // Repairs are accumulated, not applied per order: one UPDATE per row would cost a
         // round trip each, and at ~95 ms against the deployed database a 50-row batch
