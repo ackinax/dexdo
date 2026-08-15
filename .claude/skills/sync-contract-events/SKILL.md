@@ -7,7 +7,7 @@ description: Use when the smart contracts have been updated — a contracts sync
 
 Audit what the backend must change after a contract update. Two distinct event identities drive everything:
 
-- **ABI signature id** (32-bit hash of the event name + input types) — how the decoder recognizes a body. Built at **compile time**: `crates/infrastructure/src/decoder.rs` embeds the ABIs via `include_str!` (`DEX_ABIS`: RootOracle, Oracle, OracleEventList, PMP, OrderBook, RootPN, PrivateNote, Nullifier; `INFERENCE_ABIS`: InferenceOrderBook, TokenContract). `RootModel`/`SuperRoot` ABIs exist in the repo but are NOT loaded. Changing an `.abi.json` requires rebuild + redeploy.
+- **ABI signature id** (32-bit hash of the event name + input types) — how the decoder recognizes a body. Built at **compile time**: `crates/infrastructure/src/decoder.rs` embeds the ABIs via `include_str!` (`DEX_ABIS`: RootOracle, Oracle, OracleEventList, PMP, OrderBook, RootPN, PrivateNote, Nullifier; `INFERENCE_ABIS`: InferenceOrderBook, TokenContract). `RootModel` is loaded too (it resolves the `ContractDeployed` id collision with `TokenContract` — see `add_route`); `SuperRoot`'s ABI exists in the repo but is NOT loaded. Changing an `.abi.json` requires rebuild + redeploy.
 - **EVENT_ID constant** (`contracts/dex/modifiers/modifiers.sol`, e.g. `OB_QUEUED = 159`) — the external `dst` each event is emitted to (`:{id:064x}`). Used by the ingest ignore-filter (`config::ignored_event_dsts`) and by decoder dst routes for colliding signature ids.
 
 Two scripts ship with this skill: `diff-events.sh` (ABI event sets, Step 1) and
@@ -98,9 +98,14 @@ The decoder auto-knows whatever is in the embedded ABIs, so the gap to audit is 
 # DEX projector arms (full event_type match)
 sed -n '/match event.event_type.as_str/,/ProjectionOutcome::Unknown/p' crates/infrastructure/src/projectors.rs \
   | sed 's/=>.*//' | grep -oE '"[A-Za-z.]+"' | tr -d '"' | sort -u
-# Inference / TokenContract arms (suffix match, prefix stripped)
+# Inference / TokenContract arms. These two dispatch on an ENUM, not on strings, so
+# grep for the variants — a string-grep here picks up comment text and apply_close()
+# arguments instead. And it is `match kind`: the one `match suffix` left in
+# inference_projectors.rs is the orphan-repair dispatch, so a grep for that prints
+# four unrelated names while looking like a complete answer.
+# Expect 9 and 15 — the same numbers as the decoder's per-ABI id counts.
 for f in crates/infrastructure/src/inference_projectors.rs crates/infrastructure/src/token_contract_projectors.rs; do
-  echo "== $f"; sed -n '/match suffix/,/_ =>/p' "$f" | sed 's/=>.*//' | grep -oE '"[A-Za-z]+"' | sort -u
+  echo "== $f"; awk '/match kind \{/,/^    \}$/' "$f" | grep -oE 'E::[A-Za-z]+' | sort -u
 done
 # Config-ignorable set + its dst ids
 sed -n '/pub const IGNORABLE_EVENT_TYPES/,/^];/p; /pub const IGNORABLE_EVENT_IDS/,/^];/p' crates/infrastructure/src/config.rs
@@ -152,7 +157,7 @@ What breaks, by change kind:
 |---|---|
 | `contracts/{dex,airegistry}/*.{abi.json,tvc,sol}` | Artifact sync from acki-nacki compiled dir (rebuild required — ABIs are `include_str!`). Audit the `.sol` diff too — see [Step 1b](#step-1b--diff-the-sol-sources-mandatory-not-optional) |
 | `contracts/dex/modifiers/modifiers.sol` | EVENT_ID constants (external dst ids) — may arrive with the sync or in a separate one (see Step 2 note) |
-| `crates/infrastructure/src/decoder.rs` | New contract → add to `DEX_ABIS`/`INFERENCE_ABIS`; colliding id → `add_route`; tests pin the total counts (`known_events() == 72` and `unique_event_ids() == 72` today) — update both on any add/remove |
+| `crates/infrastructure/src/decoder.rs` | New contract → add to `DEX_ABIS`/`INFERENCE_ABIS`; colliding id → `add_route`; tests pin the total counts (`known_events() == 82` and `unique_event_ids() == 82` today, at decoder.rs:296 and :398) — update both on any add/remove |
 | `crates/infrastructure/src/projectors.rs` (+ `inference_projectors.rs`, `token_contract_projectors.rs`) | Match arm per event: `apply_*` or no-op `Applied` |
 | `crates/infrastructure/src/config.rs` | `IGNORABLE_EVENT_TYPES` + `IGNORABLE_EVENT_IDS` (+ `METRIC_CRITICAL_EVENT_TYPES` if a new event backs a metric) |
 | `config/indexer.local.yaml`, `config/indexer.stage.supabase.yaml`, `deploy/ansible/roles/dexdo/templates/indexer.yaml.j2` | `ignored_event_types` entries |
@@ -165,6 +170,6 @@ What breaks, by change kind:
 
 - **Yaml first, code never**: adding a type to `ignored_event_types` that is not in `IGNORABLE_EVENT_TYPES` fails indexer **startup** — `IndexerConfig::validate` is an allow-list (rejects metric-critical, state-changing types, and typos). Code (`config.rs` + projector no-op arm) first, config second. (Ignore the stale comment in `config/indexer.stage.supabase.yaml` claiming only metric-critical types are rejected — the code is an allow-list.)
 - **Half-registering an ignorable**: `IGNORABLE_EVENT_TYPES` without the matching `IGNORABLE_EVENT_IDS` entry or projector no-op arm — config.rs unit tests and `ignorable_event_types_projector_noop.rs` fail. The ID comes from `modifiers.sol`, not from the ABI signature.
-- **Forgetting the decoder count pins**: any event add/remove breaks the `decoder.rs` tests asserting `known_events() == 72` and `unique_event_ids() == 72` — update both literals and the arithmetic comments next to them.
+- **Forgetting the decoder count pins**: any event add/remove breaks the `decoder.rs` tests asserting `known_events() == 82` and `unique_event_ids() == 82` — update both literals and the arithmetic comments next to them.
 - **Expecting a running service to see new ABIs**: `include_str!` — the fix ships with a rebuild + redeploy, not a config reload.
 - **Assuming unhandled events queue up**: `Unknown` rows are marked processed on first sight and pruned on stage after 3 days; a projector added later needs an explicit backfill.

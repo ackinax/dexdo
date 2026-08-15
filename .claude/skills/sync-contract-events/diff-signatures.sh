@@ -36,6 +36,20 @@ dir="${3:-contracts}"
 
 cd "$repo_root"
 
+# Both revisions must resolve, and the directory must exist in BOTH of them.
+# `git ls-tree` on a path that is not in the tree exits 0 with no output, so
+# without these guards a typo in <contracts-dir> makes `sigs` emit nothing for
+# both sides — an empty diff, and the all-clear message below. That is the exact
+# conclusion this script exists to disprove, printed with total confidence.
+# `set -e` cannot help: the failure is inside a process substitution, whose exit
+# status the shell never inspects.
+for rev in "$old_rev" "$new_rev"; do
+    git rev-parse --verify --quiet "${rev}^{commit}" >/dev/null \
+        || { echo "error: not a commit: $rev" >&2; exit 1; }
+    git ls-tree -r --name-only "$rev" -- "$dir" | grep -q '\.sol$' \
+        || { echo "error: no .sol files under '$dir' at $rev" >&2; exit 1; }
+done
+
 # Emit "Kind . <signature>" for every function in every .sol file at $1.
 # Comments are stripped first so a `function` word inside a doc block cannot
 # be mistaken for a declaration.

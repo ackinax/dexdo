@@ -60,7 +60,8 @@ select now() - min(reference_price_at) as price_lag,
        now() - min(last_swept_at)      as sweep_lag
   from inference_markets where last_reconciled_at is not null;
 
-select orderbook_address, last_swept_at, sweep_cursor, reconcile_attempts
+select orderbook_address, last_swept_at, sweep_cursor, reconcile_attempts,
+       last_reconcile_failed_at, last_reconcile_error
   from inference_markets where last_reconciled_at is not null
  order by last_swept_at asc nulls first limit 5;
 ```
