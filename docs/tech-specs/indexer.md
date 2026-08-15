@@ -709,3 +709,31 @@ The same gate applies to inference markets: an [`inference_markets`](data-schema
 `GET /api/v1/inference/orders` fails closed whenever it cannot vouch for the completeness of its view of a book — see [read-api.md § Fail-closed gate](read-api.md#fail-closed-gate). One of that gate's three arms reads the same [`indexer_cursors`](data-schema.md#indexer_cursors) row the capture loop maintains for `CAPTURE_STREAM` (`crates/infrastructure/src/indexer_repo.rs`): `at_head` alone only records that the *last* poll saw no next page, so the gate additionally requires that poll to have landed within `CAPTURE_FRESHNESS_SECS` (30s, `crates/infrastructure/src/config.rs`) of the request. A capture loop that stops polling — crashed, wedged, or simply configured with too coarse a `polling_interval_ms` — therefore turns every book's TokenContract-filtered live-SELL queries into `MarketInconsistent` / 503 once the last poll ages past that bound, independent of whether the loop is actually behind.
 
 `IndexerConfig::validate` refuses to start a config whose `indexer.polling_interval_ms` cannot land at least two polls inside that window: `2.0 * polling_interval_ms / 1000.0 <= CAPTURE_FRESHNESS_SECS`. Two polls, not one, because a single slow poll near the boundary must not be able to make every book unqueryable on its own — the margin absorbs one missed or delayed tick. The shipped configs poll every 3 s (`polling_interval_ms: 3000`), ten polls inside the 30 s window; raising it above 15 s trips this check at startup rather than failing silently at request time with no indication of why.
+
+## Глоссарий идентификаторов IX-*
+
+Комментарии тестов и кода ссылаются на строки матрицы тестов inference-контура
+идентификаторами вида `IX-SEQ-02`. Матрица — внешний планировочный документ, в
+репозиторий она не входит: идентификатор в комментарии называет ФАКТ, который
+тест обязан доказывать, и остаётся читаемым без неё. Префикс задаёт область.
+
+| Префикс | Область | Пример факта |
+|---|---|---|
+| `IX-CAP-*` | Захват: ребро GraphQL → строка `raw_events` | недекодируемое тело сохраняется с NULL `event_type` и растит `indexer_decode_errors` |
+| `IX-OB-*` | Проекция книги в `inference_orders` | нулевой `tokenContract` у BUY нормализуется в SQL NULL |
+| `IX-TC-*` | Проекция сеттлемента в `inference_deals` / `inference_ticks` | `StreamStopped` закрывает сделку с `clean_settlement` |
+| `IX-REC-*` | Реконсайлер: discovery, refresh, phantom sweep | недекодируемая строка не закрывает sweep-гейт |
+| `IX-GATE-*` | Чтение: видимость и fail-closed | непроецированная строка под книгой даёт 503 `MarketInconsistent` |
+| `IX-FAIL-*` | Отказы и повторы проекции | `Deferred` оставляет строку pending и повторяется по таймеру |
+| `IX-MET-*` | Метрики | каждый статус схемы имеет бакет в гейдже |
+| `IX-SEQ-*` | Сквозные цепочки на стенде | размещённый ордер доезжает до `/orders` и `/depth` |
+
+Это префиксы, фактически встречающиеся в репозитории. Матрица определяет и
+другие области (например ленту сделок), но на них здесь пока никто не ссылается —
+если такой идентификатор появится в коде, строку сюда надо дописать.
+
+Полный текст строки — в матрице
+(`specs/2026-08-11-inference-indexer-test-matrix.md` рабочего каталога
+планирования). Идентификатор в комментарии обязан сопровождаться прозой,
+объясняющей факт: комментарий, состоящий из одного идентификатора, не проходит
+ревью — он отсылает к документу, которого у читателя нет.
