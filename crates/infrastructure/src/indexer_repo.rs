@@ -1291,9 +1291,13 @@ impl IndexerRepository {
     /// "failed, then recovered through discovery" is already absent here.
     ///
     /// KNOWN GAP, and the reason this predicate is not tightened: a clean
-    /// *refresh* cycle does not clear the mark either, so a single transient
-    /// failure after visibility leaves a book named here until its next
-    /// discovery. The schema has no "currently failing" fact for a visible book;
+    /// *refresh* cycle does not clear the mark either, and for a visible book
+    /// NOTHING does — `select_discovery_candidates` requires
+    /// `last_reconciled_at is null`, and both sites that null it set
+    /// `superseded_at` in the same UPDATE, so a visible row never returns to
+    /// discovery. A single transient failure after visibility — a benign `NoBoc`
+    /// on a refresh tick included — therefore names the book here for the rest of
+    /// its life. The schema has no "currently failing" fact for a visible book;
     /// until it gains one (clear the mark on a clean refresh cycle, or compare
     /// `last_reconcile_failed_at` against `last_swept_at`/`reference_price_at`),
     /// this list errs toward naming a recovered book rather than staying silent

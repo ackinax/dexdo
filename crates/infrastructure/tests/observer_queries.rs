@@ -261,15 +261,14 @@ async fn a_verdict_needs_a_reason_and_a_superseded_book_needs_none() {
     seed_book(&pool, failing_without, false, true, None, false).await;
     seed_book(&pool, superseded, false, false, None, true).await;
     seed_book(&pool, discovering, false, false, None, false).await;
-    // Visible AND carrying a failure mark. On chain this shape means one thing
-    // only — the book worked and then broke: the visibility stamp
-    // (`advance_sweep_and_maybe_stamp`) clears `last_reconcile_failed_at` in the
-    // same UPDATE, so "failed, then recovered through discovery" cannot produce
-    // it, while `stamp_failure` writes the mark without touching
-    // `last_reconciled_at`. It is also the class no gauge can show: the
-    // `failing` bucket counts this book as `visible`. Hence it MUST appear in the
-    // observer's list below — hiding it would leave the most alarming state with
-    // no line of output anywhere.
+    // Visible AND carrying a failure mark. The shape means "failed at least once
+    // since becoming visible" — no more: nothing clears the mark for a visible
+    // book (see the KNOWN GAP on `inference_failing_books`), so a book broken
+    // right now and one that took a single transient `NoBoc` an hour ago look
+    // identical here. It is still the class that MUST be reported: no gauge can
+    // show it — the `failing` bucket counts this book as `visible` — so hiding it
+    // would leave a broken-right-now book with no line of output anywhere, and a
+    // false positive costs one line of diagnostics.
     seed_book(&pool, broke_after_visible, true, true, Some("getOrder reverted"), false).await;
 
     let repo = IndexerRepository::new(pool.clone());

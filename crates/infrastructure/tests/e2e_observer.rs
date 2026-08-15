@@ -138,8 +138,11 @@ async fn snapshot(repo: &IndexerRepository, since: i64) -> anyhow::Result<Result
 /// inside the loop and never reaches the tail of the test. Without it, "the reason
 /// is named" is indistinguishable from "something was written".
 ///
-/// Query errors are deliberately swallowed into defaults here: on the red path the
-/// diagnostics have no right to displace the real cause of the failure.
+/// Query errors are never propagated from here: on the red path the diagnostics have
+/// no right to displace the real cause of the failure. How each is absorbed differs by
+/// what its default would claim — the book list defaults to empty and the undecodable
+/// count to the `-1` sentinel, while a failed failing-books query is rendered inline,
+/// because there its default (`[]`) reads as the verdict "nobody is failing".
 async fn print_diagnostics(repo: &IndexerRepository, since: i64, elapsed: Duration) {
     let books = repo.inference_books_with_events_since(since).await.unwrap_or_default();
     let undecodable = repo.count_undecodable_since(since).await.unwrap_or(-1);

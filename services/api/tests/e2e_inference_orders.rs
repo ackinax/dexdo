@@ -386,9 +386,10 @@ async fn a_book_cancels_the_order_it_was_asked_to_and_never_takes_an_expired_one
                     None => failures.push(format!("order {cancelled_id} missing from /orders")),
                     Some(o) => {
                         // THE status assert, not a defensive re-read: the poll
-                        // above waits only for the order to leave OPEN, so a
-                        // wrong terminal verdict lands here — named as a wrong
-                        // status rather than reported as a read-model timeout.
+                        // above waits only for the order to leave `LIVE` (the
+                        // wire name — see the note on the poll), so a wrong
+                        // terminal verdict lands here, named as a wrong status
+                        // rather than reported as a read-model timeout.
                         if o["status"].as_str() != Some("CANCELLED") {
                             failures.push(format!(
                                 "cancelled order: want CANCELLED, got {}",
