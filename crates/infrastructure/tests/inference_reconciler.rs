@@ -1888,6 +1888,84 @@ async fn a_clean_cycle_clears_a_failure_mark_left_by_an_earlier_one() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn the_visibility_stamp_clears_the_failure_text_with_its_timestamp() {
+    // The one path that can clear this text, and it had no test. `clear_failure` is
+    // gated on `last_reconcile_failed_at is not null`, so a text the stamp leaves
+    // behind is unreachable for the rest of the row's life — no later pass, in either
+    // queue, can ever see it again.
+    //
+    // The seed is the ORDINARY cold start, not a contrived failure: a book's first
+    // discovery tick routinely hits `NoBoc` (the account is not on chain yet) and
+    // stamps both columns with NO_BOC_REASON. So before this clause the common
+    // outcome was a perfectly healthy visible book answering "account BOC not served
+    // yet" forever, and neither observer predicate fires on it — nothing goes red,
+    // the column just lies to whoever reads it.
+    let Some(pool) = setup().await else { return };
+    let ob = "0:t_stamp_clears_text";
+    let r = InferenceReconciler::for_test(pool.clone());
+
+    seed_market(&pool, ob, false).await;
+    r.stamp_failure(ob, InferenceReconciler::NO_BOC_REASON).await.unwrap();
+    sqlx::query(
+        "update inference_markets set sweep_cursor=null, sweep_cycle_max=10, sweep_override_seq=0
+          where orderbook_address=$1",
+    )
+    .bind(ob)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Not stamping yet: an incomplete cycle must leave BOTH columns exactly as they
+    // are — otherwise the assertions below would pass on a clause that clears
+    // unconditionally, which is a different bug in the same UPDATE.
+    let stamped =
+        r.advance_sweep_and_maybe_stamp(ob, None, "10", Some("3"), false, true, 0).await.unwrap();
+    assert!(!stamped, "an incomplete cycle does not stamp");
+    let (marked, text): (bool, Option<String>) = sqlx::query_as(
+        "select last_reconcile_failed_at is not null, last_reconcile_error
+           from inference_markets where orderbook_address = $1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(marked, "a non-stamping pass must leave the mark");
+    assert_eq!(
+        text.as_deref(),
+        Some(InferenceReconciler::NO_BOC_REASON),
+        "and must leave its text"
+    );
+
+    let stamped =
+        r.advance_sweep_and_maybe_stamp(ob, Some("3"), "10", None, true, true, 0).await.unwrap();
+    assert!(stamped, "a clean discovery cycle stamps visibility");
+
+    let (visible, marked, text): (bool, bool, Option<String>) = sqlx::query_as(
+        "select last_reconciled_at is not null, last_reconcile_failed_at is not null,
+                last_reconcile_error
+           from inference_markets where orderbook_address = $1",
+    )
+    .bind(ob)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(visible, "the book became visible");
+    assert!(!marked, "the stamp clears the failure timestamp");
+    assert!(
+        text.is_none(),
+        "and its text with it — this is the only writer that can, so a text surviving here \
+         is orphaned permanently: clear_failure will not touch a row whose timestamp is \
+         already NULL. Got {text:?}"
+    );
+
+    sqlx::query("delete from inference_markets where orderbook_address = $1")
+        .bind(ob)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 /// The two tests below hold the CALL in place, not just the query. The test above
 /// calls `clear_failure` directly, so deleting the only call site left the suite
 /// green with nothing but an unused-function warning — verified by deleting it.

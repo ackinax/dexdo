@@ -807,6 +807,14 @@ impl InferenceReconciler {
     /// `override_seq`. The seq guard closes the first-tick hole: when `prev_cursor` is
     /// NULL, an override that resets the cursor to NULL is invisible to the cursor-CAS,
     /// but it bumped the seq, so the guard fails and the stamp is blocked.
+    ///
+    /// The visibility stamp clears BOTH failure columns, and it is the only place that
+    /// can: `clear_failure` is gated on `last_reconcile_failed_at is not null`, so a
+    /// text left behind here would be unreachable for the rest of the row's life. That
+    /// was the state until this clause existed, and it was not an edge case — `NoBoc`
+    /// is the ordinary cold start, so the common outcome was a healthy visible book
+    /// answering "account BOC not served yet" forever to the one column an operator is
+    /// told to read for why a book is unhealthy.
     /// Returns whether `last_reconciled_at` was stamped.
     #[allow(clippy::too_many_arguments)]
     pub async fn advance_sweep_and_maybe_stamp(
@@ -827,6 +835,7 @@ impl InferenceReconciler {
                       last_swept_at = now(),
                       last_reconciled_at = case when $5 then now() else last_reconciled_at end,
                       last_reconcile_failed_at = case when $5 then null else last_reconcile_failed_at end,
+                      last_reconcile_error = case when $5 then null else last_reconcile_error end,
                       updated_at = now()
                 where orderbook_address = $1
                   and superseded_at is null
