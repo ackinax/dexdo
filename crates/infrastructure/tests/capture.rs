@@ -256,6 +256,23 @@ async fn bulk_insert_counts_new_and_conflicting_and_dedups_within_page() {
         .await
         .expect("count dup");
     assert_eq!(dup_count, 1, "a within-page duplicate msg_id must land exactly once");
+
+    // Clean up. This test used to purge only at its start, which is enough for
+    // ITS next run and wrong for everyone else's: the three rows stayed in
+    // `raw_events` forever, and `projection_lag_seconds_empty_queue_is_zero`
+    // (reprojection.rs) skips its assert whenever the eligible queue is not
+    // empty — so a leak here silently retires that contract on any long-lived
+    // database.
+    purge(
+        &pool,
+        &[
+            ("delete from raw_events where msg_id = $1", existing.as_str()),
+            ("delete from raw_events where msg_id = $1", fresh.as_str()),
+            ("delete from raw_events where msg_id = $1", dup.as_str()),
+            ("delete from indexer_cursors where stream_name = $1", CAPTURE_TEST_STREAM),
+        ],
+    )
+    .await;
 }
 
 #[tokio::test]

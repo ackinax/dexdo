@@ -80,7 +80,10 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 #     the SAME note. A note serialises its own operations through `_busy` and
 #     rejects a repeated message body outright, so two of these at once would
 #     have one of them silently dropped;
-#   * the trader-path binaries read and write the shared test database;
+#   * the trader-path binaries read and write the shared test database — and so
+#     does `e2e_inference_orders`, whose read-model phase raises the production
+#     router against it on the stand (`E2E_READ_MODEL`). It holds a note of its
+#     own, so it is here for the database alone;
 #   * everything that deploys a market sends an external `deployOracle` to the
 #     ONE `RootOracle` the whole stand shares. An external message carries a
 #     `timestamp` the contract compares against the last it accepted, so two
@@ -94,7 +97,8 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 # here at all.
 [[profile.ci-e2e.overrides]]
 filter = '''
-    binary(e2e_inference) | binary(e2e_inference_clob) | binary(e2e_register_account)
+    binary(e2e_inference) | binary(e2e_inference_clob) | binary(e2e_inference_orders)
+  | binary(e2e_register_account)
   | binary(e2e_batch_orders) | binary(e2e_buy_full_set) | binary(e2e_cancel_batch_orders)
   | binary(e2e_cancel_order) | binary(e2e_order)
 '''

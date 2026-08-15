@@ -4505,14 +4505,55 @@ async fn projection_lag_seconds_empty_queue_is_zero() {
     // on a shared DB (REPROJECTION_LOCK is in-process only, so it does not cross
     // nextest's process-per-test). Read the count on both sides of the lag read
     // and assert the empty-queue==0 contract only when the queue is observably
-    // empty across both — then it was empty during the lag read too. Otherwise a
-    // concurrent row makes the snapshots disagree and we skip rather than flake.
+    // empty across both — then it was empty during the lag read too.
     let pending_before = repo.count_pending_projection().await.expect("count_pending_projection");
     let lag = repo.projection_lag_seconds().await.expect("projection_lag_seconds");
     let pending_after = repo.count_pending_projection().await.expect("count_pending_projection");
     if pending_before == 0 && pending_after == 0 {
         assert_eq!(lag, 0, "empty eligible queue must return 0");
+        return;
     }
+
+    // Not empty — and skipping unconditionally here is what used to retire this
+    // contract for good. A sibling that panics before its cleanup leaves rows of
+    // exactly the eligible shape, and from that moment this test skips on every
+    // later run without saying so: green, and checking nothing.
+    //
+    // AGE is the discriminator, not a list of msg_id prefixes. A prefix list
+    // would need updating whenever a test seeds under a new name, and the one
+    // that forgot would be exactly the leaker nobody hears about — the same
+    // silence this is meant to end. A concurrent sibling's row is seconds old
+    // and is about to be cleaned by its own test; a leak is from a previous run
+    // and never will be. This whole crate's suite finishes in well under a
+    // minute, so nothing legitimately holds a row eligible-and-unprojected for
+    // ten.
+    let stale: Vec<(String, i64)> = sqlx::query_as(
+        "select msg_id, extract(epoch from now() - created_at)::bigint
+           from raw_events
+          where processed_at is null
+            and event_type is not null
+            and decoded is not null
+            and created_at < now() - interval '10 minutes'
+          order by created_at
+          limit 20",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("list stale pending rows");
+
+    assert!(
+        stale.is_empty(),
+        "eligible rows have been pending for over ten minutes: {stale:?} (msg_id, age in \
+         seconds). Nothing in this suite holds a row that long, so these are leaks from a \
+         test that died before its cleanup. They make the empty-queue contract untestable \
+         for every later run on this database — delete them, and give the leaking test a \
+         purge that survives a panic (a prefix purge at its start, as observer_queries.rs \
+         does)"
+    );
+    eprintln!(
+        "skipping the empty-queue assert: {pending_before}/{pending_after} pending rows, all \
+         of them fresh enough to be a concurrent sibling's"
+    );
 }
 
 #[tokio::test]

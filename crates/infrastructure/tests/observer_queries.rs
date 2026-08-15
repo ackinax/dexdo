@@ -104,6 +104,15 @@ async fn the_pending_window_excludes_rows_ingested_before_the_run() {
             .await
             .unwrap();
     }
+    // Purge by PREFIX, not just by the four msg_ids below: a previous run that
+    // panicked between the seeds and the tail cleanup left rows of exactly the
+    // shape this file seeds — typed, decoded, unprocessed — and those are
+    // eligible for `PENDING_PROJECTION_WHERE`. A prefix purge makes this file
+    // self-healing across such a crash instead of accumulating.
+    sqlx::query("delete from raw_events where msg_id like 'obsq-%'")
+        .execute(&pool)
+        .await
+        .expect("prefix purge");
     seed_raw(&pool, "obsq-old", src, Some(ty), 7200).await;
     seed_raw(&pool, "obsq-new", src, Some(ty), 5).await;
     seed_raw(&pool, "obsq-undec-old", undec_old, None, 7200).await;
