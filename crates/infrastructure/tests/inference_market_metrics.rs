@@ -355,21 +355,45 @@ async fn wedged_books_count_reflects_unprojected_events_under_visible_books() {
 // test, and freeze-on-error (`metrics_refresh`) turns it into a plausible stale
 // number on the dashboard rather than a visible gap.
 //
-// The assert is AGREEMENT, not an exact count. The scoped result is a subset of the
+// TWO checks with different strengths, and the difference is the point.
+//
+// The COUNT check is agreement, not equality: the scoped result is a subset of the
 // whole-table one by construction, so `whole >= scoped` holds bucket for bucket at
-// any moment, whatever a sibling is writing. That is weak on a uniform seed and
-// sharp on this one: the seeded buckets differ from each other, so exchanging two
-// tuple elements makes the whole-table read contradict the scoped read it must
-// contain.
+// any moment, whatever a sibling is writing. It is honest and it is WEAK — a lower
+// bound cannot catch a swap that leftover rows already satisfy. Verified: exchange
+// `visible` and `failing` in the whole-table tuple and this passes even on an
+// otherwise empty database, because the seed puts one row in each. Exchange `open`
+// and `expired` and it passes wherever both buckets are non-empty. The seed below
+// is pairwise distinct so the SCOPED decode is pinned exactly, and so the whole-table
+// containment is sharp when the table holds nothing else — on a shared database it
+// is not, and no lower bound can make it so.
+//
+// The STALENESS check is sharp everywhere, and it is sharp by seed rather than by
+// luck: the ages are 20 and 10 years, which nothing else in this suite comes near.
+// The whole-table read is a MAXIMUM over a superset, so after exchanging the pair it
+// reports the sweep maximum as the price lag — at most our 10 years, which fails the
+// 20-year assert no matter what else is in the table.
 #[tokio::test]
 async fn whole_table_metric_queries_agree_with_their_scoped_siblings() {
     let Some(pool) = setup().await else { return };
     let repo = IndexerRepository::new(pool.clone());
 
+    // Ages nothing else seeds. The gap between them is what an exchanged pair has to
+    // cross, so it is made enormous rather than the 500s it used to be.
+    const PRICE_AGE_SECS: i64 = 20 * 365 * 24 * 3600;
+    const SWEEP_AGE_SECS: i64 = 10 * 365 * 24 * 3600;
+
     let visible = "inf_whole_table.visible";
     let failing = "inf_whole_table.failing";
+    let failing2 = "inf_whole_table.failing2";
+    let discovering = "inf_whole_table.discovering";
     let ob = "inf_whole_table.orders";
-    let addrs = vec![visible.to_string(), failing.to_string()];
+    let addrs = vec![
+        visible.to_string(),
+        failing.to_string(),
+        failing2.to_string(),
+        discovering.to_string(),
+    ];
 
     sqlx::query("delete from inference_markets where orderbook_address = any($1)")
         .bind(&addrs)
@@ -385,23 +409,39 @@ async fn whole_table_metric_queries_agree_with_their_scoped_siblings() {
     sqlx::query(
         r#"insert into inference_markets
                (orderbook_address, last_reconciled_at, reference_price_at, last_swept_at)
-           values ($1, now(), now() - interval '900 seconds', now() - interval '400 seconds')"#,
+           values ($1, now(), now() - make_interval(secs => $2), now() - make_interval(secs => $3))"#,
     )
     .bind(visible)
+    .bind(PRICE_AGE_SECS as f64)
+    .bind(SWEEP_AGE_SECS as f64)
     .execute(&pool)
     .await
     .expect("insert visible");
-    sqlx::query(
-        "insert into inference_markets (orderbook_address, last_reconcile_failed_at) values ($1, now())",
-    )
-    .bind(failing)
-    .execute(&pool)
-    .await
-    .expect("insert failing");
+    for ob in [failing, failing2] {
+        sqlx::query(
+            "insert into inference_markets (orderbook_address, last_reconcile_failed_at) values ($1, now())",
+        )
+        .bind(ob)
+        .execute(&pool)
+        .await
+        .expect("insert failing");
+    }
+    sqlx::query("insert into inference_markets (orderbook_address) values ($1)")
+        .bind(discovering)
+        .execute(&pool)
+        .await
+        .expect("insert discovering");
 
-    // Asymmetric per bucket (1 open, 2 filled, 0 cancelled, 1 expired), so a swapped
-    // tuple element cannot hide behind equal counts.
-    for (order_id, status) in [(1i64, "OPEN"), (2, "FILLED"), (3, "FILLED"), (4, "EXPIRED")] {
+    // Pairwise distinct per bucket (1 open, 2 filled, 0 cancelled, 3 expired). The
+    // previous seed had open == expired, so exchanging those two changed nothing.
+    for (order_id, status) in [
+        (1i64, "OPEN"),
+        (2, "FILLED"),
+        (3, "FILLED"),
+        (4, "EXPIRED"),
+        (5, "EXPIRED"),
+        (6, "EXPIRED"),
+    ] {
         sqlx::query(
             r#"insert into inference_orders
                    (orderbook_address, order_id, is_buy, price, amount_initial,
@@ -418,12 +458,14 @@ async fn whole_table_metric_queries_agree_with_their_scoped_siblings() {
 
     let (dw, vw, fw) = repo.inference_market_state_counts().await.expect("whole-table states");
     let (ds, vs, fs) = repo.inference_market_state_counts_for(&addrs).await.expect("scoped states");
+    // The scoped decode is pinned exactly — the seed is (1 discovering, 1 visible,
+    // 2 failing), so any exchange within this tuple is red.
+    assert_eq!((ds, vs, fs), (1, 1, 2), "the scoped read pins this test's own seed");
     assert!(
         dw >= ds && vw >= vs && fw >= fs,
         "whole-table state counts must contain the scoped ones bucket for bucket: \
          whole=({dw},{vw},{fw}) scoped=({ds},{vs},{fs})"
     );
-    assert!(vw >= 1 && fw >= 1, "the seeded visible and failing rows must be visible whole-table");
 
     let (pw, sw) = repo.inference_staleness_seconds().await.expect("whole-table staleness");
     let (ps, ss) = repo.inference_staleness_seconds_for(&addrs).await.expect("scoped staleness");
@@ -432,15 +474,25 @@ async fn whole_table_metric_queries_agree_with_their_scoped_siblings() {
         "whole-table staleness maximises over a superset, so it can only be larger: \
          whole=({pw},{sw}) scoped=({ps},{ss})"
     );
-    // The two ages differ by 500s in the seed, which is what makes an exchanged pair
-    // fail rather than pass unnoticed.
-    assert!(ps >= 900 && ss >= 400, "the scoped read must see the ages seeded here: {ps}/{ss}");
+    // The sharp pair, and the reason for the absurd ages. Both reads are maxima, so
+    // exchanging the two elements substitutes the sweep maximum for the price lag —
+    // and no row anywhere in this suite has a sweep age near 20 years, so the FIRST
+    // of each pair goes red. (The second survives an exchange: a price maximum of 20
+    // years clears a 10-year bar. One sharp assert per pair is what is available.)
+    assert!(
+        pw >= PRICE_AGE_SECS && ps >= PRICE_AGE_SECS,
+        "reference-price staleness must report the 20-year seed: whole={pw} scoped={ps}"
+    );
+    assert!(
+        sw >= SWEEP_AGE_SECS && ss >= SWEEP_AGE_SECS,
+        "sweep staleness must report the 10-year seed: whole={sw} scoped={ss}"
+    );
 
     let scope = vec![ob.to_string()];
     let (ow, flw, cw, ew) = repo.inference_order_status_counts().await.expect("whole-table orders");
     let (os, fls, cs, es) =
         repo.inference_order_status_counts_for(&scope).await.expect("scoped orders");
-    assert_eq!((os, fls, cs, es), (1, 2, 0, 1), "the scoped read pins this test's own seed");
+    assert_eq!((os, fls, cs, es), (1, 2, 0, 3), "the scoped read pins this test's own seed");
     assert!(
         ow >= os && flw >= fls && cw >= cs && ew >= es,
         "whole-table status counts must contain the scoped ones bucket for bucket: \

@@ -291,7 +291,13 @@ mod tests {
     //
     // Lower bounds rather than equality: the gauges are whole-table and siblings
     // write to the same database, so the seeded rows can only add to a bucket, never
-    // remove from one, and can only make a staleness maximum larger.
+    // remove from one, and can only make a staleness maximum larger. That makes the
+    // BUCKET assertions weak on a shared database — leftover OPEN/FILLED/EXPIRED rows
+    // satisfy a lower bound whichever way the tuple is decoded — and it is why the
+    // staleness pair carries the sharp check instead: at 20 and 10 years the seeded
+    // ages are ones nothing else in this workspace comes near, so a whole-table
+    // maximum that reports the sweep age as the price lag fails no matter what else
+    // is in the table.
     #[tokio::test]
     async fn refresh_once_on_a_live_pool_fills_every_gauge_from_its_own_query() {
         let url = match std::env::var("TEST_DATABASE_URL") {
@@ -321,12 +327,16 @@ mod tests {
             .execute(&pool)
             .await
             .expect("purge orders");
+        const PRICE_AGE_SECS: u64 = 20 * 365 * 24 * 3600;
+        const SWEEP_AGE_SECS: u64 = 10 * 365 * 24 * 3600;
         sqlx::query(
             r#"insert into inference_markets
                    (orderbook_address, last_reconciled_at, reference_price_at, last_swept_at)
-               values ($1, now(), now() - interval '700 seconds', now() - interval '200 seconds')"#,
+               values ($1, now(), now() - make_interval(secs => $2), now() - make_interval(secs => $3))"#,
         )
         .bind(ob)
+        .bind(PRICE_AGE_SECS as f64)
+        .bind(SWEEP_AGE_SECS as f64)
         .execute(&pool)
         .await
         .expect("insert visible market");
@@ -367,14 +377,16 @@ mod tests {
         let (_disc, visible, _failing) = metrics.inference_market_states_value();
         assert!(visible >= 1, "the seeded visible book must reach the market-state gauge");
 
-        // The two staleness ages are the swap this test exists for: the seed makes
-        // the price age (>=700s) strictly larger than the sweep age (>=200s), and a
-        // whole-table maximum can only grow, so an exchanged pair breaks the second
-        // assert.
+        // The two staleness ages are the swap this test exists for. Both gauges are
+        // whole-table maxima, so exchanging the pair reports the sweep maximum as the
+        // price lag — at most 10 years, since nothing anywhere seeds a sweep age
+        // beyond that — and the FIRST assert goes red. Only the first: a 20-year
+        // price maximum clears the 10-year bar, so the second survives an exchange.
+        // One sharp assert per exchanged pair is what a maximum makes available.
         let price_lag = metrics.inference_reference_price_lag_seconds_value();
         let sweep_lag = metrics.inference_sweep_lag_seconds_value();
-        assert!(price_lag >= 700, "reference-price lag gauge: {price_lag}");
-        assert!(sweep_lag >= 200, "sweep lag gauge: {sweep_lag}");
+        assert!(price_lag >= PRICE_AGE_SECS, "reference-price lag gauge: {price_lag}");
+        assert!(sweep_lag >= SWEEP_AGE_SECS, "sweep lag gauge: {sweep_lag}");
 
         let (open, filled, _cancelled, expired) = metrics.inference_order_counts_value();
         assert!(
