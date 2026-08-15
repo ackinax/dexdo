@@ -423,14 +423,27 @@ mod tests {
         let (_disc, visible, _failing) = metrics.inference_market_states_value();
         assert!(visible >= 1, "the seeded visible book must reach the market-state gauge");
 
-        // The two staleness ages are the swap this test exists for. Both gauges are
-        // whole-table maxima, so exchanging the pair reports the sweep maximum as the
-        // price lag — at most 10 years, since nothing anywhere seeds a sweep age
-        // beyond that — and the FIRST assert goes red. Only the first: a 20-year
-        // price maximum clears the 10-year bar, so the second survives an exchange.
-        // One sharp assert per exchanged pair is what a maximum makes available.
+        // The staleness pair is the swap this test exists for, and the sharp check is
+        // AGREEMENT WITH THE SOURCE, not the seeded magnitudes. Both sides are read
+        // from the same whole-table query, so a sibling writing between them is the
+        // only way they can differ innocently — and exchanging the two `set_` calls
+        // makes them differ every time, whatever else is in the table.
+        //
+        // The magnitudes alone would not do it. They are lower bounds against a
+        // whole-table maximum, so a 20-year row left behind by ANOTHER test's panic
+        // (inference_market_metrics seeds the same ages under its own addresses and
+        // purges only those) satisfies them permanently, even if this test's own seed
+        // never landed. They stay below as evidence the seed reached the gauge; the
+        // equality is what pins the wiring.
+        let (repo_price_lag, repo_sweep_lag) =
+            repo.inference_staleness_seconds().await.expect("whole-table staleness");
         let price_lag = metrics.inference_reference_price_lag_seconds_value();
         let sweep_lag = metrics.inference_sweep_lag_seconds_value();
+        assert_eq!(
+            (price_lag, sweep_lag),
+            (repo_price_lag.max(0) as u64, repo_sweep_lag.max(0) as u64),
+            "each staleness gauge must carry its own column from the query behind it"
+        );
         assert!(price_lag >= PRICE_AGE_SECS, "reference-price lag gauge: {price_lag}");
         assert!(sweep_lag >= SWEEP_AGE_SECS, "sweep lag gauge: {sweep_lag}");
 

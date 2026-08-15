@@ -3165,6 +3165,110 @@ async fn fast_path_falls_back_and_isolates_poison_row() {
     purge(&pool, &cleanup).await;
 }
 
+/// The orphan counter's half of the same claim its `unknown_events` twin makes
+/// above: a batch that falls back must count each dropped orphan ONCE, not once
+/// per attempt.
+///
+/// Its own test (`inference_projectors.rs`) drains a clean batch, so it can never
+/// see the double count — the fast pass commits and the savepointed path never
+/// runs. This stages the batch that does: an aged orphan the fast pass
+/// dead-letters, and behind it a poison row that aborts the transaction the
+/// counter was bumped inside. The atomic does not roll back with it, so counting
+/// at the match arm reports one permanent loss as two.
+///
+/// That direction matters more than a cosmetic drift: `dodex-orphans-dropped`
+/// fires at any non-zero hourly rate, so an over-count is a page about data loss
+/// that did not happen at that volume.
+#[tokio::test(flavor = "current_thread")]
+async fn a_dropped_orphan_is_counted_once_across_a_fallback() {
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+
+    let book = "0:reproj_orphan_dbl_book";
+    let ob = "0:reproj_orphan_dbl_iob";
+    let order_id = "93";
+    let orphan_msg = "reproj-orphan-dbl-orphan";
+    let poison_msg = "reproj-orphan-dbl-poison";
+    let after = "zzzz_reproj_orphandbl_0";
+    let orphan_chain = "zzzz_reproj_orphandbl_1_orphan";
+    let poison_chain = "zzzz_reproj_orphandbl_2_poison";
+    let stream = "reproj_orphan_dbl_stream";
+
+    let cleanup: Vec<(&str, &str)> = vec![
+        ("delete from live_orders where orderbook_address = $1", book),
+        ("delete from inference_orders where orderbook_address = $1", ob),
+        ("delete from inference_markets where orderbook_address = $1", ob),
+        ("delete from raw_events where msg_id = $1", orphan_msg),
+        ("delete from raw_events where msg_id = $1", poison_msg),
+        ("delete from indexer_cursors where stream_name = $1", stream),
+    ];
+    purge(&pool, &cleanup).await;
+
+    // The orphan: a Filled whose order never arrived. Dead-letterable once its
+    // INGEST age passes the cutoff, so `created_at` is backdated after the insert
+    // (`insert_raw_at` writes it as now()).
+    insert_raw_at(
+        &pool,
+        orphan_msg,
+        orphan_chain,
+        ob,
+        "InferenceOrderBook.InferenceFilled",
+        &json!({"makerId":"901","takerId":"902","ticks":"1","clearingPrice":"1","sellerTC":"0:s","buyerNote":"0:b","sellerNote":"0:s"}),
+    )
+    .await;
+    sqlx::query("update raw_events set created_at = now() - interval '1 hour' where msg_id = $1")
+        .bind(orphan_msg)
+        .execute(&pool)
+        .await
+        .expect("age the orphan past the cutoff");
+
+    // The poison row, sorting AFTER the orphan so the fast pass has already counted
+    // the drop by the time this aborts the transaction.
+    insert_open_parent(&pool, book, order_id).await;
+    insert_raw_at(
+        &pool,
+        poison_msg,
+        poison_chain,
+        book,
+        "OrderBook.OrderFilled",
+        &json!({"orderId": order_id, "filledAmount": "30", "clearingPrice": "6150"}),
+    )
+    .await;
+
+    // Dead-lettering only fires once capture has reached head; a per-test stream so
+    // this never reads or writes the shared live cursor row.
+    sqlx::query(
+        "insert into indexer_cursors (stream_name, cursor, at_head, updated_at)
+         values ($1, 'c', true, now())
+         on conflict (stream_name) do update set at_head = true, updated_at = now()",
+    )
+    .bind(stream)
+    .execute(&pool)
+    .await
+    .expect("seed the at-head cursor");
+
+    let repo = IndexerRepository::new(pool.clone())
+        .with_capture_stream(stream)
+        .with_inference_orphan_cutoff(Duration::from_secs(60));
+    let stats = repo
+        .reproject_pending_from(1000, Some(after), Some(poison_chain))
+        .await
+        .expect("reproject");
+
+    assert_eq!(stats.scanned, 2, "only the two in-range rows are drained");
+    assert_eq!(stats.failed, 1, "the poison row isolates in the savepointed replay");
+    assert_eq!(repo.projection_fallback_count(), 1, "the batch fell back exactly once");
+    assert!(processed_at_is_set(&pool, orphan_msg).await, "the aged orphan is dead-lettered");
+    assert_eq!(
+        repo.inference_orphans_dropped_count(),
+        1,
+        "one orphan dropped, one count — the rolled-back fast pass counted it too before the \
+         bump moved past the commit. This repo is freshly constructed, so 1 is its whole history"
+    );
+
+    purge(&pool, &cleanup).await;
+}
+
 /// A fully clean batch commits on the optimistic fast path with no fallback:
 /// the fallback log marker is absent and the freshly-computed stats are exact.
 #[tokio::test(flavor = "current_thread")]

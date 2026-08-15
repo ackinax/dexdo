@@ -483,6 +483,13 @@ fn event_payloads_decode_abi_shape() {
     decodes!(iob::OrderCancelledData, INFERENCE_ORDER_BOOK_ABI, "InferenceOrderCancelled");
     let filled = decodes!(iob::FilledData, INFERENCE_ORDER_BOOK_ABI, "InferenceFilled");
     assert_eq!(filled.seller_tc.as_deref(), Some(SAMPLE_ADDRESS));
+    // `sellerNote` is pinned for a different reason than its camelCase neighbour: it
+    // is the field v4.0.33 added so the deal link survives orphan repair, where no
+    // SELL leg exists to walk. Nothing else guards its presence in the ABI, so if it
+    // were dropped the projector would silently fall back to the leg walk — which is
+    // exactly the path that has no leg — and the seller would go missing only on the
+    // orphan path, where no test looks for him.
+    assert_eq!(filled.seller_note.as_deref(), Some(SAMPLE_ADDRESS));
     decodes!(iob::ExecutedData, INFERENCE_ORDER_BOOK_ABI, "InferenceExecuted");
     decodes!(iob::RefundedData, INFERENCE_ORDER_BOOK_ABI, "InferenceRefunded");
     decodes!(iob::OrderBookDeployedData, INFERENCE_ORDER_BOOK_ABI, "InferenceOrderBookDeployed");

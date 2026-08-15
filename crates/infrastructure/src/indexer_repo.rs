@@ -751,10 +751,13 @@ impl IndexerRepository {
         };
         let mut to_mark: Vec<i64> = Vec::new();
         // Buffered until the outer commit, for the same reason as in the fast path:
-        // a savepoint release is not a commit, and an atomic bumped before the outer
-        // transaction lands survives its rollback.
+        // a savepoint release is not a commit, and neither an atomic nor a log line
+        // rolls back with the transaction. `warn_unknown` in particular mutates the
+        // first-sighting set, so firing it before a commit that then fails would
+        // spend the one loud warning on a pass whose rows stayed pending — every
+        // later sighting of that type is demoted to the noise target.
         let mut orphans_dropped = 0u64;
-        let mut unknown_seen = 0u64;
+        let mut unknown_warnings: Vec<(String, String)> = Vec::new();
 
         for row in rows {
             stats.scanned += 1;
@@ -826,11 +829,10 @@ impl IndexerRepository {
                     }
                 }
                 Ok(ProjectionOutcome::Unknown) => {
-                    self.warn_unknown(&row.msg_id, &event.event_type);
                     sp.commit().await.context("reproject savepoint release")?;
+                    unknown_warnings.push((row.msg_id.clone(), event.event_type.clone()));
                     to_mark.push(row.id);
                     stats.unknown += 1;
-                    unknown_seen += 1;
                 }
                 Err(err) => {
                     drop(sp);
@@ -847,8 +849,11 @@ impl IndexerRepository {
 
         Self::mark_processed(&mut tx, &to_mark).await?;
         tx.commit().await.context("reproject tx commit")?;
-        self.unknown_events.fetch_add(unknown_seen, Ordering::Relaxed);
+        self.unknown_events.fetch_add(unknown_warnings.len() as u64, Ordering::Relaxed);
         self.inference_orphans_dropped.fetch_add(orphans_dropped, Ordering::Relaxed);
+        for (msg_id, event_type) in &unknown_warnings {
+            self.warn_unknown(msg_id, event_type);
+        }
         Ok(stats)
     }
 
