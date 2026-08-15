@@ -97,6 +97,7 @@ async fn refresh_once(repo: &IndexerRepository, metrics: &IndexerMetrics, cursor
     metrics.set_inference_orphans_dropped(repo.inference_orphans_dropped_count());
     metrics.set_decode_errors(repo.decode_errors_count());
     metrics.set_decode_ambiguous_collisions(repo.decode_ambiguous_collisions_count());
+    metrics.set_unknown_events(repo.unknown_events_count());
     match repo.inference_market_state_counts().await {
         Ok((discovering, visible, failing)) => metrics.set_inference_market_states(
             discovering.max(0) as u64,

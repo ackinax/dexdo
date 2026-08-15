@@ -64,6 +64,7 @@ pub struct IndexerMetrics {
     projection_fallbacks: Arc<AtomicU64>,
     inference_orphans_dropped: Arc<AtomicU64>,
     decode_errors: Arc<AtomicU64>,
+    unknown_events: Arc<AtomicU64>,
     decode_ambiguous_collisions: Arc<AtomicU64>,
     inference_markets_discovering: Arc<AtomicU64>,
     inference_markets_visible: Arc<AtomicU64>,
@@ -90,6 +91,7 @@ pub struct IndexerMetrics {
     _projection_fallbacks_counter: ObservableCounter<u64>,
     _inference_orphans_dropped_counter: ObservableCounter<u64>,
     _decode_errors_counter: ObservableCounter<u64>,
+    _unknown_events_counter: ObservableCounter<u64>,
     _decode_ambiguous_collisions_counter: ObservableCounter<u64>,
     _inference_markets_gauge: ObservableGauge<u64>,
     _inference_reference_price_lag_gauge: ObservableGauge<u64>,
@@ -112,6 +114,7 @@ impl IndexerMetrics {
         let projection_fallbacks = Arc::new(AtomicU64::new(0));
         let inference_orphans_dropped = Arc::new(AtomicU64::new(0));
         let decode_errors = Arc::new(AtomicU64::new(0));
+        let unknown_events = Arc::new(AtomicU64::new(0));
         let decode_ambiguous_collisions = Arc::new(AtomicU64::new(0));
         let inference_markets_discovering = Arc::new(AtomicU64::new(0));
         let inference_markets_visible = Arc::new(AtomicU64::new(0));
@@ -222,6 +225,17 @@ impl IndexerMetrics {
             )
             .with_callback(move |observer| {
                 observer.observe(decode_errors_cache.load(Ordering::Relaxed), &[]);
+            })
+            .build();
+
+        let unknown_events_cache = Arc::clone(&unknown_events);
+        let unknown_events_counter = meter
+            .u64_observable_counter("indexer_unknown_events")
+            .with_description(
+                "Decoded rows that matched no projector arm. Unknown marks the row processed and never retries it, so a rising count means events are being dropped for good — a new contract event without an arm, or an arm removed while its type still arrives. Distinct from indexer_decode_errors (the body failed to decode) and indexer_decode_ambiguous_collisions (a shared id with no dst route): those rows keep their payload and stay replayable, these do not",
+            )
+            .with_callback(move |observer| {
+                observer.observe(unknown_events_cache.load(Ordering::Relaxed), &[]);
             })
             .build();
 
@@ -355,6 +369,7 @@ impl IndexerMetrics {
             projection_fallbacks,
             inference_orphans_dropped,
             decode_errors,
+            unknown_events,
             decode_ambiguous_collisions,
             inference_markets_discovering,
             inference_markets_visible,
@@ -377,6 +392,7 @@ impl IndexerMetrics {
             _projection_fallbacks_counter: projection_fallbacks_counter,
             _inference_orphans_dropped_counter: inference_orphans_dropped_counter,
             _decode_errors_counter: decode_errors_counter,
+            _unknown_events_counter: unknown_events_counter,
             _decode_ambiguous_collisions_counter: decode_ambiguous_collisions_counter,
             _inference_markets_gauge: inference_markets_gauge,
             _inference_reference_price_lag_gauge: inference_reference_price_lag_gauge,
@@ -436,6 +452,12 @@ impl IndexerMetrics {
     /// total of event bodies that failed to decode and were stored undecoded.
     pub fn set_decode_errors(&self, value: u64) {
         self.decode_errors.store(value, Ordering::Relaxed);
+    }
+
+    /// Set the cumulative value reported by `indexer_unknown_events` — the running
+    /// total of decoded rows dropped by the projector's `Unknown` arm.
+    pub fn set_unknown_events(&self, value: u64) {
+        self.unknown_events.store(value, Ordering::Relaxed);
     }
 
     /// Set the cumulative value reported by `indexer_decode_ambiguous_collisions`
@@ -554,6 +576,11 @@ impl IndexerMetrics {
     #[doc(hidden)]
     pub fn inference_wedged_books_value(&self) -> u64 {
         self.inference_wedged_books.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn unknown_events_value(&self) -> u64 {
+        self.unknown_events.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]

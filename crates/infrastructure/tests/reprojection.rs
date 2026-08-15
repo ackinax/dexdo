@@ -347,6 +347,34 @@ async fn unknown_event_type_is_marked_processed() {
 }
 
 #[tokio::test]
+async fn an_unknown_event_type_bumps_the_unknown_counter() {
+    // The counter is the only durable trace an `Unknown` leaves. The row is marked
+    // processed and never retried, and the warn beside it is deduplicated to once
+    // per type per process — so a new contract event that finds no arm is decoded,
+    // dropped, and shows up nowhere: backlog 0, decode_errors 0, observer green.
+    // Absolute value on a fresh repository instance, like the decode counters
+    // (per-instance `Arc<AtomicU64>`).
+    let _guard = REPROJECTION_LOCK.lock().await;
+    let Some(pool) = setup().await else { return };
+    let repo = IndexerRepository::new(pool.clone());
+
+    let msg_id = "reproj_unknown_counter-msg";
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
+    insert_raw(&pool, msg_id, "0:reproj_unknown_counter_src", "TokenContract.Bogus", &json!({}))
+        .await;
+
+    repo.reproject_pending(1000).await.expect("reproject");
+    assert_eq!(
+        repo.unknown_events_count(),
+        1,
+        "an unroutable event type must bump indexer_unknown_events exactly once"
+    );
+    assert_eq!(repo.decode_errors_count(), 0, "an unknown arm is not a decode failure");
+
+    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
+}
+
+#[tokio::test]
 async fn unknown_inference_scoped_event_type_is_marked_processed_and_never_retried() {
     // IX-FAIL-06, the inference-scoped variant of the test above: a typed,
     // decoded row whose `TokenContract.*` suffix matches no settlement arm falls

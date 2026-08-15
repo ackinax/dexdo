@@ -70,6 +70,15 @@ pub struct IndexerRepository {
     /// here. A non-zero rate means ABI drift or malformed bodies for an otherwise
     /// known event. Shared across clones via `Arc`, like `projection_fallbacks`.
     decode_errors: Arc<AtomicU64>,
+    /// Running count of decoded rows that matched no projector arm
+    /// (`ProjectionOutcome::Unknown`). `Unknown` marks the row processed and never
+    /// retries it, and the `warn!` beside it is deduplicated to once per type per
+    /// process, so without this counter a new contract event is decoded, dropped
+    /// and leaves no trace: backlog 0, decode_errors 0, observer green. Distinct
+    /// from `decode_errors` and `decode_ambiguous_collisions` in the way that
+    /// matters most — those rows keep their payload and stay replayable, these do
+    /// not. Shared across clones via `Arc`, like `decode_errors`.
+    unknown_events: Arc<AtomicU64>,
     /// Running count of event bodies left undecoded because their id collides
     /// across ABIs and no `dst` route disambiguated it (the `AmbiguousCollision`
     /// decode outcome). Distinct from a benign unknown id and from a hard decode
@@ -258,6 +267,7 @@ impl IndexerRepository {
             inference_orphan_cutoff: std::time::Duration::from_millis(1_800_000), /* default; overridden in main */
             inference_orphans_dropped: Arc::new(AtomicU64::new(0)),
             decode_errors: Arc::new(AtomicU64::new(0)),
+            unknown_events: Arc::new(AtomicU64::new(0)),
             decode_ambiguous_collisions: Arc::new(AtomicU64::new(0)),
             inference_reconcile_failures: Arc::new(AtomicU64::new(0)),
             capture_stream: CAPTURE_STREAM.to_string(),
@@ -288,6 +298,12 @@ impl IndexerRepository {
     /// undecoded. Polled by the metrics-refresh loop for `indexer_decode_errors`.
     pub fn decode_errors_count(&self) -> u64 {
         self.decode_errors.load(Ordering::Relaxed)
+    }
+
+    /// Running total of decoded rows dropped by the `Unknown` arm. Polled by the
+    /// metrics-refresh loop for `indexer_unknown_events`.
+    pub fn unknown_events_count(&self) -> u64 {
+        self.unknown_events.load(Ordering::Relaxed)
     }
 
     /// Running total of event bodies left undecoded due to an ambiguous event-id
@@ -667,6 +683,7 @@ impl IndexerRepository {
                     unknown_warnings.push((row.msg_id.clone(), event.event_type.clone()));
                     to_mark.push(row.id);
                     stats.unknown += 1;
+                    self.unknown_events.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
                     // The optimistic transaction is now aborted; discard it and
@@ -810,6 +827,7 @@ impl IndexerRepository {
                     sp.commit().await.context("reproject savepoint release")?;
                     to_mark.push(row.id);
                     stats.unknown += 1;
+                    self.unknown_events.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
                     drop(sp);
