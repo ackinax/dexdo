@@ -155,19 +155,6 @@ pub(crate) enum DeadLetterVerdict {
 }
 
 impl IndexerRepository {
-    /// The dead letter is an ALLOW-LIST decision, not a property of deferral in
-    /// general: the cutoff asserts "this parent will never arrive", which is a
-    /// claim about a specific parent. `projectors.rs` defers in fourteen places
-    /// and nearly all of them wait for something that legitimately arrives later
-    /// — `PMPDeployed` waits for its `token_type` to show up in `ref_tokens`, and
-    /// `TimingsSet`, `PoolsFrozen`, `Resolved` and the cancellation events wait
-    /// for their own `PMPDeployed`. At the 30-minute production cutoff
-    /// (`indexer.yaml.j2`), dead-lettering those would kill a market silently and
-    /// permanently: the row is marked processed and never re-asked (IX-FAIL-06).
-    ///
-    /// The list itself lives in [`Self::dead_letter_verdict`], which is also what
-    /// picks the repair path — one decision rather than an allow-list here and a
-    /// separate `starts_with` at each call site.
     /// Shared subquery for "addresses that emitted at least one event inside the
     /// run window". Shared by `inference_books_with_events_since` and
     /// `inference_anchored_books_since`: their window predicate must be
@@ -867,6 +854,16 @@ impl IndexerRepository {
 
     /// What the dead-letter rule says about a deferred row — and, for a row it
     /// admits, WHICH repair path applies.
+    ///
+    /// The dead letter is an ALLOW-LIST decision, not a property of deferral in
+    /// general: the cutoff asserts "this parent will never arrive", which is a claim
+    /// about a specific parent. `projectors.rs` defers in fourteen places and nearly
+    /// all of them wait for something that legitimately arrives later — `PMPDeployed`
+    /// waits for its `token_type` to show up in `ref_tokens`, and `TimingsSet`,
+    /// `PoolsFrozen`, `Resolved` and the cancellation events wait for their own
+    /// `PMPDeployed`. At the 30-minute production cutoff (`indexer.yaml.j2`),
+    /// dead-lettering those would kill a market silently and permanently: the row is
+    /// marked processed and never re-asked (IX-FAIL-06).
     ///
     /// A row is admitted when its type is dead-letterable, its **ingest** age
     /// (`now() - raw_events.created_at`) exceeds the configured cutoff, AND the
