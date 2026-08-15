@@ -48,10 +48,22 @@ pub enum Probe<T> {
 /// out, nextest would kill the test BEFORE the final `assert!`, losing the
 /// collected `failures`.
 ///
-/// Chain waits and this budget share one clock — `ReadBudget::start()` sits
-/// ahead of all of them (decision E) — so the 240s bounds ELAPSED TEST TIME,
-/// not time spent polling: a slow chain eats into it before the first read
-/// phase ever runs. The worst case is therefore not the sum `chain + 240s`;
+/// Chain waits and this budget share one clock, so the 240s bounds ELAPSED TEST
+/// TIME rather than time spent polling: a slow chain eats into it before the
+/// first read phase ever runs.
+///
+/// WHERE the clock starts differs by binary, and the difference is load-bearing
+/// for the ceiling below. `e2e_inference` starts it ahead of every chain wait,
+/// as decision E describes. `e2e_inference_clob` and `e2e_inference_orders`
+/// start it AFTER their `wait_inference_book_live` — a read phase cannot
+/// possibly succeed before the book is live, so counting that wait against the
+/// read budget would spend it on a precondition. The cost is that their ceiling
+/// is `book-live wait + 240s + trailing chain waits`, which must stay under
+/// nextest's 600s `terminate-after`; at a ≤90s book-live wait it does, with
+/// room. Aligning all three either way is an open decision that needs a stand
+/// run to settle — do not "fix" one side to match the other from reading alone.
+///
+/// The worst case is therefore not the sum `chain + 240s`;
 /// it is `max(chain-so-far, 240s)` at the point the last read phase starts,
 /// plus whatever chain waits still follow it. For `e2e_inference` that is
 /// ≈330s: 180s of chain (the book-live wait, then the order-surface loop)

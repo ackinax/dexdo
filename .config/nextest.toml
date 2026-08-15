@@ -16,8 +16,10 @@ test-group = 'serial-reprojection'
 # `indexer_cursors` row for CAPTURE_STREAM, and one of them flips `at_head` to false to
 # exercise the read gate's capture-lag arm. Under nextest's per-process parallelism a
 # sibling binary would observe that flip and receive -1500 for a lookup it expects to
-# succeed. Both binaries are pinned to one one-thread group so they run sequentially and
-# never race the cursor row; the in-process mutexes then cover the rest.
+# succeed. `read_model_polling` joined them for the same reason — its gate test seeds
+# `at_head` on the same singleton row. All THREE binaries are pinned to one one-thread
+# group so they run sequentially and never race the cursor row; the in-process mutexes
+# then cover the rest.
 #
 # `inference_market_metrics` used to join this group too: its state-count tests asserted
 # whole-table aggregate DELTAS, which any concurrent writer to `inference_markets`

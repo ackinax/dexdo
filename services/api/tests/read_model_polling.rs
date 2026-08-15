@@ -214,14 +214,16 @@ async fn a_fatal_probe_does_not_wait_out_the_budget() {
 
 #[tokio::test]
 async fn a_fail_closed_503_is_retryable_and_a_bad_request_is_not() {
-    // The most valuable of the six. `503` is a legitimate answer from the
-    // gate, and a test that treats it as failure turns red on a healthy
+    // The most valuable test in this file. `503` is a legitimate answer from
+    // the gate, and a test that treats it as failure turns red on a healthy
     // system. `400` is the opposite.
     //
     // The URL here uses `tokenContract=` ON PURPOSE: the gate on unprojected
     // rows only fires when `token_contract.is_some() && side != BUY &&
-    // statuses ∋ LIVE` (`inference_read_repo.rs:715-721`). None of the wave's
-    // phases use that shape — this is the only test that builds it.
+    // statuses ∋ LIVE` (the arm-1 predicate in
+    // `inference_read_repo::build_snapshot_query` — named, not line-numbered,
+    // because these references have drifted twice already). No scenario phase
+    // builds that shape; this is the only test that does.
     let Some((service, pool, _kek, _pn)) = common::setup().await else { return };
     let ob = "0:rmp_gate";
     purge(&pool, ob).await;

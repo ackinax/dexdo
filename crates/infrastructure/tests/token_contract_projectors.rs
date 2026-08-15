@@ -684,9 +684,12 @@ async fn unknown_token_contract_event_returns_unknown() {
 // still writes *something*.
 //
 // One test per `TokenContract.*` type the wave-4 harvest actually produced a
-// post-upgrade body for. `ShellWithdrawn` is named in the brief's skeleton
-// group but has no fixture — see the provenance comment on the `TokenContract.*`
-// section of `chain_bodies.rs` for why.
+// post-upgrade body for. `ShellWithdrawn` is the exception in both directions: it
+// has no fixture (see the provenance comment on the `TokenContract.*` section of
+// `chain_bodies.rs`), so its skeleton-only property is pinned by a SYNTHETIC test
+// instead — `a_synthetic_shell_withdrawn_event_is_skeleton_only`, which says so in
+// its own comment and is to be replaced by a real body at the first run that
+// withdraws shell.
 
 #[tokio::test]
 async fn a_real_contract_deployed_body_seeds_skeleton_via_dst_route() {

@@ -354,10 +354,11 @@ async fn apply_filled_decrement(
                       when o.status = 'CANCELLED' and o.swept_at is null then o.swept_at
                       else null
                   end,
-                  -- A terminal row (FILLED, or real-cancel CANCELLED+swept_at NULL) is a
-                  -- FULL no-op: a late/duplicate Filled must not advance its chain/bookkeeping
-                  -- columns either (mirrors projectors::apply_order_filled). Only OPEN rows
-                  -- and provisional sweep-cancels (swept_at NOT NULL, being overridden) mutate.
+                  -- A terminal row — FILLED, EXPIRED, or a real event-cancel
+                  -- (CANCELLED with swept_at NULL) — is a FULL no-op: a late or duplicate
+                  -- Filled must not advance its chain/bookkeeping columns either (mirrors
+                  -- projectors::apply_order_filled). Only OPEN rows and provisional
+                  -- sweep-cancels (swept_at NOT NULL, being overridden) mutate.
                   last_chain_order = case
                       when o.status = 'FILLED' or o.status = 'EXPIRED'
                            or (o.status = 'CANCELLED' and o.swept_at is null) then o.last_chain_order

@@ -126,13 +126,14 @@ async fn the_pending_window_excludes_rows_ingested_before_the_run() {
 
     // Undecodable rows are counted SEPARATELY from projectable ones, by the same window.
     //
-    // The check goes through the SCOPED variant rather than the difference of two
-    // global counters: `count_undecodable_since` is the only method here without a
-    // scope, and comparing two of its readings breaks under an outside writer.
-    // The competitor is known by name — `capture.rs`
+    // Exact sets come from the SCOPED variant, and the global counter is asserted
+    // only one-sidedly (`>= 1`) further down. That split is deliberate:
+    // `count_undecodable_since` is the only method here without a scope, so any
+    // claim about ITS exact value — including a delta between two readings — is at
+    // the mercy of an outside writer. The competitor is known by name: `capture.rs`
     // (`persist_page_handles_mixed_decodable_and_undecodable_edges`) inserts an
-    // undecodable row and then purges it; a delete between the two readings breaks
-    // the inequality even with a perfectly working window.
+    // undecodable row and then purges it, and a purge landing between two readings
+    // breaks a delta even with a perfectly working window.
     let mut in_narrow = repo.undecodable_addresses_since(now - 60, &undec_scope).await.unwrap();
     in_narrow.sort();
     assert_eq!(

@@ -313,9 +313,16 @@ mod tests {
     // An arm in `token_contract_projectors.rs` named an event the ABI does not
     // declare: dead code with a forever-green test. This test holds the removal on
     // the same ground the removal was made on — the ABI, not a retelling of it. It
-    // is a named check for ONE event: the general "every routed event exists in the
-    // ABI" guard arrives with wave 1 and will subsume this test; at that point it
-    // should be deleted rather than kept.
+    // is a named check for ONE event.
+    //
+    // THE PROMISE HAS COME DUE. This comment used to say the general guard "arrives
+    // with wave 1 and will subsume this test; at that point it should be deleted
+    // rather than kept". Wave 1 arrived: `token_contract_enum_covers_every_abi_event`
+    // (crates/contracts) asserts the declared variant set EQUALS the ABI's event set,
+    // so a returning `StreamReclaimed` appears in the ABI, is absent from `ALL`, and
+    // fails there — strictly stronger than this check, which names one event. The
+    // deletion is scheduled rather than done here because removing a test belongs in
+    // the pass that removes the other subsumed guards, with its reason recorded.
     #[test]
     fn token_contract_abi_does_not_declare_stream_reclaimed() {
         let abi: serde_json::Value = serde_json::from_str(ABI_TOKEN_CONTRACT).unwrap();
