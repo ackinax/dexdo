@@ -328,6 +328,9 @@ mod tests {
             .execute(&pool)
             .await
             .expect("purge orders");
+        // Coupled to the identical pair in `inference_market_metrics.rs`: this test's
+        // upper bound assumes nothing in the workspace seeds a sweep age near 20 years,
+        // and that file is the only other place seeding at this magnitude.
         const PRICE_AGE_SECS: u64 = 20 * 365 * 24 * 3600;
         const SWEEP_AGE_SECS: u64 = 10 * 365 * 24 * 3600;
         sqlx::query(
@@ -440,10 +443,18 @@ mod tests {
         // 10 years and both gauges are maxima over the table, so exchanging the two
         // `set_` calls moves each outside its own band: the price gauge would report the
         // sweep maximum (under 20 years) and the sweep gauge the price maximum (at least
-        // 20). The upper bound is the load-bearing half and it rests on one fact — no
-        // row anywhere in this workspace carries a sweep age near 20 years. A future
-        // fixture that breaks that turns this red, which is the right outcome: it would
-        // also destroy the assertion below it.
+        // 20). Neither half is the load-bearing one — the price lower bound is simply
+        // what fires first on a straight exchange — and both rest on the SAME premise:
+        // no row anywhere in this workspace carries a sweep age near 20 years. The other
+        // 20y/10y seed lives in `inference_market_metrics.rs`; raising its sweep age to
+        // 20 years would quietly disarm the upper bound here, so the two constants are
+        // coupled across crates and each says so.
+        //
+        // What the band does NOT catch, and the equality it replaced did not either: a
+        // neighbour's leaked row carries the same 20y/10y pair, so it satisfies both
+        // assertions on its own. A break in the query's `where last_reconciled_at is not
+        // null` would also only ever ENLARGE a maximum. Neither is what this test is
+        // about — it pins which column reaches which gauge — but neither is covered.
         let price_lag = metrics.inference_reference_price_lag_seconds_value();
         let sweep_lag = metrics.inference_sweep_lag_seconds_value();
         assert!(price_lag >= PRICE_AGE_SECS, "reference-price lag gauge: {price_lag}");

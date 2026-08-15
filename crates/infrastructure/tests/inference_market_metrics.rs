@@ -380,6 +380,11 @@ async fn whole_table_metric_queries_agree_with_their_scoped_siblings() {
 
     // Ages nothing else seeds. The gap between them is what an exchanged pair has to
     // cross, so it is made enormous rather than the 500s it used to be.
+    //
+    // Coupled to the identical pair in `services/indexer/src/metrics_refresh.rs`: its
+    // sweep gauge is pinned by an UPPER bound of 20 years, which holds only while no
+    // row in the workspace carries a sweep age that large. Raising SWEEP_AGE_SECS here
+    // disarms that assertion silently, so the two move together or not at all.
     const PRICE_AGE_SECS: i64 = 20 * 365 * 24 * 3600;
     const SWEEP_AGE_SECS: i64 = 10 * 365 * 24 * 3600;
 

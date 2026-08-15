@@ -359,9 +359,16 @@ async fn an_unknown_event_type_bumps_the_unknown_counter() {
     let repo = IndexerRepository::new(pool.clone());
 
     let msg_id = "reproj_unknown_counter-msg";
-    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
-    insert_raw(&pool, msg_id, "0:reproj_unknown_counter_src", "TokenContract.Bogus", &json!({}))
-        .await;
+    // The deal row is purged too: a `TokenContract.*` event seeds the deal skeleton
+    // BEFORE the arm match, so even a type that falls through to Unknown leaves one
+    // behind, keyed on the event's src. Both ends, so a panic mid-test is recoverable.
+    let src = "0:reproj_unknown_counter_src";
+    let cleanup: [(&str, &str); 2] = [
+        ("delete from raw_events where msg_id = $1", msg_id),
+        ("delete from inference_deals where token_contract_address = $1", src),
+    ];
+    purge(&pool, &cleanup).await;
+    insert_raw(&pool, msg_id, src, "TokenContract.Bogus", &json!({})).await;
 
     repo.reproject_pending(1000).await.expect("reproject");
     assert_eq!(
@@ -371,7 +378,7 @@ async fn an_unknown_event_type_bumps_the_unknown_counter() {
     );
     assert_eq!(repo.decode_errors_count(), 0, "an unknown arm is not a decode failure");
 
-    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id)]).await;
+    purge(&pool, &cleanup).await;
 }
 
 #[tokio::test]
@@ -390,9 +397,16 @@ async fn unknown_inference_scoped_event_type_is_marked_processed_and_never_retri
     let test = "reproj_unknown_tc_event";
     let msg_id = format!("{test}-msg");
 
-    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
+    // Same as its neighbour above: the skeleton seed runs before the arm match, so
+    // this leaves an inference_deals row keyed on the src unless it is purged.
+    let src = "0:reproj_unknown_tc_src";
+    let cleanup: [(&str, &str); 2] = [
+        ("delete from raw_events where msg_id = $1", msg_id.as_str()),
+        ("delete from inference_deals where token_contract_address = $1", src),
+    ];
+    purge(&pool, &cleanup).await;
 
-    insert_raw(&pool, &msg_id, "0:reproj_unknown_tc_src", "TokenContract.Bogus", &json!({})).await;
+    insert_raw(&pool, &msg_id, src, "TokenContract.Bogus", &json!({})).await;
 
     repo.reproject_pending(1000).await.expect("reproject");
     assert!(
@@ -421,7 +435,7 @@ async fn unknown_inference_scoped_event_type_is_marked_processed_and_never_retri
         "the second pass must not pick the stamped row back up"
     );
 
-    purge(&pool, &[("delete from raw_events where msg_id = $1", msg_id.as_str())]).await;
+    purge(&pool, &cleanup).await;
 }
 
 /// One captured `warn!` event: its tracing target plus the `message` and
@@ -3222,8 +3236,12 @@ async fn a_dropped_orphan_is_counted_once_across_a_fallback() {
         orphan_chain,
         ob,
         "InferenceOrderBook.InferenceFilled",
+        // `sellerTC` is the binding, not a copy of it: the cleanup deletes the
+        // inference_deals row this upsert creates, keyed on exactly this value, and a
+        // literal here would let a rename silently stop matching — reintroducing the
+        // very leak this test was fixed for, with nothing going red.
         &json!({"makerId":"901","takerId":"902","ticks":"1","clearingPrice":"1",
-            "sellerTC":"0:reproj_orphan_dbl_tc","buyerNote":"0:reproj_orphan_dbl_buyer",
+            "sellerTC": deal_tc, "buyerNote":"0:reproj_orphan_dbl_buyer",
             "sellerNote":"0:reproj_orphan_dbl_seller"}),
     )
     .await;

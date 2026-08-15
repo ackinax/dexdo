@@ -537,9 +537,12 @@ impl IndexerMetrics {
         self.metrics_refresh_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Test-only snapshot getters: plain atomic reads of every cache the refresh
-    // loop writes — what the indexer's refresh tests assert on (its sentinels are
-    // unreadable from another crate otherwise). Ten of the thirteen mirror the
+    // Test-only snapshot getters: plain atomic reads of the caches the indexer's
+    // refresh tests assert on (its sentinels are unreadable from another crate
+    // otherwise). NOT every cache — seven have no getter because nothing asserts
+    // on them yet: the two pool gauges, `projection_fallbacks`, `decode_errors`,
+    // `decode_ambiguous_collisions`, `inference_orphans_dropped` and
+    // `inference_reconcile_failures`. Of the thirteen that exist, ten mirror the
     // eight fallible DB-backed sections (two sections fill two caches each); the
     // other three are not DB-backed at all — `metrics_refresh_failures_count` is
     // the loop's own error counter, `metrics_refresh_passes_count` its heartbeat,

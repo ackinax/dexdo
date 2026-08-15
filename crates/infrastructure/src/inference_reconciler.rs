@@ -613,30 +613,35 @@ impl InferenceReconciler {
         .context("select sweep batch")?;
 
         // Probe each via getOrder. amount == 0 is a phantom (placed but never rested, or
-        // a taker remainder refunded on chain without an event). A live order is also an
-        // opportunity: the getter carries tokenContract and deadline, so a row missing
-        // either is repaired here at no extra chain cost. The two repairs are
-        // independent, because the reasons a column is NULL are: a BUY's tokenContract is
-        // the zero address by design, and a bid placed good-till-cancel carries deadline
-        // zero. Neither is recoverable, and neither is meant to be — what IS recoverable
-        // is a SELL whose non-zero deadline or real tokenContract never reached the read
-        // model.
-        let mut to_cancel: Vec<String> = Vec::new();
-        // Repairs are accumulated, not applied per order. One UPDATE per row would cost a
-        // round trip each, and a fresh book can present a whole batch of SELL rows whose
-        // tokenContract the placement never carried. At ~95 ms per round trip, a 50-row
-        // batch would spend ~5 s here and stall every book behind it.
+        // a taker remainder refunded on chain without an event) — that check is what the
+        // sweep is for, and it runs for EVERY row in the batch. A live order is also an
+        // opportunity: the same response already carries tokenContract and deadline, so
+        // the two `_missing` flags gate nothing but a pair of field extractions off it.
+        // That is the whole meaning of "no extra chain cost".
         //
-        // KNOWN HOLE, and it is a wasted probe rather than a wrong write: the candidate
-        // SELECT keys on `token_contract is null` / `deadline is null` without reading
-        // `is_buy`, so a GTC bid — every subscription among them — qualifies forever. The
-        // getter answers zero for both fields, `non_zero_*` map that to `None`, and the
-        // `tc.is_some() || deadline.is_some()` gate below never fires, so the row is
-        // probed every cycle and never repaired. Narrowing the SELECT by `is_buy` is the
-        // fix and it changes repair semantics, so it is deliberately deferred rather than
-        // slipped in here; the same gap is what makes `repair` unable to tell a SELL's
-        // missing tokenContract from a BUY's intentional NULL when the getter answers
-        // zero.
+        // The two repairs are independent, and only the mechanism below is asserted here:
+        // a value the getter answers as zero becomes `None` through `non_zero_address` /
+        // `non_zero_uint`, so the `tc.is_some() || deadline.is_some()` gate does not fire
+        // and the row is left alone. A good-till-cancel bid answers zero on both, so it
+        // is never repaired — correctly, because a zero there is the value, not a gap.
+        //
+        // WHICH non-zero-on-chain NULL this repair recovers is NOT established here, and
+        // two review rounds have now produced a confident wrong answer to that question
+        // by reasoning from this file instead of reading `InferenceOrderBook.sol`. Do not
+        // add a third. `upsert_resting_order` is the only writer of these rows and it
+        // decodes both fields from mandatory ABI inputs; establish the reachable case
+        // from the contract and the projector before describing it.
+        let mut to_cancel: Vec<String> = Vec::new();
+        // Repairs are accumulated, not applied per order: one UPDATE per row would cost a
+        // round trip each, and at ~95 ms against the deployed database a 50-row batch
+        // would spend ~5 s here and stall every book behind it. The batch is bounded by
+        // `sweep_batch_n`, so this is the whole cost either way.
+        //
+        // Note what the SELECT does NOT do: `tc_missing` / `deadline_missing` are
+        // select-list expressions, not filters. Every OPEN row in the id window is
+        // returned and probed, because the phantom check needs all of them — narrowing
+        // the query by the repair's interest (`is_buy`, or the NULLs themselves) would
+        // silently remove rows from the phantom sweep, which is the sweep's actual job.
         let mut repairs: Vec<(String, Option<String>, Option<String>)> = Vec::new();
         for (id, tc_missing, deadline_missing) in &ids {
             let o = self.call_getter(boc, "getOrder", &json!({ "id": id }))?;
