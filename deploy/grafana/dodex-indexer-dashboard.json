@@ -1975,6 +1975,76 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Metrics-refresh passes rate (heartbeat)",
+      "description": "rate() of indexer_metrics_refresh_passes — completed passes of the refresh loop, which runs every 15s. This is the only signal a DEAD refresh task gives: a panicked task freezes every DB-derived gauge it feeds and stops indexer_metrics_refresh_failures at the same time, so the failure counter cannot report its own death. Watch for the line going flat, not for a value. A dead database keeps this growing — that is what the failures panel beside it is for.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 56
+      },
+      "id": 29,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.01
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "rate(indexer_metrics_refresh_passes${counter_suffix}{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval])",
+          "legendFormat": "refresh failures/s",
+          "range": true,
+          "refId": "A"
+        }
+      ]
     }
   ]
 }

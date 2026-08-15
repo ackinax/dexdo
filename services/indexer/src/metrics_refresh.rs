@@ -139,6 +139,11 @@ async fn refresh_once(repo: &IndexerRepository, metrics: &IndexerMetrics, cursor
             metrics.inc_metrics_refresh_failures();
         }
     }
+
+    // Last statement on purpose: what this counts is a pass that reached the end.
+    // A panic anywhere above leaves the counter flat, and that flatness is the only
+    // signal a dead refresh task gives — the failure counter it feeds dies with it.
+    metrics.inc_metrics_refresh_passes();
 }
 
 #[cfg(test)]
@@ -239,6 +244,15 @@ mod tests {
             metrics.metrics_refresh_failures_count(),
             8,
             "eight independent fallible sections must each bump the counter exactly once"
+        );
+        // The heartbeat counts a pass that REACHED THE END, which a dead database
+        // does not prevent — all eight sections fail, and the pass still completes.
+        // Telling "the DB is down" from "the task is dead" is the failure counter's
+        // job; this one only answers whether the loop is still running at all.
+        assert_eq!(
+            metrics.metrics_refresh_passes_count(),
+            1,
+            "a pass that reached its end is counted, failures and all"
         );
         assert_eq!(metrics.orders_created_value(), 11, "orders_created must freeze");
         assert_eq!(
@@ -348,6 +362,7 @@ mod tests {
             0,
             "a live pool must not bump the failure counter"
         );
+        assert_eq!(metrics.metrics_refresh_passes_count(), 1, "one completed pass, one heartbeat");
 
         let (_disc, visible, _failing) = metrics.inference_market_states_value();
         assert!(visible >= 1, "the seeded visible book must reach the market-state gauge");

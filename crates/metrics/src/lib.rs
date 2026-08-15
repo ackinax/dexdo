@@ -78,6 +78,7 @@ pub struct IndexerMetrics {
     inference_reconcile_failures: Arc<AtomicU64>,
     inference_wedged_books: Arc<AtomicU64>,
     metrics_refresh_failures: Arc<AtomicU64>,
+    metrics_refresh_passes: Arc<AtomicU64>,
     // Retain the observable-counter and gauge handles for the lifetime of the
     // provider, mirroring the reference metrics setup. The observe callbacks
     // themselves are registered with the meter at `build()` time.
@@ -100,6 +101,7 @@ pub struct IndexerMetrics {
     _inference_reconcile_failures_counter: ObservableCounter<u64>,
     _inference_wedged_books_gauge: ObservableGauge<u64>,
     _metrics_refresh_failures_counter: ObservableCounter<u64>,
+    _metrics_refresh_passes_counter: ObservableCounter<u64>,
 }
 
 impl IndexerMetrics {
@@ -128,6 +130,7 @@ impl IndexerMetrics {
         let inference_reconcile_failures = Arc::new(AtomicU64::new(0));
         let inference_wedged_books = Arc::new(AtomicU64::new(0));
         let metrics_refresh_failures = Arc::new(AtomicU64::new(0));
+        let metrics_refresh_passes = Arc::new(AtomicU64::new(0));
 
         let created_cache = Arc::clone(&orders_created);
         let orders_created_counter = meter
@@ -358,6 +361,17 @@ impl IndexerMetrics {
             })
             .build();
 
+        let metrics_refresh_passes_cache = Arc::clone(&metrics_refresh_passes);
+        let metrics_refresh_passes_counter = meter
+            .u64_observable_counter("indexer_metrics_refresh_passes")
+            .with_description(
+                "Completed passes of the metrics refresh loop. A counter that stops growing is the only signal a dead refresh task gives: a panicked task freezes every gauge it feeds AND stops indexer_metrics_refresh_failures, so the failure counter cannot report its own death. Alert on the absence of growth, not on a value",
+            )
+            .with_callback(move |observer| {
+                observer.observe(metrics_refresh_passes_cache.load(Ordering::Relaxed), &[]);
+            })
+            .build();
+
         Self {
             orders_created,
             orders_partially_filled,
@@ -383,6 +397,7 @@ impl IndexerMetrics {
             inference_reconcile_failures,
             inference_wedged_books,
             metrics_refresh_failures,
+            metrics_refresh_passes,
             _orders_created_counter: orders_created_counter,
             _orders_partially_filled_counter: orders_partially_filled_counter,
             _projection_backlog_gauge: projection_backlog_gauge,
@@ -401,6 +416,7 @@ impl IndexerMetrics {
             _inference_reconcile_failures_counter: inference_reconcile_failures_counter,
             _inference_wedged_books_gauge: inference_wedged_books_gauge,
             _metrics_refresh_failures_counter: metrics_refresh_failures_counter,
+            _metrics_refresh_passes_counter: metrics_refresh_passes_counter,
         }
     }
 
@@ -504,6 +520,14 @@ impl IndexerMetrics {
         self.inference_wedged_books.store(value, Ordering::Relaxed);
     }
 
+    /// Increment the cumulative value reported by `indexer_metrics_refresh_passes`.
+    /// Called at the END of a refresh pass, so what it counts is a pass that
+    /// reached the end. A panic anywhere in the pass leaves it flat, which is
+    /// exactly the signal: the failure counter cannot report its own task's death.
+    pub fn inc_metrics_refresh_passes(&self) {
+        self.metrics_refresh_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Increment the cumulative value reported by `indexer_metrics_refresh_failures`.
     /// Called by the metrics-refresh loop itself on every failed DB query so a
     /// DB outage that freezes the other gauges (skipped `set_` on `Err`) still
@@ -581,6 +605,11 @@ impl IndexerMetrics {
     #[doc(hidden)]
     pub fn unknown_events_value(&self) -> u64 {
         self.unknown_events.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn metrics_refresh_passes_count(&self) -> u64 {
+        self.metrics_refresh_passes.load(Ordering::Relaxed)
     }
 
     #[doc(hidden)]
