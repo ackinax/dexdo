@@ -36,6 +36,15 @@ jobs:
     env:
       # Same shape as the PR `tests` job — local read-model the e2e helpers
       # upsert the deployed market into.
+      #
+      # `E2E_READ_MODEL` is deliberately NOT set here, and that is what keeps the
+      # inference binaries' read-model phases off in this lane: nothing populates
+      # this database. It exists for helpers that upsert a market row directly,
+      # while the read phases poll for facts only an indexer produces — a book in
+      # /markets, an order in /orders, a trade in /trades. Enabled on the
+      # woodpecker stand instead (.woodpecker/e2e.yml), where an indexer runs; see
+      # `read_phases_enabled` in services/api/tests/common/read_model.rs for why a
+      # reachable database is not the same fact.
       TEST_DATABASE_URL: postgres://dodex:dodex@localhost:5432/dodex_test
     services:
       postgres:

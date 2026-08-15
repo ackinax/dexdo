@@ -1112,6 +1112,11 @@ steps:
       E2E_CI_USER: { from_secret: e2e_ci_user }
       TEST_DATABASE_URL: { from_secret: e2e_test_database_url }   # postgres://dodex:<pw>@127.0.0.1:55432/dodex_test
       ACKI_DIR: *acki_dir_on_host
+      # `E2E_READ_MODEL` is passed through in the ssh call below, not declared
+      # here, because the value is a constant rather than a secret. It turns on
+      # the inference binaries' read-model phases, and this is the only lane that
+      # may set it: the stand runs an indexer filling the database the phases
+      # poll. See `read_phases_enabled` in services/api/tests/common/read_model.rs.
     commands:
       - cp -ar $CI_WORKSPACE/.ssh ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519
       - >
@@ -1122,6 +1127,7 @@ steps:
         E2E_NETWORK_ENDPOINT='http://127.0.0.1'
         E2E_SEED_NOTES='$ACKI_DIR/config/dex_test_notes.keys.json'
         TEST_DATABASE_URL='$TEST_DATABASE_URL'
+        E2E_READ_MODEL='1'
         bash -s" < .acki-nacki/tests/dexdo/e2e-on-host.sh
 
   dump_logs:

@@ -87,6 +87,38 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// assert the bound itself.
 pub const PROBE_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
 
+/// Whether this lane has an indexer filling the read model, and therefore
+/// whether the read phases can prove anything.
+///
+/// Two different facts used to be conflated into one. `TEST_DATABASE_URL` says a
+/// database is reachable; it does NOT say anything is writing to it. The
+/// shellnet lane (`.github/workflows/e2e-shellnet.yml`) sets that variable for a
+/// service-container Postgres and runs no indexer — its database exists for the
+/// helpers that upsert a market row directly. Gating the read phases on the URL
+/// alone made them run there and poll for facts only an indexer can produce: a
+/// book in `/markets`, an order in `/orders`, a trade in `/trades`. Nothing ever
+/// writes those, so every phase burned the shared budget to zero and pushed a
+/// failure — the binary went red for the shape of the lane rather than for a
+/// defect, and the whole 240s was spent proving it.
+///
+/// `E2E_READ_MODEL` is the second fact, set only where an indexer is running
+/// (`.woodpecker/e2e.yml`). The gate is deliberately NOT inside `common::setup()`:
+/// seventeen ordinary API test files call that, and they seed their own rows —
+/// they need a database, not an indexer.
+pub fn read_phases_enabled() -> bool {
+    read_phases_enabled_from(std::env::var("E2E_READ_MODEL").ok().as_deref())
+}
+
+/// The decision behind [`read_phases_enabled`], split out so it can be tested
+/// without mutating the process environment — the same shape `select_endpoint`
+/// uses in `crates/metrics`. It earns a test despite its size: the binaries this
+/// gate governs are all `#[ignore]`, so a gate that silently answered "yes"
+/// everywhere would put the read phases back into the lane that cannot serve
+/// them, and no CI run would notice.
+pub fn read_phases_enabled_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("true") | Some("TRUE"))
+}
+
 /// The remaining shared budget. Created once per binary; each phase gets
 /// `left()`. Waiting for visibility is paid for once, not once per request.
 pub struct ReadBudget {

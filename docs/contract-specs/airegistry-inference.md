@@ -98,18 +98,22 @@ a seed-note pool. Three of them — `e2e_inference`, `e2e_inference_clob` and
 `e2e_inference_orders` — additionally carry **read-model phases** that assert
 the chain action reached the public API, polling the production router raised
 in-process (`common::setup()`) against the indexer database. Those phases need
-`TEST_DATABASE_URL`; without it each binary prints a skip notice and runs its
-chain half exactly as before, so the missing variable never turns a run red.
+**two** things: `TEST_DATABASE_URL`, and `E2E_READ_MODEL=1` to say an indexer is
+filling that database. Both are set only on the woodpecker stand; the shellnet
+lane sets the first alone, and the phases stay off there because nothing writes
+the facts they poll for. Without either, each binary prints a skip notice and
+runs its chain half exactly as before, so a missing variable never turns a run
+red.
 The polling rules (poll for presence, assert content; never panic mid-scenario)
 and the shared wait budget live in
 [`docs/tech-specs/indexer.md`](../tech-specs/indexer.md#in-scene-end-to-end-assertions).
 
 | Test | Covers |
 | --- | --- |
-| `e2e_inference` | Note deploys the book, places a resting BUY with SHELL escrow, cancels it. Read phases (`TEST_DATABASE_URL`): the placed order in `/orders` and its level in `/depth` (IX-SEQ-02), the deployed book in `/markets` (IX-SEQ-01), and that the producer filter serves only the scene's own market (IX-GATE-17). |
+| `e2e_inference` | Note deploys the book, places a resting BUY with SHELL escrow, cancels it. Read phases (stand only): the placed order in `/orders` and its level in `/depth` (IX-SEQ-02), the deployed book in `/markets` (IX-SEQ-01), and that the producer filter serves only the scene's own market (IX-GATE-17). |
 | `e2e_inference_match` | External `TokenContract` deploy + a SELL offer crossed by a BUY ⇒ the match funds the `TokenContract` (handover). |
-| `e2e_inference_clob` | Two flows: a partial fill (2-tick offer crossed by a 4-tick limit buy, 2 ticks rest) + `getBestBidAsk`/`getWeeklyMedianPrice`, and a match's `Filled` event confirmed by its routing id. Read phases (`TEST_DATABASE_URL`): the match on the public tape in `/trades` and the taker leg in `/orders` (IX-SEQ-03). |
-| `e2e_inference_orders` | The book as an order book, with no deal at all: two bids, a single `cancelInferenceOrder` by id that takes only its own, and a buy whose deadline has already passed — refused before `tvm.accept()`, so `nextOrderId` never moves. Fast (~35 s). Read phase (`TEST_DATABASE_URL`): the precise cancel in `/orders` — the cancelled order reads `CANCELLED` with its size preserved (a cancel is not a fill), while its neighbour stays live (IX-SEQ-08). |
+| `e2e_inference_clob` | Two flows: a partial fill (2-tick offer crossed by a 4-tick limit buy, 2 ticks rest) + `getBestBidAsk`/`getWeeklyMedianPrice`, and a match's `Filled` event confirmed by its routing id. Read phases (stand only): the match on the public tape in `/trades` and the taker leg in `/orders` (IX-SEQ-03). |
+| `e2e_inference_orders` | The book as an order book, with no deal at all: two bids, a single `cancelInferenceOrder` by id that takes only its own, and a buy whose deadline has already passed — refused before `tvm.accept()`, so `nextOrderId` never moves. Fast (~35 s). Read phase (stand only): the precise cancel in `/orders` — the cancelled order reads `CANCELLED` with its size preserved (a cancel is not a fill), while its neighbour stays live (IX-SEQ-08). |
 | `e2e_inference_funding` | `fundDeployShell`: a note pays its own canonical `TokenContract` address, and the deal contract then deploys onto it with no giver in the run. Also pins the two things the call must not do — reach the RootModel, which it no longer has a leg for, and send anything at all when asked for `0`. Fast (~2 min). |
 
 The streaming-deal suites — `e2e_inference_stream`, `e2e_inference_settlement`,

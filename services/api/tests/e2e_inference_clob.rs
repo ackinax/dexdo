@@ -43,6 +43,7 @@ use common::e2e_setup::network_endpoint;
 use common::read_model::api;
 use common::read_model::get_json;
 use common::read_model::poll_read_with;
+use common::read_model::read_phases_enabled;
 use common::read_model::GetOutcome;
 use common::read_model::Probe;
 use common::read_model::ReadBudget;
@@ -143,10 +144,20 @@ async fn inference_partial_fill_leaves_remainder() {
     // flow already collects into `failures` and always reaches `cleanup`
     // further down — an early `return` here would skip both the cleanup and
     // any chain-phase failures collected later.
-    let read: Option<std::sync::Arc<salvo::Service>> =
-        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
+    // Two conditions, not one: a reachable database AND an indexer filling it.
+    // See `read_model::read_phases_enabled` — the shellnet lane sets
+    // TEST_DATABASE_URL for a Postgres nobody writes to, and running the read phase
+    // there burns the whole budget proving the lane has no indexer.
+    let read: Option<std::sync::Arc<salvo::Service>> = if read_phases_enabled() {
+        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s))
+    } else {
+        None
+    };
     if read.is_none() {
-        eprintln!("[e2e_clob] TEST_DATABASE_URL not set — read phase skipped");
+        eprintln!(
+            "[e2e_clob] read phase skipped: needs E2E_READ_MODEL=1 (an indexer is filling \
+             the read model) and TEST_DATABASE_URL"
+        );
     }
     let budget = ReadBudget::start();
 

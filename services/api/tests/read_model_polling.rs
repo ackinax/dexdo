@@ -14,6 +14,7 @@ use std::time::Instant;
 use common::read_model::api;
 use common::read_model::get_json;
 use common::read_model::poll_read_with;
+use common::read_model::read_phases_enabled_from;
 use common::read_model::GetOutcome;
 use common::read_model::Probe;
 use common::read_model::PROBE_TIMEOUT_FLOOR;
@@ -364,4 +365,22 @@ async fn a_router_404_without_the_error_envelope_is_terminal() {
             }
         ),
     }
+}
+
+#[test]
+fn read_phases_need_an_indexer_not_merely_a_database() {
+    // The gate that decides whether the inference binaries run their read
+    // phases. It exists because `TEST_DATABASE_URL` answers the wrong question:
+    // the shellnet lane sets it for a Postgres nobody writes to, and the phases
+    // there polled for facts only an indexer produces until the whole budget was
+    // gone. Every binary this gate governs is `#[ignore]`, so this unit is the
+    // only thing standing between a mistake here and a lane that burns 240s per
+    // phase to conclude nothing.
+    assert!(!read_phases_enabled_from(None), "unset means off — the default must be the safe one");
+    assert!(!read_phases_enabled_from(Some("")), "an empty value is not an opt-in");
+    assert!(!read_phases_enabled_from(Some("0")), "an explicit 0 is off");
+    assert!(!read_phases_enabled_from(Some("yes")), "only the documented spellings count");
+    assert!(read_phases_enabled_from(Some("1")), "the woodpecker stand sets exactly this");
+    assert!(read_phases_enabled_from(Some("true")));
+    assert!(read_phases_enabled_from(Some("TRUE")));
 }

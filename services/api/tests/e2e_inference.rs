@@ -46,6 +46,7 @@ use common::e2e_setup::network_endpoint;
 use common::read_model::api;
 use common::read_model::get_json;
 use common::read_model::poll_read_with;
+use common::read_model::read_phases_enabled;
 use common::read_model::GetOutcome;
 use common::read_model::Probe;
 use common::read_model::ReadBudget;
@@ -140,10 +141,20 @@ async fn inference_order_book_buy_then_cancel_against_shellnet() {
     // `None` does NOT exit the test: there are chained checks below and a
     // final `assert!(failures.is_empty(), …)`. An early `return` would turn
     // a red chain run green exactly where there is simply no database.
-    let read: Option<std::sync::Arc<salvo::Service>> =
-        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s));
+    // Two conditions, not one: a reachable database AND an indexer filling it.
+    // See `read_model::read_phases_enabled` — the shellnet lane sets
+    // TEST_DATABASE_URL for a Postgres nobody writes to, and running the read phases
+    // there burns the whole budget proving the lane has no indexer.
+    let read: Option<std::sync::Arc<salvo::Service>> = if read_phases_enabled() {
+        common::setup().await.map(|(s, _pool, _kek, _pn)| std::sync::Arc::new(s))
+    } else {
+        None
+    };
     if read.is_none() {
-        eprintln!("[e2e_inference] TEST_DATABASE_URL not set — read phases skipped");
+        eprintln!(
+            "[e2e_inference] read phases skipped: needs E2E_READ_MODEL=1 (an indexer is filling \
+             the read model) and TEST_DATABASE_URL"
+        );
     }
 
     // Wait budget — ONE per binary (decision E). A per-fact budget would push
