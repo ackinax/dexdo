@@ -465,6 +465,18 @@ waits run — so a CI log reading "...the binary's shared budget was spent earli
 means the shared clock ran out against a slow chain, not that the read model itself
 stalled.
 
+The TOTAL of that one budget is per-binary, not a constant. Most take the 240s
+default, which assumes the read phases follow a few minutes of chain.
+`e2e_inference_stream` and `e2e_inference_range_link` size their own
+(`ReadBudget::with_total`) because their last phase follows far more than that —
+`PROBE_WINDOW` alone is 180s and sits BETWEEN the stream binary's two phases. On
+the default the budget would be spent before the stop even settles, `left()`
+would be zero, and the phase would fire a single probe the instant the fact was
+created: a guaranteed false red rather than a strict check. One budget per
+binary is the rule; 240s is a default, and the rule is what matters — it exists
+so per-fact budgets cannot sum past nextest's 600s kill and take the collected
+failures with them.
+
 ## Reconciliation
 
 Three reconcilers (market, OracleEventList, inference) fill metadata that the event stream alone does not carry. All run on a fixed cadence (configured under `indexer:` in `config/indexer.<env>.yaml`) and share a failure-backoff pattern (`last_reconcile_failed_at`, `reconcile_attempts` on the parent row) so a permanently broken contract cannot starve the queue. The inference reconciler additionally exposes three cadence knobs (`inference_reference_price_refresh_ms`, `inference_sweep_interval_ms`, `inference_orphan_cutoff_ms`) beyond its base interval; see [Inference reconciler](#inference-reconciler) for the full table.
