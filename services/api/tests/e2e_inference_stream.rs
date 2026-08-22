@@ -79,26 +79,36 @@ const POLL_TICK: Duration = Duration::from_secs(2);
 // the sum is what has to fit, because a stand having a bad minute is exactly
 // when the ceilings are reached.
 //
-//   book live                     90s   (BOOK_TICKS)
-//   offer rested                  90s   (OFFER_TICKS)
-//   match funds the TC            60s   (FUND_TICKS)
-//   fundDeal + open acknowledged  40s   (OPEN_TICKS)
+//   book live                     60s   (BOOK_TICKS)
+//   offer rested                  60s   (OFFER_TICKS)
+//   match funds the TC            40s   (FUND_TICKS)
+//   both bonds land               60s   (BOND_TICKS)
+//   open acknowledged             40s   (OPEN_TICKS)
 //   PROBE_WINDOW                 190s   (180s of contract + 10s of chain clock)
 //   probe accepted                30s   (ACCEPT_TICKS)
 //   stop settles on chain         40s   (STOP_TICKS)
 //                                ────
-//                                540s, leaving 60s for the read phases'
+//                                520s, leaving 80s for the read phases'
 //                                trailing polls and `finish`.
+//
+// The first four ceilings were cut after dexdo pipeline #292 measured them: the
+// scene reached `open` in 15.9s of wall clock, against the 240s those steps had
+// been given. They stay well above the measurement because they are timeouts
+// for a bad day, not expectations — but 240s of headroom for a 16s stretch left
+// no room for the bond wait this scene turned out to need.
 //
 // 60s is the floor this wave requires a scene to keep. The optional
 // `withdrawShell` step is the first thing cut when the run is already slower
 // than its ceilings — it is measured at runtime rather than assumed, see
 // OPTIONAL_STEP_RESERVE.
-const BOOK_TICKS: u32 = 45;
-const OFFER_TICKS: u32 = 45;
-const FUND_TICKS: u32 = 30;
+const BOOK_TICKS: u32 = 30;
+const OFFER_TICKS: u32 = 30;
+const FUND_TICKS: u32 = 20;
 const OPEN_TICKS: u32 = 20;
 const ACCEPT_TICKS: u32 = 15;
+/// Both bonds are in-flight messages when `fundDeal` returns; 60s is the ceiling
+/// for the pair of them to land.
+const BOND_TICKS: u32 = 30;
 const STOP_TICKS: u32 = 20;
 
 /// `PROBE_WINDOW` in `contracts/airegistry/modifiers/modifiers.sol:25` is 180s
@@ -141,7 +151,7 @@ const SCENE_CEILING: Duration = Duration::from_secs(560);
 /// the scene serves that purpose exactly: at the last phase this leaves roughly
 /// `SCENE_CEILING - elapsed` of polling, and the test still reaches its
 /// `assert!`.
-const STREAM_READ_BUDGET: Duration = Duration::from_secs(545);
+const STREAM_READ_BUDGET: Duration = Duration::from_secs(540);
 
 // A limit price must be a positive whole multiple of `PRICE_STEP` (1 SHELL =
 // 1e9); the book rejects sub-SHELL dust with ERR_BAD_PARAM before assigning an
@@ -438,14 +448,77 @@ async fn a_two_sided_deal_settles_clean_and_names_both_of_its_parties() {
     .await
     .expect("fundDeal accepted");
 
-    dex.token_contract_open(
-        &tc,
-        // An opaque blob addressed to the buyer; nothing on the way reads it.
-        ParamsOfOpen { endpoint_cipher: "00".to_string() },
-        seller_signer(),
-    )
-    .await
-    .expect("open accepted");
+    // Both bonds have to be in before `open` is sent, and neither arrives
+    // synchronously. `TokenContract.sol:984-985` requires `_sellerBondFunded`
+    // AND `_buyerBondFunded`, and both are set by messages still in flight at
+    // this point: the seller's by the `fundDeal` just sent, the buyer's by the
+    // `fundBuyerBond` its own note emitted back on the fill (`:721-727` spells
+    // out that an ordinary deal's buyer bond "arrives later"). Sending `open`
+    // straight after `fundDeal` raced both of them and reverted in the compute
+    // phase with code 621 — which reads as "open is broken" rather than "open
+    // was early", so this waits instead.
+    //
+    // The seller side has a flag; the buyer side does not, and
+    // `token_contract_get_buyer_bond` explains why `bond_held > 0` stands in
+    // for one here.
+    let mut bonds_in = false;
+    for _ in 0..BOND_TICKS {
+        tokio::time::sleep(POLL_TICK).await;
+        let seller_in =
+            matches!(dex.token_contract_get_seller_bond(&tc).await, Ok(b) if b.bond_funded);
+        let buyer_in =
+            matches!(dex.token_contract_get_buyer_bond(&tc).await, Ok(b) if b.bond_held > 0);
+        if seller_in && buyer_in {
+            bonds_in = true;
+            break;
+        }
+    }
+    if !bonds_in {
+        let seller_bond = dex.token_contract_get_seller_bond(&tc).await;
+        let buyer_bond = dex.token_contract_get_buyer_bond(&tc).await;
+        failures.push(format!(
+            "the deal's bonds never both landed, so `open` could only have reverted: \
+             seller={seller_bond:?} buyer={buyer_bond:?}"
+        ));
+        finish(
+            &dex,
+            &seller.address,
+            &buyer.address,
+            &model_hash,
+            seller_signer(),
+            buyer_signer(),
+            failures,
+        )
+        .await;
+        return;
+    }
+
+    // Through `finish` rather than `expect`: a revert here strands two notes in
+    // a funded deal, and the panic would skip the cancel-all that releases
+    // their resting orders — the discipline every other early exit in this file
+    // follows.
+    if let Err(err) = dex
+        .token_contract_open(
+            &tc,
+            // An opaque blob addressed to the buyer; nothing on the way reads it.
+            ParamsOfOpen { endpoint_cipher: "00".to_string() },
+            seller_signer(),
+        )
+        .await
+    {
+        failures.push(format!("open refused after both bonds were in: {err:?}"));
+        finish(
+            &dex,
+            &seller.address,
+            &buyer.address,
+            &model_hash,
+            seller_signer(),
+            buyer_signer(),
+            failures,
+        )
+        .await;
+        return;
+    }
 
     let mut opened = false;
     for _ in 0..OPEN_TICKS {

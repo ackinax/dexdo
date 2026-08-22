@@ -58,6 +58,10 @@ const REST_TICKS: u32 = 30;
 const OFFER_TICKS: u32 = 45;
 const FILL_TICKS: u32 = 30;
 
+/// The expiry scene's own read budget. See the budget note on that test for why
+/// the 240s default cannot serve it.
+const EXPIRY_READ_BUDGET: Duration = Duration::from_secs(520);
+
 const PRICE_PER_TICK: u128 = 1_000_000_000;
 const MAX_SELL_TTL: u64 = 3600;
 const FLAG_IOC: u8 = 0x01;
@@ -168,14 +172,20 @@ async fn read_surfaces(
 // ── IX-SEQ-12: expiry is its own ending ───────────────────────────────────
 //
 // Budget, by summand:
-//   book live                 90s   (BOOK_TICKS)
-//   two bids rest             60s   (REST_TICKS, twice, worst case)
-//   the deadline passes       45s   (DEADLINE_IN + slack for the chain clock)
-//   expireOrder + read phase  60s   (what remains of the read budget)
+//   book live                  90s   (BOOK_TICKS)
+//   two bids rest             120s   (REST_TICKS, twice, worst case)
+//   the deadline passes       195s   (DEADLINE_IN + CLOCK_SLACK, minus whatever
+//                                     the two rests already spent — it is an
+//                                     absolute wait, not an additional one)
+//   expireOrder + read phase  120s   (what remains of the read budget)
 //                            ────
-//                            255s of the 600s `ci-e2e` kill. Far from the
-//                            ceiling: this scene deploys no TokenContract and
-//                            waits out no contract window.
+//                            405s of the 600s `ci-e2e` kill.
+//
+// The read budget is sized rather than left at the 240s default for the reason
+// spelled out in `common::read_model`: the clock starts before the chain waits,
+// and here they run past 240s on their own, which would hand the read phase
+// `left() = 0` and one probe fired the instant `expireOrder` lands — a
+// guaranteed false red rather than a strict check.
 #[tokio::test]
 #[ignore = "requires shellnet + seed_notes.json"]
 async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
@@ -184,11 +194,24 @@ async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
         .with_env_filter("info,ackinacki_kit=debug")
         .try_init();
 
-    /// How far ahead the doomed order's deadline sits. Long enough that the
-    /// order certainly rests first — an order placed with a deadline already
-    /// past is refused before `tvm.accept()` and never becomes an order at all,
-    /// which is a different fact (and one `e2e_inference_orders` already pins).
-    const DEADLINE_IN: u64 = 30;
+    /// How far ahead the doomed order's deadline sits.
+    ///
+    /// It has to clear the CHAIN's clock, not this host's — the book compares
+    /// the deadline against `block.timestamp`, and the two disagree by more
+    /// than one might guess. At 30s this test failed on the stand (dexdo
+    /// pipeline #292) with "the bid with a deadline never rested": the order
+    /// was not slow, it was REFUSED, because it reached the book already
+    /// expired and a placement past its deadline is turned away before
+    /// `tvm.accept()` — it never becomes an order at all. That the chain was
+    /// not merely slow is settled by the same run: `e2e_inference_orders`
+    /// placed two bids and finished in 16.9s.
+    ///
+    /// 180 rather than some smaller round number because the repository has
+    /// already priced this skew in the opposite direction: `STALE_BY = 120` in
+    /// `e2e_inference_orders.rs` backdates a deadline by two minutes for
+    /// exactly this reason. A margin that generous in the past deserves at
+    /// least as much in the future.
+    const DEADLINE_IN: u64 = 180;
 
     let (note, keys) = note_and_signer();
     let signer = || Signer::Keys { keys: keys.clone() };
@@ -199,7 +222,7 @@ async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
 
     let mut failures: Vec<String> = Vec::new();
     let read = read_surfaces("e2e_expiry", &mut failures).await;
-    let budget = ReadBudget::start();
+    let budget = ReadBudget::with_total(EXPIRY_READ_BUDGET);
 
     let (ob, model_hash, first_id) = fresh_book(&dex, &note, signer(), &model_name).await;
     eprintln!("[e2e_expiry] order_book={ob}");

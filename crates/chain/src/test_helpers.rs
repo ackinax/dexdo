@@ -21,6 +21,7 @@ use dodex_contracts::airegistry::inference_order_book::ResultOfGetOrder as IobOr
 use dodex_contracts::airegistry::inference_order_book::ResultOfGetStats as IobStats;
 use dodex_contracts::airegistry::token_contract::ParamsOfOpen;
 use dodex_contracts::airegistry::token_contract::ParamsOfWithdrawShell;
+use dodex_contracts::airegistry::token_contract::ResultOfGetBuyerBond as TcBuyerBond;
 use dodex_contracts::airegistry::token_contract::ResultOfGetConfig as TcConfig;
 use dodex_contracts::airegistry::token_contract::ResultOfGetFees as TcFees;
 use dodex_contracts::airegistry::token_contract::ResultOfGetOffer as TcOffer;
@@ -607,6 +608,23 @@ impl Dex {
     ) -> ChainResult<TcState> {
         TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
             .get_state()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// The buyer's bond as the deal holds it (`TokenContract.getBuyerBond`).
+    ///
+    /// Read `bond_held > 0` as "the buyer's half has landed" for an ordinary
+    /// deal: the contract exposes no `bond_funded` flag on this side, and
+    /// `fundBuyerBond` writes the amount and the private flag together
+    /// (`TokenContract.sol:957-958`). A subscription funds it by carve-out
+    /// instead (`:727`), where that reading does not hold.
+    pub async fn token_contract_get_buyer_bond(
+        &self,
+        token_contract_address: &str,
+    ) -> ChainResult<TcBuyerBond> {
+        TokenContract::new(self.ctx.clone(), self_rooted_contract_params(token_contract_address))
+            .get_buyer_bond()
             .await
             .map_err(Into::into)
     }

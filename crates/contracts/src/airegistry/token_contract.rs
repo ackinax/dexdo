@@ -166,6 +166,26 @@ pub struct ResultOfGetSellerBond {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Result of `TokenContract.getBuyerBond`.
+///
+/// Note what is NOT here: a `bond_funded` flag. `getBuyerBond`
+/// (`TokenContract.sol:2119`) returns only the two amounts, while the contract
+/// keeps `_buyerBondFunded` to itself — and `open()` requires that flag
+/// (`:985`). For an ORDINARY deal the two move together: `fundBuyerBond` sets
+/// `_buyerBond = need` and the flag on adjacent lines (`:957-958`), so
+/// `bond_held > 0` is a faithful stand-in. A SUBSCRIPTION funds the bond by
+/// carve-out at fund time instead (`:727`) and this equivalence does not carry
+/// there.
+pub struct ResultOfGetBuyerBond {
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub bond_held: u128,
+    /// Zero unless the deal is a subscription — `_isSubscription() ? _bondAmount() : 0`.
+    #[serde(deserialize_with = "deserialize_u128")]
+    pub bond_required: u128,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 /// Result of `TokenContract.getConfig` (protocol-wide constants, spec §9.1).
 pub struct ResultOfGetConfig {
     #[serde(deserialize_with = "deserialize_u16")]
@@ -400,6 +420,11 @@ impl TokenContract {
     /// Original contract method: `getSellerBond`.
     pub async fn get_seller_bond(&self) -> KitResult<ResultOfGetSellerBond> {
         self.call_get_method::<ResultOfGetSellerBond>("getSellerBond").await
+    }
+
+    /// Original contract method: `getBuyerBond`.
+    pub async fn get_buyer_bond(&self) -> KitResult<ResultOfGetBuyerBond> {
+        self.call_get_method::<ResultOfGetBuyerBond>("getBuyerBond").await
     }
 
     /// Original contract method: `getOffer`.
