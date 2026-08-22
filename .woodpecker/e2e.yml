@@ -1117,6 +1117,23 @@ steps:
       # the inference binaries' read-model phases, and this is the only lane that
       # may set it: the stand runs an indexer filling the database the phases
       # poll. See `read_phases_enabled` in services/api/tests/common/read_model.rs.
+      #
+      # THE INDEXER-E2E SCENARIOS RUN HERE, NOT IN A STEP OF THEIR OWN. The
+      # script this pipes selects by profile, not by name — `cargo nextest run
+      # --profile ci-e2e -p dodex-api --run-ignored only -E 'not
+      # binary(e2e_inference_dispute)'` — so `e2e_inference_stream`,
+      # `e2e_inference_expiry_sweep` and `e2e_inference_range_link` were picked
+      # up the moment they existed. A separate step would have to pipe a
+      # different script (there is none) and would run the whole suite twice.
+      #
+      # What that costs is not additive with the rest: the script runs four at a
+      # time and delegates serialisation to the `serial-e2e-shared` group in
+      # `.config/nextest.toml`, which all three new binaries are in. They
+      # therefore queue behind each other — worst case ~9 + ~7 + ~7 minutes of
+      # scene time, most of it asleep in on-chain windows — while the
+      # unconstrained binaries keep overlapping them. Treat that as an upper
+      # bound to be replaced by measurement: take the real per-binary times off
+      # the first green stand run and correct this note.
     commands:
       - cp -ar $CI_WORKSPACE/.ssh ~/.ssh && chmod 700 ~/.ssh && chmod 600 ~/.ssh/id_ed25519
       - >
