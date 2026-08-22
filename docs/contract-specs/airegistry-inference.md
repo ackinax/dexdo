@@ -94,16 +94,23 @@ Acki Nacki is dApp-sharded, which shapes how these contracts are reached:
 
 Node-gated `#[ignore]` tests under `services/api/tests/`, driven through
 `dodex_chain::Dex`. The chain half needs only a reachable shellnet endpoint and
-a seed-note pool. Three of them — `e2e_inference`, `e2e_inference_clob` and
-`e2e_inference_orders` — additionally carry **read-model phases** that assert
+a seed-note pool. Four of them — `e2e_inference`, `e2e_inference_clob`,
+`e2e_inference_orders` and `e2e_inference_stream` — additionally carry
+**read-model phases** that assert
 the chain action reached the public API, polling the production router raised
 in-process (`common::setup()`) against the indexer database. Those phases need
 **two** things: `TEST_DATABASE_URL`, and `E2E_READ_MODEL=1` to say an indexer is
 filling that database. Both are set only on the woodpecker stand; the shellnet
 lane sets the first alone, and the phases stay off there because nothing writes
-the facts they poll for. Without either, each binary prints a skip notice and
-runs its chain half exactly as before, so a missing variable never turns a run
-red.
+the facts they poll for.
+
+The two are NOT symmetric, and the asymmetry is deliberate. With
+`E2E_READ_MODEL` unset the binary prints a skip notice and runs its chain half
+exactly as before — the ordinary case on every lane but one, and never red. With
+`E2E_READ_MODEL` set and no reachable database the binary pushes a FAILURE: that
+combination is an instruction the only lane able to carry it out could not carry
+out, and printing a notice onto a green run is precisely how such a run goes
+unnoticed.
 The polling rules (poll for presence, assert content; never panic mid-scenario)
 and the shared wait budget live in
 [`docs/tech-specs/indexer.md`](../tech-specs/indexer.md#in-scene-end-to-end-assertions).
@@ -115,13 +122,24 @@ and the shared wait budget live in
 | `e2e_inference_clob` | Two flows: a partial fill (2-tick offer crossed by a 4-tick limit buy, 2 ticks rest) + `getBestBidAsk`/`getWeeklyMedianPrice`, and a match's `Filled` event confirmed by its routing id. Read phases (stand only): the match on the public tape in `/trades` and the taker leg in `/orders` (IX-SEQ-03). |
 | `e2e_inference_orders` | The book as an order book, with no deal at all: two bids, a single `cancelInferenceOrder` by id that takes only its own, and a buy whose deadline has already passed — refused before `tvm.accept()`, so `nextOrderId` never moves. Fast (~35 s). Read phase (stand only): the precise cancel in `/orders` — the cancelled order reads `CANCELLED` with its size preserved (a cancel is not a fill), while its neighbour stays live (IX-SEQ-08). |
 | `e2e_inference_funding` | `fundDeployShell`: a note pays its own canonical `TokenContract` address, and the deal contract then deploys onto it with no giver in the run. Also pins the two things the call must not do — reach the RootModel, which it no longer has a leg for, and send anything at all when asked for `0`. Fast (~2 min). |
+| `e2e_inference_stream` | The deal lifecycle past the match, between **two** notes: offer → crossing IOC buy → `fundDeal` → `open` → `PROBE_WINDOW` → `acceptProbe` → buyer `stop`. Read phases (stand only): `inference_deals` names a seller and a buyer that DIFFER (IX-SEQ-04), and the deal closes `STOPPED` with `clean_settlement` (IX-SEQ-06). Both are SQL, not HTTP — `inference_deals` has no public surface. Slow (~9 min): `PROBE_WINDOW` alone is 180 s. |
 
-The streaming-deal suites — `e2e_inference_stream`, `e2e_inference_settlement`,
-`e2e_inference_twosided`, `e2e_inference_range`, `e2e_inference_subscription`,
-`e2e_inference_recovery` and `e2e_inference_dispute` — were removed with the
-contract calls they drove when v4.0.33 dropped those calls. What remains above
-is the whole of the inference e2e coverage; the deal lifecycle past a match is
-not exercised end to end.
+The streaming-deal suites — `e2e_inference_settlement`, `e2e_inference_twosided`,
+`e2e_inference_range`, `e2e_inference_subscription`, `e2e_inference_recovery` and
+`e2e_inference_dispute` — were removed with the contract calls they drove when
+v4.0.33 dropped those calls.
+
+**That removal was about a changed model, not a disappeared one, and two
+contract versions have passed since.** What v4.0.33 dropped were
+`TokenContract.advance` and `PrivateNote.postSellerBond`, the optimistic
+tick-by-tick driver; what replaced them are `fundDeal` (the seller's half of the
+bond, the buyer's being funded inline on the fill) and `acceptProbe` (the seller
+claiming the trial tick once `PROBE_WINDOW` has passed). Both are present at
+v4.0.35, which is what `e2e_inference_stream` above drives — it is a new binary
+of the same name as a deleted one, built on the replacement calls rather than
+restored from git. The suites still listed as removed are the ones for which no
+such replacement has been written; the deal lifecycle past a match is no longer
+entirely unexercised.
 
 They share the seed-note pool (`tests/fixtures/seed_notes.json` /
 `E2E_SEED_NOTES`) like the other e2e tests; the note must additionally hold
@@ -133,6 +151,7 @@ cargo test -p dodex-api --test e2e_inference_match -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_clob -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_orders -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_funding -- --ignored --nocapture
+cargo test -p dodex-api --test e2e_inference_stream -- --ignored --nocapture
 ```
 
 All of them run in the e2e pipeline's `e2e_tests` step, which excludes nothing:
