@@ -1137,12 +1137,13 @@ steps:
       # poll. See `read_phases_enabled` in services/api/tests/common/read_model.rs.
       #
       # THE INDEXER-E2E SCENARIOS RUN HERE, NOT IN A STEP OF THEIR OWN. The
-      # script this pipes selects by profile, not by name — `cargo nextest run
-      # --profile ci-e2e -p dodex-api --run-ignored only -E 'not
-      # binary(e2e_inference_dispute)'` — so `e2e_inference_stream`,
-      # `e2e_inference_expiry_sweep` and `e2e_inference_range_link` were picked
-      # up the moment they existed. A separate step would have to pipe a
-      # different script (there is none) and would run the whole suite twice.
+      # script this pipes selects by profile and by nothing else — at the pin
+      # above it is `cargo nextest run --profile ci-e2e -p dodex-api
+      # --run-ignored only --test-threads 4 --no-fail-fast`, with no `-E` at
+      # all — so `e2e_inference_stream`, `e2e_inference_expiry_sweep` and
+      # `e2e_inference_range_link` were picked up the moment they existed. A
+      # separate step would have to pipe a different script (there is none) and
+      # would run the whole suite twice.
       #
       # What that costs is not additive with the rest: the script runs four at a
       # time and delegates serialisation to the `serial-e2e-shared` group in
