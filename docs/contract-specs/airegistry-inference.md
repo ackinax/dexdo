@@ -94,9 +94,10 @@ Acki Nacki is dApp-sharded, which shapes how these contracts are reached:
 
 Node-gated `#[ignore]` tests under `services/api/tests/`, driven through
 `dodex_chain::Dex`. The chain half needs only a reachable shellnet endpoint and
-a seed-note pool. Four of them — `e2e_inference`, `e2e_inference_clob`,
-`e2e_inference_orders` and `e2e_inference_stream` — additionally carry
-**read-model phases** that assert
+a seed-note pool. Five of them — `e2e_inference`, `e2e_inference_clob`,
+`e2e_inference_orders`, `e2e_inference_stream` and
+`e2e_inference_expiry_sweep` — additionally carry **read-model phases** that
+assert
 the chain action reached the public API, polling the production router raised
 in-process (`common::setup()`) against the indexer database. Those phases need
 **two** things: `TEST_DATABASE_URL`, and `E2E_READ_MODEL=1` to say an indexer is
@@ -123,6 +124,7 @@ and the shared wait budget live in
 | `e2e_inference_orders` | The book as an order book, with no deal at all: two bids, a single `cancelInferenceOrder` by id that takes only its own, and a buy whose deadline has already passed — refused before `tvm.accept()`, so `nextOrderId` never moves. Fast (~35 s). Read phase (stand only): the precise cancel in `/orders` — the cancelled order reads `CANCELLED` with its size preserved (a cancel is not a fill), while its neighbour stays live (IX-SEQ-08). |
 | `e2e_inference_funding` | `fundDeployShell`: a note pays its own canonical `TokenContract` address, and the deal contract then deploys onto it with no giver in the run. Also pins the two things the call must not do — reach the RootModel, which it no longer has a leg for, and send anything at all when asked for `0`. Fast (~2 min). |
 | `e2e_inference_stream` | The deal lifecycle past the match, between **two** notes: offer → crossing IOC buy → `fundDeal` → `open` → `PROBE_WINDOW` → `acceptProbe` → buyer `stop`. Read phases (stand only): `inference_deals` names a seller and a buyer that DIFFER (IX-SEQ-04), and the deal closes `STOPPED` with `clean_settlement` (IX-SEQ-06). Both are SQL, not HTTP — `inference_deals` has no public surface. Slow (~9 min): `PROBE_WINDOW` alone is 180 s. |
+| `e2e_inference_expiry_sweep` | Two endings, two tests. A bid whose deadline passes is expired by the permissionless `expireOrder` and reads `EXPIRED` in `/orders` — its own terminal status — while a neighbour without a deadline stays `LIVE` (IX-SEQ-12). And a taker remainder the chain refunds with no closing event is ended by the reconciler's sweep: `CANCELLED` **with `swept_at` set**, which is SQL because the DTO carries no such field and a provisional cancel is otherwise identical to a real one over HTTP (IX-SEQ-07). |
 
 The streaming-deal suites — `e2e_inference_settlement`, `e2e_inference_twosided`,
 `e2e_inference_range`, `e2e_inference_subscription`, `e2e_inference_recovery` and
@@ -152,6 +154,7 @@ cargo test -p dodex-api --test e2e_inference_clob -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_orders -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_funding -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_stream -- --ignored --nocapture
+cargo test -p dodex-api --test e2e_inference_expiry_sweep -- --ignored --nocapture
 ```
 
 All of them run in the e2e pipeline's `e2e_tests` step, which excludes nothing:
