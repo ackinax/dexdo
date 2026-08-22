@@ -37,9 +37,18 @@ variables:
   # the risk is real, not theoretical -- move the pin to a `dev` commit once
   # this work lands there.
   #
-  # This pin is two commits ahead of the last, and BOTH are inert for the
-  # zerostate this pipeline bakes:
+  # This pin is three commits ahead of the last, and ALL THREE are inert for
+  # the zerostate this pipeline bakes:
   #
+  # - `fix(dexdo): drop the e2e build dir when the host disk cannot hold
+  #   another build` is the newest. Nothing ever removed `~/dexdo-e2e/target`
+  #   on host B, so it grew run over run until pipeline #290 ran the disk out
+  #   mid-link: rustc reported an LLVM IO failure, ld died with SIGBUS, and
+  #   `e2e_tests` and `observer` exited 101 and 65 with no rustc diagnostic
+  #   anywhere and not one test having run — indistinguishable at a glance
+  #   from broken code on this side. The runner now drops `target` only when
+  #   free space is below a floor, so the warm cache survives the normal case
+  #   rather than trading a disk failure for a timeout.
   # - `test(dexdo): drop the nextest filter naming a deleted suite` is the one
   #   that matters. `e2e-on-host.sh` carried `-E 'not
   #   binary(e2e_inference_dispute)'` for a suite the v4.0.33 sync deleted, and
@@ -58,7 +67,7 @@ variables:
   #   drift freely": it holds because stage_contracts.sh replaces those exact
   #   directories, and a contract added outside its two allowlists would be
   #   taken from the pin instead.
-  - &acki_sha "e210d4019916b766a4bdb45b5b14d6daf8e09484"
+  - &acki_sha "b23f976819247370915c6b18138b6a3fbc29b7e5"
   - &allbin_img "docker.gosh.sh/ackinacki-all-bin@sha256:1ee9cec484f27659e4b4d0e2182ca79485929b23c659bd772e58786f9bb1d2c7"
   - &node_img "docker.gosh.sh/ackinacki-node@sha256:00af55c1fb597d89f8afb469a43eb21c991c9db911ff7a6161ad934218fc4a03"
   - &gql_img "docker.gosh.sh/ackinacki-gql-server@sha256:a45e15d363cb6f4ef4aca5bdc82d7fe225cca2b6dea97c1838ffbf7208dea962"
