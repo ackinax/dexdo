@@ -225,6 +225,18 @@ pub fn api(path: &str) -> String {
     format!("http://test/api/v1/inference/{path}")
 }
 
+/// Full URL for a public PREDICTION endpoint — a different tree of the same
+/// router, not a different service.
+///
+/// It earns its own function rather than a parameter because exactly one fact
+/// crosses between the two: a range market is a prediction market that settles
+/// from an inference book, so the scene that proves the link is the only one
+/// that reads both. Everything else stays on [`api`], and a caller that
+/// reaches for this one is saying which side of the link it is asking about.
+pub fn api_prediction(path: &str) -> String {
+    format!("http://test/api/v1/prediction/{path}")
+}
+
 /// The outcome of a single GET through the production router.
 pub enum GetOutcome {
     Ok(Value),

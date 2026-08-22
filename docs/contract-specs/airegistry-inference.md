@@ -10,7 +10,7 @@ with, but separate from, the DEX.DO prediction-market core under `contracts/dex/
 | --- | --- |
 | `SuperRoot` | Per-network root factory. Registers a `RootModel` at a deterministic address derived from an owner pubkey. (The per-model `ManifestMetadata` contract and SuperRoot's `registerManifest` / `getManifestAddress` were removed upstream in v4.0.10.) |
 | `RootModel` | Per-owner model registry. Derives + registers `TokenContract` children at deterministic `(sellerPubkey, nonce)` addresses. |
-| `TokenContract` | Per-deal streaming escrow. Holds the buyer's SHELL deposit and settles ticks one at a time (probe-tick model, spec §3.1.2): `open → advance → stop / dispute / reclaim`. |
+| `TokenContract` | Per-deal streaming escrow. Holds the buyer's SHELL deposit and settles on the probe-tick model (spec §3.1.2): `fundDeal → open → acceptProbe → stop / dispute / reclaim`. (`advance`, the old tick-by-tick driver, was dropped in v4.0.33 along with `PrivateNote.postSellerBond`; `acceptProbe` and `fundDeal` are what replaced them.) |
 | `InferenceOrderBook` | Per-model CLOB. Matches SELL offers (each backed by a `TokenContract`) against BUY orders and subscriptions paid in SHELL escrow. Deployed per `(model)` from a `PrivateNote`. |
 
 Inference settles in **SHELL held physically by the note**, so the
@@ -83,20 +83,21 @@ Acki Nacki is dApp-sharded, which shapes how these contracts are reached:
   cross a dApp boundary, so the fresh account is created + gassed by sending
   **ECC SHELL with flag 16** from the giver (flag 16 lands the ECC as the new
   account's native balance).
-- **`open()`** requires the seller mirror bond already funded, and
-  `fundSellerBond` only accepts an internal SHELL-bearing message (an external
-  signed call cannot carry currency). The e2e harness delivers it as a call body
-  from the giver (`sendCurrencyWithBody`), so no separate wallet is needed. The
-  bond is `2 * pricePerTick`, so a test must derive the amount from P rather
-  than hardcoding it.
+- **`open()`** requires the seller mirror bond already funded. Since v4.0.33
+  that funding is `PrivateNote.fundDeal` — the note pays its own deal out of
+  `_balance[CURRENCIES_ID_SHELL]`, deriving the deal address from the `nonce`
+  rather than being told it, so a wrong nonce bounces instead of paying a
+  stranger. No giver and no separate wallet are involved on the seller side.
+  The buyer's half is never called for at all: the fill path inside the buyer's
+  note sends `fundBuyerBond` inline (`PrivateNote.sol:752`).
 
 ## End-to-end tests
 
 Node-gated `#[ignore]` tests under `services/api/tests/`, driven through
 `dodex_chain::Dex`. The chain half needs only a reachable shellnet endpoint and
-a seed-note pool. Five of them — `e2e_inference`, `e2e_inference_clob`,
-`e2e_inference_orders`, `e2e_inference_stream` and
-`e2e_inference_expiry_sweep` — additionally carry **read-model phases** that
+a seed-note pool. Six of them — `e2e_inference`, `e2e_inference_clob`,
+`e2e_inference_orders`, `e2e_inference_stream`, `e2e_inference_expiry_sweep`
+and `e2e_inference_range_link` — additionally carry **read-model phases** that
 assert
 the chain action reached the public API, polling the production router raised
 in-process (`common::setup()`) against the indexer database. Those phases need
@@ -124,6 +125,7 @@ and the shared wait budget live in
 | `e2e_inference_orders` | The book as an order book, with no deal at all: two bids, a single `cancelInferenceOrder` by id that takes only its own, and a buy whose deadline has already passed — refused before `tvm.accept()`, so `nextOrderId` never moves. Fast (~35 s). Read phase (stand only): the precise cancel in `/orders` — the cancelled order reads `CANCELLED` with its size preserved (a cancel is not a fill), while its neighbour stays live (IX-SEQ-08). |
 | `e2e_inference_funding` | `fundDeployShell`: a note pays its own canonical `TokenContract` address, and the deal contract then deploys onto it with no giver in the run. Also pins the two things the call must not do — reach the RootModel, which it no longer has a leg for, and send anything at all when asked for `0`. Fast (~2 min). |
 | `e2e_inference_stream` | The deal lifecycle past the match, between **two** notes: offer → crossing IOC buy → `fundDeal` → `open` → `PROBE_WINDOW` → `acceptProbe` → buyer `stop`. Read phases (stand only): `inference_deals` names a seller and a buyer that DIFFER (IX-SEQ-04), and the deal closes `STOPPED` with `clean_settlement` (IX-SEQ-06). Both are SQL, not HTTP — `inference_deals` has no public surface. Slow (~9 min): `PROBE_WINDOW` alone is 180 s. |
+| `e2e_inference_range_link` | The one scene spanning both halves of the product: an `InferenceOrderBook` is deployed first, then a prediction market whose event is a RANGE event carrying that book's address. Read phase (stand only): `/api/v1/prediction/markets?resolvesFrom=<book>` returns exactly that market, naming the book and `WEEKLY_MEDIAN_PRICE` (IX-SEQ-09). Two notes of different currencies — `PN-INF` for the book, `PN-API` for the market. |
 | `e2e_inference_expiry_sweep` | Two endings, two tests. A bid whose deadline passes is expired by the permissionless `expireOrder` and reads `EXPIRED` in `/orders` — its own terminal status — while a neighbour without a deadline stays `LIVE` (IX-SEQ-12). And a taker remainder the chain refunds with no closing event is ended by the reconciler's sweep: `CANCELLED` **with `swept_at` set**, which is SQL because the DTO carries no such field and a provisional cancel is otherwise identical to a real one over HTTP (IX-SEQ-07). |
 
 The streaming-deal suites — `e2e_inference_settlement`, `e2e_inference_twosided`,
@@ -155,6 +157,7 @@ cargo test -p dodex-api --test e2e_inference_orders -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_funding -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_stream -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_expiry_sweep -- --ignored --nocapture
+cargo test -p dodex-api --test e2e_inference_range_link -- --ignored --nocapture
 ```
 
 All of them run in the e2e pipeline's `e2e_tests` step, which excludes nothing:

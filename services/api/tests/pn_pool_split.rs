@@ -68,6 +68,10 @@ const STAND_NOTES_SPEC: &str = include_str!("../../../tests/e2e/dex_test_notes.s
 /// indices onto one note and turn each back into the self-trade it exists to
 /// stop being, which is why they assert the two addresses differ rather than
 /// trusting the arithmetic.
+/// Taken so far: 0–4 by the trader-path binaries, 5 by `e2e_inference_range_link`
+/// (which needs a NACKL note to deploy its prediction market and a `PN-INF` one
+/// for the book it resolves from — a note's currency is fixed by its
+/// constructor, so no single note can do both), and 9 by `e2e_register_account`.
 const API_NOTES_FOR_ONE_EACH: u64 = 19;
 
 #[test]
