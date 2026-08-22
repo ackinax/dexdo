@@ -66,6 +66,7 @@ reclaim`.
 | --- | --- | --- | --- |
 | `open` | `open` | `ParamsOfOpen { endpoint_cipher }` | Seller opens the stream (freezes the probe tick). |
 | `advance` | `advance` | — | Seller advances one tick (optimistic-accept after the settle window). |
+| `accept_probe` | `acceptProbe` | — | Seller claims the trial tick after `PROBE_WINDOW` of buyer silence. Reverts if the window is still open or the probe is already accepted; accepting it is what makes a later `stop` settle cleanly rather than burn the probe. |
 | `stop` | `stop` | — | Buyer stops the stream cleanly (spec §4.1). |
 | `dispute` | `dispute` | — | Buyer disputes the current ticks (spec §4.2). |
 | `release_dispute` | `releaseDispute` | — | Buyer releases a dispute it raised. |
@@ -140,6 +141,7 @@ on-chain.
 | `place_inference_subscription` | `placeInferenceSubscription` | `ParamsOfPlaceInferenceSubscription` | Place a subscription (semantic order). |
 | `cancel_inference_order` | `cancelInferenceOrder` | `ParamsOfCancelInferenceOrder` | Cancel one resting inference order owned by this note. |
 | `cancel_all_inference_orders` | `cancelAllInferenceOrders` | `ParamsOfCancelAllInferenceOrders` | Cancel all resting inference orders owned by this note. |
+| `fund_deal` | `fundDeal` | `ParamsOfFundDeal { nonce, gas_shell, amount, endpoint_cipher }` | Seller note funds its own deal `TokenContract`. Seller-only: the buyer's half of the bond is funded inline by the buyer's note on the fill (`fundBuyerBond`), never from here. The deal address is derived from `nonce` rather than passed, so a wrong nonce bounces instead of paying a stranger. |
 | `stream_stop` | `streamStop` | `ParamsOfStreamDeal` | Buyer note stops the stream cleanly (amicable exit, §4.1). |
 | `stream_dispute` | `streamDispute` | `ParamsOfStreamDeal` | Buyer note disputes the current ticks (§4.2). |
 | `stream_reclaim` | `streamReclaim` | `ParamsOfStreamDeal` | Buyer note reclaims a probe tick after the stream timeout (seller no-show). |

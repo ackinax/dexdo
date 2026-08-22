@@ -544,6 +544,31 @@ pub struct ParamsOfStreamDeal {
     pub token_contract: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+/// Parameters for `PrivateNote.fundDeal` (seller note → its deal
+/// `TokenContract`), `PrivateNote.sol:1055`.
+///
+/// Only the SELLER needs this call. The buyer's side of the bond is funded by
+/// the buyer's own note without anyone asking: the fill path calls
+/// `IInferenceDeal.fundBuyerBond` from inside the note (`:752`), so a scenario
+/// that crosses an offer has already paid it by the time the deal exists.
+pub struct ParamsOfFundDeal {
+    /// Ties the call to the deal the note derives internally; the deal address
+    /// is computed from it rather than passed, so a wrong nonce addresses a
+    /// contract that does not exist and the message bounces (`:1050`).
+    pub nonce: u64,
+    /// SHELL forwarded to cover the deal's own gas, separate from `amount`.
+    /// The contract requires `gasShell > 0 || amount > 0` (`:1060`).
+    pub gas_shell: u128,
+    /// Seller bond, paid out of `_balance[CURRENCIES_ID_SHELL]` — the note
+    /// reverts with `ERR_LOW_VALUE` if that ledger is short (`:1061`).
+    pub amount: u128,
+    /// `optional(bytes)` as a hex string: an opaque blob forwarded unchanged
+    /// to the deal for the buyer. Nothing in the note reads it.
+    pub endpoint_cipher: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 /// Result of `PrivateNote.getInferenceOrderBookAddress`.
 pub struct ResultOfGetInferenceOrderBookAddress {
@@ -1268,6 +1293,30 @@ impl PrivateNote {
     ) -> KitResult<ResultOfSendMessage> {
         let call_set = CallSet {
             function_name: "cancelAllInferenceOrders".to_string(),
+            header: None,
+            input: Some(json!(params)),
+        };
+        self.send_message(Some(call_set), None, signer).await
+    }
+
+    /// # Seller note funds its deal contract (spec §3.1.1)
+    ///
+    /// Original contract method: `fundDeal`
+    ///
+    /// Should be signed with PrivateNote owner keys.
+    ///
+    /// The seller's half of the bond only. The buyer's half never travels this
+    /// road: the fill path inside the buyer's own note calls
+    /// `IInferenceDeal.fundBuyerBond` directly (`PrivateNote.sol:752`), so a
+    /// scenario that crosses an offer has already funded the buyer side before
+    /// it reaches this call.
+    pub async fn fund_deal(
+        &self,
+        params: ParamsOfFundDeal,
+        signer: Signer,
+    ) -> KitResult<ResultOfSendMessage> {
+        let call_set = CallSet {
+            function_name: "fundDeal".to_string(),
             header: None,
             input: Some(json!(params)),
         };
