@@ -37,9 +37,15 @@ variables:
   # the risk is real, not theoretical -- move the pin to a `dev` commit once
   # this work lands there.
   #
-  # This pin is four commits ahead of the last, and ALL FOUR are inert for
+  # This pin is five commits ahead of the last, and ALL FIVE are inert for
   # the zerostate this pipeline bakes:
   #
+  # - `fix(dexdo): raise the free-space floor above the size of one build`
+  #   is the newest. The guard added two commits earlier had a 20 GiB floor,
+  #   which two runs then showed to be SMALLER than one build: #293 started
+  #   with 119736 MiB free and #294 with 71446 MiB, so a cold build of the
+  #   workspace writes ~47 GiB. A 20 GiB floor would wave through a build
+  #   that cannot fit. Raised to 60 GiB, which cleans more often on purpose.
   # - `fix(dexdo): print the database host instead of the database password`
   #   is the newest and the reason to move the pin promptly. The runner's
   #   `==> cargo nextest run …` line meant to name the database without its
@@ -75,7 +81,7 @@ variables:
   #   drift freely": it holds because stage_contracts.sh replaces those exact
   #   directories, and a contract added outside its two allowlists would be
   #   taken from the pin instead.
-  - &acki_sha "a54e0c14a543aef139a20286f70d1f3ffb8eb55e"
+  - &acki_sha "a4e16add82680db310a3a1dd1f7fd08526fdbbdb"
   - &allbin_img "docker.gosh.sh/ackinacki-all-bin@sha256:1ee9cec484f27659e4b4d0e2182ca79485929b23c659bd772e58786f9bb1d2c7"
   - &node_img "docker.gosh.sh/ackinacki-node@sha256:00af55c1fb597d89f8afb469a43eb21c991c9db911ff7a6161ad934218fc4a03"
   - &gql_img "docker.gosh.sh/ackinacki-gql-server@sha256:a45e15d363cb6f4ef4aca5bdc82d7fe225cca2b6dea97c1838ffbf7208dea962"
