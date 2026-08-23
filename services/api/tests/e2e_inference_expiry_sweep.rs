@@ -307,13 +307,15 @@ async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
     // scene did not account for is exactly what the control above is guarding.
     dex.inference_expire_order(&ob, doomed_id).await.expect("expireOrder accepted");
 
-    // This scene asserts over HTTP alone: both statuses it cares about are
-    // public, so the pool raised alongside the router goes unused here.
-    if let Some((service, _pool)) = read.as_ref() {
+    // The ASSERTIONS here are HTTP alone — both statuses this scene cares about
+    // are public. The pool is used for one thing only, and the gate below says
+    // why.
+    if let Some((service, pool)) = read.as_ref() {
         let want_expired = doomed_id.to_string();
         let want_live = survivor_id.to_string();
         let orders = poll_read_with("IX-SEQ-12 expiry in /orders", budget.left(), || {
             let service = std::sync::Arc::clone(service);
+            let pool = pool.clone();
             let ob = ob.clone();
             let want = want_expired.clone();
             async move {
@@ -330,16 +332,57 @@ async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
                         // budget blamed on the indexer.
                         //
                         // `LIVE` is the wire name for the DB's `OPEN`.
-                        let settled = all.iter().any(|o| {
-                            o["orderId"].as_str() == Some(want.as_str())
-                                && o["status"].as_str() != Some("LIVE")
-                        });
-                        if settled {
-                            Probe::Ready(all)
-                        } else {
-                            Probe::Pending(format!(
+                        let doomed = all
+                            .iter()
+                            .find(|o| o["orderId"].as_str() == Some(want.as_str()))
+                            .cloned();
+                        let status =
+                            doomed.as_ref().and_then(|o| o["status"].as_str()).map(str::to_owned);
+                        match status.as_deref() {
+                            None | Some("LIVE") => Probe::Pending(format!(
                                 "order {want} still LIVE or absent from /orders"
-                            ))
+                            )),
+                            Some("EXPIRED") => Probe::Ready(all),
+                            // A TERMINAL STATUS THAT IS NOT THE ONE WE WANT IS
+                            // NOT AUTOMATICALLY THE ANSWER. Two writers race for
+                            // this row: `expireOrder` projects `EXPIRED`, and the
+                            // phantom sweep — which sees the same order gone from
+                            // the book and reads `amount == 0` — writes a
+                            // PROVISIONAL `CANCELLED` with `swept_at` set. The
+                            // expiry projector is contracted to overwrite exactly
+                            // that (`inference_projectors.rs:701-708`:
+                            // `takes_expiry` is `OPEN or (CANCELLED and swept_at
+                            // is not null)`, and it clears `swept_at` on the way
+                            // through), so a swept cancel here is a row still in
+                            // flight, not a verdict.
+                            //
+                            // Pipeline #297 lost that race and reported a
+                            // provisional cancel as a wrong terminal status. The
+                            // distinction is not on the wire — the DTO carries no
+                            // `swept_at` — so it is read from the column, and
+                            // ONLY to decide whether to keep waiting. A CANCELLED
+                            // with `swept_at` NULL is a real ending and is handed
+                            // straight to the assertion below, which names it.
+                            Some(_) => {
+                                let swept: Option<bool> = sqlx::query_scalar(
+                                    "select swept_at is not null from inference_orders \
+                                     where orderbook_address = $1 and order_id = $2::numeric",
+                                )
+                                .bind(&ob)
+                                .bind(&want)
+                                .fetch_optional(&pool)
+                                .await
+                                .ok()
+                                .flatten();
+                                if swept == Some(true) {
+                                    Probe::Pending(format!(
+                                        "order {want} reads a provisional sweep cancel; the \
+                                         expiry projector owes it an EXPIRED"
+                                    ))
+                                } else {
+                                    Probe::Ready(all)
+                                }
+                            }
                         }
                     }
                 }
