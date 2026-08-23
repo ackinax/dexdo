@@ -114,6 +114,9 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 #     `e2e_inference_expiry_sweep` assert over SQL rather than HTTP, because
 #     `inference_deals` and `swept_at` have no public surface at all, and
 #     `e2e_inference_range_link` reads the database AND deploys an oracle;
+#   * `e2e_inference_range` is here for the oracle alone. It touches no
+#     database — its whole reading is on chain — but it deploys an oracle of
+#     its own, which is the singleton below;
 #   * everything that deploys a market sends an external `deployOracle` to the
 #     ONE `RootOracle` the whole stand shares. An external message carries a
 #     `timestamp` the contract compares against the last it accepted, so two
@@ -129,15 +132,29 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 filter = '''
     binary(e2e_inference) | binary(e2e_inference_clob) | binary(e2e_inference_orders)
   | binary(e2e_inference_stream) | binary(e2e_inference_expiry_sweep)
-  | binary(e2e_inference_range_link)
+  | binary(e2e_inference_range_link) | binary(e2e_inference_range)
   | binary(e2e_register_account)
   | binary(e2e_batch_orders) | binary(e2e_buy_full_set) | binary(e2e_cancel_batch_orders)
   | binary(e2e_cancel_order) | binary(e2e_order)
 '''
 test-group = 'serial-e2e-shared'
 
-
-
+# `e2e_inference_range` waits two on-chain clocks in sequence, and neither is
+# negotiable. First a deal has to reach a CLOSE before the book has a reference
+# price at all — a match publishes nothing, by design — which costs the 190s
+# probe window. Then the range event needs a deadline far enough out that the
+# list still sees `MIN_RESULT_GAP` of lead when the market is deployed against
+# it, which is another 240s. Neither clock can overlap the other: the deadline
+# is only meaningful once the price it resolves from exists.
+#
+# This override was written for the pre-v4.0.33 version of the binary, deleted
+# with it by that sync, and restored with it. 20 minutes against a run that
+# measured 514s (#220) is a cap for a hang, not an expectation — and the
+# restored version adds one wait the old one did not have (both bonds before
+# `open`), so the headroom is smaller than it was.
+[[profile.ci-e2e.overrides]]
+filter = 'binary(e2e_inference_range)'
+slow-timeout = { period = "60s", terminate-after = 20 }
 
 # The sdk-e2e profile (used by the sdk workspace's proof/acceptance suites)
 # lives in sdk/.config/nextest.toml, not here: sdk/ is a separate Cargo
