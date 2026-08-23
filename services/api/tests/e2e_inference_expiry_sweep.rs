@@ -66,6 +66,19 @@ const PRICE_PER_TICK: u128 = 1_000_000_000;
 const MAX_SELL_TTL: u64 = 3600;
 const FLAG_IOC: u8 = 0x01;
 
+/// `InferenceOrderBook.sol:1630` — `require(ticks >= 2, ERR_BAD_PARAM)`. The
+/// book will not take an order for a single tick, and the refusal is invisible
+/// from here: the note has no such check of its own, so it accepts the call and
+/// forwards it, and the placement path is `bounce:false` end to end. A one-tick
+/// bid therefore does not fail, it simply never becomes an order — which reads
+/// as "the book is slow" and cost this test two wrong diagnoses before the
+/// `require` was read.
+const BID_TICKS: u128 = 2;
+/// `>= ticks * (price + 2.5% fee)` = 2.05 SHELL at `PRICE_PER_TICK`; the book
+/// checks it at `:1662`. Three is the same headroom `e2e_inference_orders`
+/// gives the same price and size.
+const BID_ESCROW: u128 = 3_000_000_000;
+
 /// Note 21 out of `PN-INF`, reserved for this binary in `pn_pool_split.rs`.
 /// Both tests take it; they never run at the same time because the binary is in
 /// the `serial-e2e-shared` group, which is pinned to one at a time.
@@ -196,21 +209,19 @@ async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
 
     /// How far ahead the doomed order's deadline sits.
     ///
-    /// It has to clear the CHAIN's clock, not this host's — the book compares
-    /// the deadline against `block.timestamp`, and the two disagree by more
-    /// than one might guess. At 30s this test failed on the stand (dexdo
-    /// pipeline #292) with "the bid with a deadline never rested": the order
-    /// was not slow, it was REFUSED, because it reached the book already
-    /// expired and a placement past its deadline is turned away before
-    /// `tvm.accept()` — it never becomes an order at all. That the chain was
-    /// not merely slow is settled by the same run: `e2e_inference_orders`
-    /// placed two bids and finished in 16.9s.
+    /// Margin against the CHAIN's clock, which is what `:1643` compares the
+    /// deadline against — `require(deadline == 0 || deadline > block.timestamp)`
+    /// — rather than this host's. The repository already prices that skew in
+    /// the other direction: `STALE_BY = 120` in `e2e_inference_orders.rs`
+    /// backdates by two minutes to be sure a deadline reads as past.
     ///
-    /// 180 rather than some smaller round number because the repository has
-    /// already priced this skew in the opposite direction: `STALE_BY = 120` in
-    /// `e2e_inference_orders.rs` backdates a deadline by two minutes for
-    /// exactly this reason. A margin that generous in the past deserves at
-    /// least as much in the future.
+    /// A CORRECTION IS RECORDED HERE ON PURPOSE. This constant was raised from
+    /// 30 to 180 to explain "the bid with a deadline never rested" on dexdo
+    /// pipeline #292, and the explanation was wrong: #293 failed identically at
+    /// 180. The real cause was `ticks: 1` against `require(ticks >= 2)` at
+    /// `:1630` — see `BID_TICKS`. The margin is kept because it is defensible
+    /// on its own terms, not because it ever fixed anything; do not read it as
+    /// evidence that clock skew was ever observed here.
     const DEADLINE_IN: u64 = 180;
 
     let (note, keys) = note_and_signer();
@@ -235,8 +246,8 @@ async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
         ParamsOfPlaceInferenceBuy {
             model_hash: model_hash.clone(),
             max_price_per_tick: PRICE_PER_TICK,
-            ticks: 1,
-            escrow: 2_000_000_000,
+            ticks: BID_TICKS,
+            escrow: BID_ESCROW,
             flags: 0,
             deadline,
         },
@@ -261,8 +272,8 @@ async fn an_order_past_its_deadline_expires_and_its_neighbour_does_not() {
         ParamsOfPlaceInferenceBuy {
             model_hash: model_hash.clone(),
             max_price_per_tick: PRICE_PER_TICK,
-            ticks: 1,
-            escrow: 2_000_000_000,
+            ticks: BID_TICKS,
+            escrow: BID_ESCROW,
             flags: 0,
             deadline: 0,
         },

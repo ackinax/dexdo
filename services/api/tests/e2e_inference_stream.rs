@@ -168,10 +168,17 @@ const BUY_ESCROW: u128 = 3_000_000_000;
 /// a remainder behind. A resting remainder would be a second order this scene
 /// never accounts for.
 const FLAG_IOC: u8 = 0x01;
-/// SHELL the seller puts up as its half of the bond, and the gas that carries
-/// the deploy. Both must be non-zero or `fundDeal` reverts with
-/// `ERR_INVALID_PARAMS` (`PrivateNote.sol:1060`).
-const SELLER_BOND: u128 = 1_000_000_000;
+/// The seller's half of the bond. DERIVED from the price, never hardcoded:
+/// `TokenContract._bondAmount()` is `2 * _pricePerTick` (`:554-556`), and
+/// `fundDeal` reverts with `ERR_INSUFFICIENT_DEPOSIT` on anything smaller
+/// (`:906`). A hardcoded 1 SHELL against this 2 SHELL requirement is what
+/// failed dexdo pipeline #293 — and it failed silently as far as the sender is
+/// concerned, because the note sends with `bounce:true`, so the SHELL came
+/// back and the only trace was `bond_funded: false` two steps later.
+///
+/// Overshooting is safe (`fundDeal` refunds the excess at `:914`), but the
+/// derivation costs nothing and cannot drift when the price does.
+const SELLER_BOND: u128 = 2 * PRICE_PER_TICK;
 const DEAL_GAS_SHELL: u128 = 1_000_000_000;
 /// One SHELL, the smallest withdrawal that still emits `ShellWithdrawn`.
 const WITHDRAW_PROBE_AMOUNT: u128 = 1;

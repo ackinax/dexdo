@@ -91,6 +91,14 @@ Acki Nacki is dApp-sharded, which shapes how these contracts are reached:
   The buyer's half is never called for at all: the fill path inside the buyer's
   note sends `fundBuyerBond` inline (`PrivateNote.sol:752`).
 
+  **The bond is `2 * pricePerTick`, so derive the amount from P rather than
+  hardcoding it.** `TokenContract._bondAmount()` (`:554-556`) is the definition
+  and `fundDeal` enforces it (`:906`, `ERR_INSUFFICIENT_DEPOSIT`). An undersized
+  bond is not loud: the note sends with `bounce:true`, so the SHELL simply comes
+  back and the deal reports `bond_funded: false` — which surfaces later as a
+  reverting `open()` rather than as a funding error. Excess is refunded
+  (`:914`), so erring high is safe and erring low is not.
+
 ## End-to-end tests
 
 Node-gated `#[ignore]` tests under `services/api/tests/`, driven through
