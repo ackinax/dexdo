@@ -68,6 +68,29 @@ decided by the file itself:
   touched the spec, the shellnet workflow, both guards and the loader, to the
   same end.
 
+**`PN-CONS`, `PN-CPN` and `PN-ROT` are seeded but not yet rented.** The sdk
+harness has named those roles since the allocator was written; the stand spec
+did not declare them until 2026-08-24, so the three were labels with no rows —
+the mirror of the `PN-INF` problem above and the louder half of it: `rent`
+answers a missing group with the pool's census, not with a note somebody else
+owns. They are seeded now so a scenario that wants one finds it rather than
+discovering the gap on the stand.
+
+`PN-CPN` is the only group whose `value` carries meaning. `generateCoupon`
+(`PrivateNote.sol:2015-2017`) walks the whole `_balance` map and requires every
+entry below `minStakeValue(tt)` — 10 000 000 for NACKL and SHELL, 10 000 for
+USDC (`modifiers.sol:161-167`) — so a coupon note has to be seeded BELOW that
+line, and 9 000 000 is that. Every other group carries the pool's usual
+1 000 000 000 000, which is a balance no coupon could ever be minted against.
+
+**The SHELL and USDC coupon notes the matrix asks for are NOT here, and cannot
+be under this name.** The generator refuses a duplicate `profile`
+(`generate_zerostate.py`: `assert profile not in seen_profiles`), and a group
+carries exactly one `tokenType`, so `PN-CPN` can express coupons in one
+currency only. The matrix's `7 = NACKL×5 + SHELL×1 + USDC×1` therefore needs a
+naming decision first — per-currency labels, and matching roles in
+`PnProfile` — which is a change to the vocabulary rather than to the spec.
+
 A suite that finds no note of its own in a profiled pool fails at load with
 the pool's label census, rather than running against notes baked for someone
 else. Both suites also pin the shipped spec against what they rent, so a
