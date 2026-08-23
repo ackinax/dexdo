@@ -440,6 +440,37 @@ steps:
         ACKI_DIR='$ACKI_DIR'
         bash -s" < $CI_WORKSPACE/tests/e2e/sdk-proof-on-host.sh
 
+  # HOW THE SDK STEPS ARE PLACED, and why it is by DURATION rather than by
+  # theme.
+  #
+  # Woodpecker does not run this DAG as chains. It flattens it into STAGES by
+  # dependency depth and runs each stage to completion before starting the
+  # next, so a level is a BARRIER: it costs its slowest member, and the other
+  # three lanes sit idle for the difference. Pipeline #298 showed what that
+  # buys when the levels are themed rather than balanced — `sdk_losing_claim`
+  # (293s) alone with `sdk_usdc_release` (13s) in a level of their own, and
+  # `sdk_coupon_debt` (718s) holding three lanes for up to 315s each. 1972s
+  # against a 1402s ideal.
+  #
+  # So the four lanes are filled column-wise from the durations sorted
+  # descending: level 1 takes the four longest, level 2 the next four, and so
+  # on. Same width, same host, same contention — 1789s instead of 1972s, and
+  # the arithmetic is reproducible from any run's step timings.
+  #
+  # ORDER IS OTHERWISE FREE, which is what makes the balancing legal. Twenty of
+  # the twenty-six scenarios never call `release_clean`, so they quarantine
+  # what they rent and the generation's total note demand is the same however
+  # they are sequenced; only the ONE constraint on `sdk_usdc_release` below is
+  # real. Comments elsewhere in this file used to argue that a note-spending
+  # scenario must run last — that argument applies to almost all of them and
+  # therefore orders nothing.
+  #
+  # Widening past four is the next lever and is NOT taken here: five lanes
+  # model at ~1494s and six at ~1328s, but four is a measured constant (#206,
+  # 2026-08-02, 1-3% per-scenario slowdown) and more lanes mean more external
+  # `deployOracle` messages racing the one RootOracle, whose replay guard
+  # answers a lost race with exit_code 52.
+  #
   # Depends on sdk_proof: the two share the host lease and the stand, and
   # running them concurrently would have them rent notes from the same pool at
   # the same time.
@@ -459,7 +490,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_replay
+      - sdk_event_rejects
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -480,13 +511,17 @@ steps:
 
   # The USDC release path, in its own step because it is the one scenario
   # whose whole point is a token type nothing else on this stand touches.
-  # Last of the three: it leases a note the proof run returns, and it
-  # quarantines the pool's only PN-USDC note for the rest of the generation.
+  #
+  # THE ONE ORDERING CONSTRAINT IN THIS WHOLE BLOCK, and the reason it sits at
+  # the end of a lane rather than wherever the balancing above would have put
+  # it: it quarantines PN-USDC notes for the rest of the generation, and
+  # `sdk_usdc_market` needs them. Anything else may be moved freely; this may
+  # not be lifted above `sdk_usdc_market`.
   sdk_usdc_release:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_parallel_acceptance
+      - sdk_key_rotation
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -505,14 +540,16 @@ steps:
         ACKI_DIR='$ACKI_DIR'
         bash -s" < $CI_WORKSPACE/tests/e2e/sdk-proof-on-host.sh
 
-  # The resting/cancel pair, last of the SDK steps: it is the only scenario
-  # that both needs a market of its own and spends the notes it takes, so
-  # anything after it would find the pool empty.
+  # The resting/cancel pair: a market of its own, and the notes it takes are
+  # spent. That used to be written here as a reason to run it last, and it is
+  # not one — twenty of the twenty-six scenarios never call `release_clean`
+  # either, so the generation's note demand is the same total whatever the
+  # order. See the placement note above `sdk_proof`.
   sdk_resting_orders:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_book_segments
+      - sdk_order_refusals
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -531,13 +568,13 @@ steps:
         ACKI_DIR='$ACKI_DIR'
         bash -s" < $CI_WORKSPACE/tests/e2e/sdk-proof-on-host.sh
 
-  # Market-order semantics, last of the SDK steps for the same reason the
-  # orders suite was before it: it spends the notes it takes.
+  # Market-order semantics. (It spends the notes it takes, like almost
+  # everything here; that is not a placement argument — see above `sdk_proof`.)
   sdk_market_orders:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_forfeit_close
+      - sdk_impostor_calls
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -556,13 +593,12 @@ steps:
         ACKI_DIR='$ACKI_DIR'
         bash -s" < $CI_WORKSPACE/tests/e2e/sdk-proof-on-host.sh
 
-  # Matching priority: which resting order a taker eats first. Last of the
-  # SDK steps, for the same note-spending reason as the two before it.
+  # Matching priority: which resting order a taker eats first.
   sdk_matching_ladder:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_usdc_market
+      - sdk_losing_claim
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -582,13 +618,13 @@ steps:
         bash -s" < $CI_WORKSPACE/tests/e2e/sdk-proof-on-host.sh
 
   # Orders still resting when the market closes: the drain has to refund
-  # them. Last of the SDK steps and the slowest, since it idles until
-  # `resultStart` before there is anything to look at.
+  # them. Slow (~310s) because it idles until `resultStart` before there is
+  # anything to look at, which is why it sits in the second level.
   sdk_shutdown_orders:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_mm_cycle
+      - sdk_multi_market
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -613,7 +649,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_resting_orders
+      - sdk_matching_ladder
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -638,7 +674,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_oracle_admin
+      - sdk_cancelled_event
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -684,7 +720,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_event_rejects
+      - sdk_oracle_admin
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -776,7 +812,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_coupon_debt
+      - sdk_oracle_quorum
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -845,7 +881,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_multi_market
+      - sdk_mm_cycle
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -868,7 +904,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_market_clock
+      - sdk_usdc_market
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -891,7 +927,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_oracle_quorum
+      - sdk_coupon_debt
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -914,7 +950,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_order_refusals
+      - sdk_book_segments
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -960,7 +996,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_matching_ladder
+      - sdk_forfeit_close
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -983,7 +1019,7 @@ steps:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_impostor_calls
+      - sdk_resting_orders
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -1025,13 +1061,15 @@ steps:
         ACKI_DIR='$ACKI_DIR'
         bash -s" < $CI_WORKSPACE/tests/e2e/sdk-proof-on-host.sh
 
-  # Lane 3's tail. ~300s: it waits out a staking window and a result window,
-  # the same shape as `forfeit_close` next door in lane 2.
+  # ~293s: it waits out a staking window and a result window, the same shape
+  # as `forfeit_close`. It used to be a lane TAIL, alone with a 13s neighbour
+  # in a level of its own — 293s of wall clock for one scenario. Now it rides
+  # in the third level, whose slowest member it is.
   sdk_losing_claim:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_bounce_recovery
+      - sdk_market_clock
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -1050,13 +1088,13 @@ steps:
         ACKI_DIR='$ACKI_DIR'
         bash -s" < $CI_WORKSPACE/tests/e2e/sdk-proof-on-host.sh
 
-  # Lane 2's tail. ~250s: it never freezes its market, so it pays for the
-  # market coming up and for five operations on one note, and nothing else.
+  # ~74s: it never freezes its market, so it pays for the market coming up and
+  # for five operations on one note, and nothing else.
   sdk_key_rotation:
     when:
       - status: [success, failure]
     depends_on:
-      - sdk_bounce_deploy
+      - sdk_replay
     image: *ansible_image
     environment:
       E2E_HOST: { from_secret: e2e_host }
@@ -1091,9 +1129,9 @@ steps:
     # already depends on the one before it. So these four say what the earlier
     # list only happened to mean while the timings held.
     depends_on:
-      - sdk_cancelled_event
-      - sdk_key_rotation
-      - sdk_losing_claim
+      - sdk_bounce_deploy
+      - sdk_bounce_recovery
+      - sdk_parallel_acceptance
       - sdk_usdc_release
     image: *ansible_image
     environment:
