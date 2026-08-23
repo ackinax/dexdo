@@ -42,18 +42,31 @@ decided by the file itself:
   `PN-TRD`, `PN-CONS`, `PN-CPN`, `PN-SHELL`, `PN-USDC` and `PN-ROT` are the sdk
   harness's roles, which it also matches against what a scenario asks for.
 
-  **`PN-INF` is the one label both sides claim, and the separation above does
-  not cover it.** The sdk harness lists `PnProfile::Inf → "PN-INF"` in its own
-  `ALL` (`sdk/tests/integration/common/allocator.rs`), so its allocator reads
-  those rows as leasable; the api-e2e inference binaries index the same rows by
-  fixed position (`TestPnPool::load_inference()`). Nothing leases it today — no
-  scenario asks for `PnProfile::Inf` — so the overlap is latent rather than
-  live, and it was invisible before wave 5 because the stand spec declared no
-  `PN-INF` group at all and the rows did not exist. Creating that group is what
-  makes the two claims meet. If an sdk scenario ever asks for `Inf`, the
-  allocator may taint or drain a row an inference binary addresses by index,
-  and the failure will surface as a chain error inside that binary rather than
-  as a pool conflict.
+  **`PN-INF` was for a while claimed by both sides, and is not any more.** The
+  sdk harness listed `PnProfile::Inf → "PN-INF"` in its own `ALL`, so its
+  allocator read those rows as leasable, while the api-e2e inference binaries
+  index the same rows by fixed position (`TestPnPool::load_inference()`).
+  Nothing ever leased one — no scenario asks for that role — so the overlap was
+  latent, and it was invisible before wave 5 because the stand spec declared no
+  `PN-INF` group at all and the rows did not exist. Creating the group is what
+  brought the two claims together.
+  
+  The role was removed from `PnProfile` on 2026-08-24, which is the whole fix:
+  ownership is decided by `from_seed_label` returning `Some`
+  (`sdk_owned_indices`), so a label the enum does not name is a label the
+  harness cannot lease. This is the mechanism the type was built with — its
+  doc comment already said a `None` here means "a note reserved for another
+  suite" — and `PN-INF` simply had not been routed through it. Two unit tests
+  pin the result: `an_unowned_label_is_not_a_profile_of_this_harness` asserts
+  the label reads as foreign, and `every_label_in_the_stand_spec_belongs_to_a_suite`
+  now names both api-e2e labels so a spec group owned by nobody still fails.
+  
+  The direction was not arbitrary. The inference surface lives entirely in
+  `dodex_chain::test_helpers` and `dodex_sdk` carries none of it, so an sdk
+  inference scenario cannot be written at all — the role named rows for a
+  scenario that cannot exist. Renaming the api suite's label instead would have
+  touched the spec, the shellnet workflow, both guards and the loader, to the
+  same end.
 
 A suite that finds no note of its own in a profiled pool fails at load with
 the pool's label census, rather than running against notes baked for someone
