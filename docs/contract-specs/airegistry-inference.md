@@ -134,13 +134,13 @@ and the shared wait budget live in
 | `e2e_inference_funding` | `fundDeployShell`: a note pays its own canonical `TokenContract` address, and the deal contract then deploys onto it with no giver in the run. Also pins the two things the call must not do — reach the RootModel, which it no longer has a leg for, and send anything at all when asked for `0`. Fast (~2 min). |
 | `e2e_inference_stream` | The deal lifecycle past the match, between **two** notes: offer → crossing IOC buy → `fundDeal` → `open` → `PROBE_WINDOW` → `acceptProbe` → buyer `stop`. Read phases (stand only): `inference_deals` names a seller and a buyer that DIFFER (IX-SEQ-04), and the deal closes `STOPPED` with `clean_settlement` (IX-SEQ-06). Both are SQL, not HTTP — `inference_deals` has no public surface. Slow (~9 min): `PROBE_WINDOW` alone is 180 s. |
 | `e2e_inference_range_link` | The one scene spanning both halves of the product: an `InferenceOrderBook` is deployed first, then a prediction market whose event is a RANGE event carrying that book's address. Read phase (stand only): `/api/v1/prediction/markets?resolvesFrom=<book>` returns exactly that market, naming the book and `WEEKLY_MEDIAN_PRICE` (IX-SEQ-09). Two notes of different currencies — `PN-INF` for the book, `PN-API` for the market. |
+| `e2e_inference_recovery` | The exit from a funded deal the seller never opened. Two deals side by side: one is left unopened and swept by the permissionless `cleanupUnopened` after `MATCH_OPEN_TIMEOUT`, the other is opened and must survive the identical call. The buyer is repaid deposit **plus** the bond `_releaseBuyerBond` folds into it, the seller's note gets its bond back unslashed, and the deal self-destructs. Two `PN-INF` notes — the subject is money leaving one party's deal and arriving at the other's note. No read phase. Slow (~15 min). |
 | `e2e_inference_range` | A price becoming an outcome, across four contracts with nobody voting: a deal is run to a CLOSE so the book has a reference price at all, an oracle publishes a RANGE event binding bounds `[1, 3, 5]` SHELL to that book, a market is deployed on it, and after the deadline `resolveRange` walks `requestWeeklyMedian` → `onWeeklyMedian` and settles into the bucket the median falls in. Also pins that the LIST set the market's clock: `resultStart` equals the event deadline, which no other scene here gets without a separate `submitSetTimings`. Two notes — `PN-INF` for the deal, `PN-API` for the market. No read phase: the whole reading is on chain. Slow (~11 min): a 190 s probe window and a 240 s range window, in sequence. |
 | `e2e_inference_expiry_sweep` | Two endings, two tests. A bid whose deadline passes is expired by the permissionless `expireOrder` and reads `EXPIRED` in `/orders` — its own terminal status — while a neighbour without a deadline stays `LIVE` (IX-SEQ-12). And a taker remainder the chain refunds with no closing event is ended by the reconciler's sweep: `CANCELLED` **with `swept_at` set**, which is SQL because the DTO carries no such field and a provisional cancel is otherwise identical to a real one over HTTP (IX-SEQ-07). |
 
 The streaming-deal suites — `e2e_inference_settlement`, `e2e_inference_twosided`,
-`e2e_inference_subscription`, `e2e_inference_recovery` and
-`e2e_inference_dispute` — were removed with the contract calls they drove when
-v4.0.33 dropped those calls.
+`e2e_inference_subscription` and `e2e_inference_dispute` — were removed with the
+contract calls they drove when v4.0.33 dropped those calls.
 
 **`e2e_inference_range` was removed with them and should not have been.** Every
 call its subject rests on survived that sync untouched — `addRangeEvent`,
@@ -154,6 +154,22 @@ is sound because `acceptProbe` sets `_ticksFinalized = 1` exactly as the single
 is 1 — so one probe tick is still the whole liquidity the median needs. The
 restored version also waits for BOTH bonds before `open`, which the deleted one
 had no reason to.
+
+**`e2e_inference_recovery` came back for half its subject, and only half.** It
+covered two exits from a deal the seller walked away from. `reclaimOnTimeout` —
+the buyer's way out of a deal that WAS opened and then abandoned — left the ABI
+with that sync and has no replacement, so that case is uncovered and named as
+such. `cleanupUnopened` survived untouched, `PrivateNote.streamCleanup` still
+forwards to it, and the never-opened exit is tested again.
+
+One claim did NOT survive the re-reading, and the restored file says so rather
+than repeating it. The deleted version described its control as exercising the
+permanent `_everOpened` latch. It does not: `cleanupUnopened` checks `!_opened`
+first, and an opened-and-abandoned deal trips that. The latch would need
+`_opened == false` with `_everOpened == true`, and no such deal can exist today
+— every way out of an open stream destroys the contract, and the one path that
+used to leave a released deal standing was `reclaimOnTimeout` itself. The latch
+is defensive code with no reachable state behind it.
 
 **That removal was about a changed model, not a disappeared one, and two
 contract versions have passed since.** What v4.0.33 dropped were
@@ -181,6 +197,7 @@ cargo test -p dodex-api --test e2e_inference_stream -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_expiry_sweep -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_range_link -- --ignored --nocapture
 cargo test -p dodex-api --test e2e_inference_range -- --ignored --nocapture
+cargo test -p dodex-api --test e2e_inference_recovery -- --ignored --nocapture
 ```
 
 All of them run in the e2e pipeline's `e2e_tests` step, which excludes nothing:

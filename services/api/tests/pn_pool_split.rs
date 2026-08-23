@@ -94,12 +94,14 @@ fn the_stand_spec_gives_every_test_here_a_note_of_its_own() {
 /// 12 (`e2e_inference_orders`), 13 (`e2e_inference_clob`),
 /// 18 (`e2e_inference_funding`), 19 and 20 (`e2e_inference_stream` — seller and
 /// buyer), 21 (`e2e_inference_expiry_sweep`), 22 (`e2e_inference_range_link`),
-/// 23 (`e2e_inference_range`). Twenty-four notes give each of those indices a
-/// row of its own.
+/// 23 (`e2e_inference_range`), 24 and 25 (`e2e_inference_recovery` — seller and
+/// buyer); 26 is spare. Twenty-seven notes give each of those indices a row of
+/// its own.
 ///
-/// THERE IS NO SPARE LEFT. Index 23 was it, and restoring `e2e_inference_range`
-/// took it. The next inference binary has to raise this number, and raising it
-/// is four coordinated edits, not one: this constant, the `count` in
+/// The count was 24 until `e2e_inference_recovery` came back and needed two
+/// rows nobody else holds — its subject is money leaving one party's deal and
+/// arriving at the other's note, which one account cannot show. Raising it was
+/// four coordinated edits, not one: this constant, the `count` in
 /// `tests/e2e/dex_test_notes.spec.json`, the `--count` that mints the shellnet
 /// lane's notes in `.github/workflows/e2e-shellnet.yml`, and the `jq 'length'`
 /// assertion immediately after that mint — which counts PN-API and PN-INF
@@ -117,7 +119,7 @@ fn the_stand_spec_gives_every_test_here_a_note_of_its_own() {
 /// self-trade it was written to stop being. It asserts the two addresses differ
 /// rather than trusting this constant, but the constant is what keeps the
 /// assertion from being the thing that fails.
-const INFERENCE_NOTES_FOR_ONE_EACH: u64 = 24;
+const INFERENCE_NOTES_FOR_ONE_EACH: u64 = 27;
 
 #[test]
 fn the_stand_spec_gives_every_inference_test_a_note_of_its_own() {

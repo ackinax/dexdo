@@ -116,7 +116,11 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 #     `e2e_inference_range_link` reads the database AND deploys an oracle;
 #   * `e2e_inference_range` is here for the oracle alone. It touches no
 #     database — its whole reading is on chain — but it deploys an oracle of
-#     its own, which is the singleton below;
+#     its own, which is the singleton below. `e2e_inference_recovery` deploys
+#     no oracle and reads no database, and it is here for neither: it holds two
+#     notes of its own and would be safe in parallel. It is pinned because its
+#     money readings are ECC DELTAS on those two notes across a sweep, and a
+#     delta is only the sweep's if nothing else moved the account meanwhile;
 #   * everything that deploys a market sends an external `deployOracle` to the
 #     ONE `RootOracle` the whole stand shares. An external message carries a
 #     `timestamp` the contract compares against the last it accepted, so two
@@ -133,6 +137,7 @@ filter = '''
     binary(e2e_inference) | binary(e2e_inference_clob) | binary(e2e_inference_orders)
   | binary(e2e_inference_stream) | binary(e2e_inference_expiry_sweep)
   | binary(e2e_inference_range_link) | binary(e2e_inference_range)
+  | binary(e2e_inference_recovery)
   | binary(e2e_register_account)
   | binary(e2e_batch_orders) | binary(e2e_buy_full_set) | binary(e2e_cancel_batch_orders)
   | binary(e2e_cancel_order) | binary(e2e_order)
@@ -155,6 +160,19 @@ test-group = 'serial-e2e-shared'
 [[profile.ci-e2e.overrides]]
 filter = 'binary(e2e_inference_range)'
 slow-timeout = { period = "60s", terminate-after = 20 }
+
+# `e2e_inference_recovery` outwaits `MATCH_OPEN_TIMEOUT` — 600s from the match,
+# before which no funded deal may be swept. The deleted version needed 30
+# minutes because it also outwaited the reclaim window (the deal's own
+# `settleWindow` plus grace, 900s from the open); `reclaimOnTimeout` left the
+# ABI at v4.0.33 and that clock went with it.
+#
+# 15 rather than 10, and the arithmetic is not a sum: the control deal is set up
+# INSIDE the first deal's window, so the wall clock is roughly the longer of
+# (setup + 600) and (setup ×2), plus the sweep and its payout.
+[[profile.ci-e2e.overrides]]
+filter = 'binary(e2e_inference_recovery)'
+slow-timeout = { period = "60s", terminate-after = 15 }
 
 # The sdk-e2e profile (used by the sdk workspace's proof/acceptance suites)
 # lives in sdk/.config/nextest.toml, not here: sdk/ is a separate Cargo

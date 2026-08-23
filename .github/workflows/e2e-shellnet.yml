@@ -93,7 +93,7 @@ jobs:
       # two seed_notes arrays concatenated; `--profile` is what tells the loader
       # which rows belong to which suite.
       #
-      # PN-INF is minted twenty-four deep, PN-API one, and the asymmetry is not
+      # PN-INF is minted twenty-seven deep, PN-API one, and the asymmetry is not
       # an oversight. Every test picks its note as `notes[k % len]`, so a pool of
       # one folds every index onto the same row — harmless while each binary is
       # one-sided and the lane is single-threaded, which is what PN-API still is.
@@ -112,14 +112,14 @@ jobs:
             --endpoint https://shellnet.ackinacki.org \
             --output "$RUNNER_TEMP/pn_pool_api.json"
           cargo run --release --bin mint_pn_pool -- \
-            --count 24 --nominal N10000 --token-type shell --profile PN-INF \
+            --count 27 --nominal N10000 --token-type shell --profile PN-INF \
             --endpoint https://shellnet.ackinacki.org \
             --output "$RUNNER_TEMP/pn_pool_inf.json"
           jq -s 'add' \
             "$RUNNER_TEMP/pn_pool_api.seed_notes.json" \
             "$RUNNER_TEMP/pn_pool_inf.seed_notes.json" \
             > "$GITHUB_WORKSPACE/tests/fixtures/seed_notes.json"
-          test "$(jq 'length' "$GITHUB_WORKSPACE/tests/fixtures/seed_notes.json")" = 25
+          test "$(jq 'length' "$GITHUB_WORKSPACE/tests/fixtures/seed_notes.json")" = 28
           jq -r '.[] | "minted \(.profile) tokenType=\(.tokenType) \(.pn_address)"' \
             "$GITHUB_WORKSPACE/tests/fixtures/seed_notes.json"
 
@@ -149,7 +149,7 @@ jobs:
           seed="$GITHUB_WORKSPACE/tests/fixtures/seed_notes.json"
           [ -s "$seed" ] || { echo "no seed note to drain — skip"; exit 0; }
           # Every row, not just the first: the file holds one PN-API note and
-          # twenty-four PN-INF ones, and every key in it is in the clear.
+          # twenty-seven PN-INF ones, and every key in it is in the clear.
           # Draining only row 0 would leave the other twenty-four spendable by
           # anyone who read the log — the loop is what keeps that from scaling
           # with the pool.
