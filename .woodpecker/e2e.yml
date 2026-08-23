@@ -37,9 +37,17 @@ variables:
   # the risk is real, not theoretical -- move the pin to a `dev` commit once
   # this work lands there.
   #
-  # This pin is three commits ahead of the last, and ALL THREE are inert for
+  # This pin is four commits ahead of the last, and ALL FOUR are inert for
   # the zerostate this pipeline bakes:
   #
+  # - `fix(dexdo): print the database host instead of the database password`
+  #   is the newest and the reason to move the pin promptly. The runner's
+  #   `==> cargo nextest run …` line meant to name the database without its
+  #   credential and did the opposite: `${TEST_DATABASE_URL%%@*}` keeps
+  #   `postgres://<user>:<password>` and discards the host, so every
+  #   `e2e_tests` log published the password in clear text. Fixed to
+  #   `##*@`. Rotating the secret is a separate action — this stops new
+  #   log lines, it does not clean the old ones.
   # - `fix(dexdo): drop the e2e build dir when the host disk cannot hold
   #   another build` is the newest. Nothing ever removed `~/dexdo-e2e/target`
   #   on host B, so it grew run over run until pipeline #290 ran the disk out
@@ -67,7 +75,7 @@ variables:
   #   drift freely": it holds because stage_contracts.sh replaces those exact
   #   directories, and a contract added outside its two allowlists would be
   #   taken from the pin instead.
-  - &acki_sha "b23f976819247370915c6b18138b6a3fbc29b7e5"
+  - &acki_sha "a54e0c14a543aef139a20286f70d1f3ffb8eb55e"
   - &allbin_img "docker.gosh.sh/ackinacki-all-bin@sha256:1ee9cec484f27659e4b4d0e2182ca79485929b23c659bd772e58786f9bb1d2c7"
   - &node_img "docker.gosh.sh/ackinacki-node@sha256:00af55c1fb597d89f8afb469a43eb21c991c9db911ff7a6161ad934218fc4a03"
   - &gql_img "docker.gosh.sh/ackinacki-gql-server@sha256:a45e15d363cb6f4ef4aca5bdc82d7fe225cca2b6dea97c1838ffbf7208dea962"
