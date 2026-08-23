@@ -447,6 +447,15 @@ async fn a_range_market_resolves_into_the_bucket_its_books_price_falls_in() {
     // The close is what publishes. Until this lands the book has no price and
     // `resolveRange` below would revert inside a `bounce:false` send, which is
     // the one failure on this path nothing ever reports.
+    //
+    // A CLOSED DEAL IS A DEAD ACCOUNT, and that is what the wait has to look
+    // for. `stop` ends in `_payOwedAndDie` (`TokenContract.sol:1521`), so once
+    // it lands `getState` stops answering entirely — there is no post-close
+    // state to read. Waiting for `!opened` off a getter, the way the
+    // pre-v4.0.33 version of this file did, therefore waits for a read that can
+    // never succeed again: pipeline #296 spent its whole 90s budget on
+    // `Not found` and reported "the deal never closed" about a deal that had
+    // closed perfectly.
     dex.stream_stop(
         &note.address,
         ParamsOfStreamDeal { token_contract: tc.clone() },
@@ -454,9 +463,11 @@ async fn a_range_market_resolves_into_the_bucket_its_books_price_falls_in() {
     )
     .await
     .expect("streamStop accepted");
-    if !poll_deal(&dex, &tc, "closed", |s| !s.opened).await {
-        failures
-            .push("the deal never closed, so it never published its finalized tick".to_string());
+    if !poll_gone(&dex, &tc).await {
+        let state = dex.token_contract_get_state(&tc).await;
+        failures.push(format!(
+            "the deal never closed, so it never published its finalized tick: {state:?}"
+        ));
         finish(&dex, &note, &model_hash, failures).await;
         return;
     }
@@ -699,6 +710,25 @@ async fn wait_active<A: AccountAccessor>(handle: A, label: &str) {
         })
         .await
         .unwrap_or_else(|e| panic!("wait {label} active: {e:?}"));
+}
+
+/// Wait for a deal to stop being a live account. `stop` ends in a
+/// `selfdestruct`, so a closed deal does not merely change state — it goes
+/// away, and an account that still runs code is a different outcome from one
+/// that does not.
+async fn poll_gone(dex: &Dex, tc: &str) -> bool {
+    for _ in 0..POLL_TICKS {
+        tokio::time::sleep(POLL_TICK).await;
+        match dex.self_rooted_account_shell(tc).await {
+            Ok(account) if account.acc_type != "Active" => {
+                eprintln!("[e2e_range] deal closed: acc_type={}", account.acc_type);
+                return true;
+            }
+            _ => continue,
+        }
+    }
+    eprintln!("[e2e_range] never reached: the deal to close");
+    false
 }
 
 async fn poll_deal<F>(dex: &Dex, tc: &str, what: &str, probe: F) -> bool

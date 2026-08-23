@@ -133,6 +133,10 @@ const MAX_SELL_TTL: u64 = 3600;
 /// `FLAG_IOC`: cross what rests and leave no remainder behind.
 const FLAG_IOC: u8 = 0x01;
 
+/// `CURRENCIES_ID_SHELL` (`contracts/dex/modifiers/modifiers.sol:202`) — the key
+/// SHELL sits under in a note's `_balance` map.
+const SHELL_CURRENCY_ID: u32 = 2;
+
 /// `MATCH_OPEN_TIMEOUT` (`modifiers.sol:27`) — how long a funded deal waits for
 /// an `open()` before anyone may sweep it. A contract constant, and the only
 /// clock this test has to outwait now that the reclaim window has gone with the
@@ -513,12 +517,31 @@ async fn setup_deal(
     ))
 }
 
-/// Physical SHELL sitting on a note. The refunds land here as ECC, not in the
-/// note's own `_balance` ledger, so this is the reading that tracks them — and
-/// it is deliberately not `.native`, which the destruct's residual-gas sweep
-/// also moves.
+/// The note's LOGICAL SHELL balance — `_balance[CURRENCIES_ID_SHELL]`, read out
+/// of `getDetails`.
+///
+/// NOT the account's physical ECC, and the difference is the whole reason
+/// pipeline #296 read two zero deltas across a sweep that had plainly happened.
+/// The deleted version of this file measured physical ECC and was right to at
+/// the time; v4.0.33 changed what it was measuring. SHELL is now a bookkeeping
+/// NUMBER rather than a currency the deal holds: `_payShell`
+/// (`TokenContract.sol:493`) subtracts from `_balance` and calls
+/// `creditFromDeal` on the note, which adds to the note's own `_balance` map —
+/// nothing physical moves at any point. `PrivateNote.sol:898` says so in as
+/// many words about the mirror path: "one pot: the buy is paid from
+/// `_balance[CURRENCIES_ID_SHELL]` and nothing physical moves."
+///
+/// What DOES move physically is gas: `fundDeal`'s `gasShell`, and the residual
+/// the destruct sweeps back to the seller's note. So a physical reading here
+/// would be measuring gas accounting and calling it a refund — in #296 it
+/// showed the seller down exactly the 2 × 1e9 of gas the two deals were funded
+/// with, and the bond return nowhere at all.
 async fn shell_of(dex: &Dex, note: &str) -> u128 {
-    dex.dex_account_shell(note).await.map(|a| a.shell).unwrap_or(0)
+    dex.get_private_note_details(note)
+        .await
+        .ok()
+        .and_then(|d| d.balance.get(&SHELL_CURRENCY_ID.to_string()).copied())
+        .unwrap_or(0)
 }
 
 /// Give a fire-and-forget send time to land before reading what it did.
