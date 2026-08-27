@@ -204,6 +204,32 @@ async fn apply_inference_order_placed(
         chain_seconds,
     )
     .await?;
+
+    // A FRESH SELL ON A FUNDED DEAL MEANS THE PREVIOUS MATCH IS OVER. Since
+    // contracts 4.0.36 a buyer no-show runs `cleanupUnopened`, which no longer
+    // destroys the deal, so the row would otherwise keep the dead match's buyer
+    // and deposit and read as "funded, never opened".
+    //
+    // This used to be the ONLY thing on chain that said so, because that call
+    // emitted nothing. It is not any more: the 4.0.36 update has the deal tell
+    // both notes (`onDealClosed`), and each note emits
+    // `PrivateNote.InferenceDealClosed` — projected in `projectors.rs` and now
+    // the direct signal. This one stays as the backstop, and it is the one that
+    // covers a deal whose notes were minted before that update.
+    //
+    // The inference is sound rather than merely plausible: `postFromNote` opens
+    // with `if (_offerPosted || _funded) { return; }`, and a funded deal never
+    // clears `_offerPosted` (`onSellClosed` returns early while `_funded`). So a
+    // deal that is funded CANNOT put a new ask up, and an ask that reaches the
+    // book naming it proves the funding was undone.
+    //
+    // Only here, not in `apply_inference_subscription_placed`: a subscription is
+    // the buyer's side and never names a seller's deal. The guard would hold
+    // there too — it asks for a SELL carrying a TokenContract — but the call
+    // would be dead weight.
+    if !is_buy && let Some(tc) = token_contract {
+        crate::token_contract_projectors::end_funding_cycle(tx, tc, &chain_order).await?;
+    }
     Ok(ProjectionOutcome::Applied)
 }
 
@@ -436,7 +462,23 @@ async fn link_deal_from_filled(
            on conflict (token_contract_address) do update
                set orderbook_address = coalesce(inference_deals.orderbook_address, excluded.orderbook_address),
                    seller_note = coalesce(inference_deals.seller_note, excluded.seller_note),
-                   buyer_note = coalesce(inference_deals.buyer_note, excluded.buyer_note),
+                   -- The buyer is the one field here that a SECOND match at the same
+                   -- deal address changes, and since contracts 4.0.36 a second match is
+                   -- ordinary: `cleanupUnopened` no longer destroys the deal, so a
+                   -- no-show returns the same `TokenContract` to the book and the next
+                   -- fill names a different buyer. First-wins would pin the row to a
+                   -- buyer who never funded it. Newest-wins by `last_chain_order`, so a
+                   -- REPLAY of an older fill (reprojection) still cannot walk it back,
+                   -- and `coalesce` on both branches keeps an orphan-repair Filled —
+                   -- which carries no `buyerNote` — from blanking a known one.
+                   -- `orderbook_address` and `seller_note` need none of this: the deal
+                   -- address derives from the seller's key and nonce, so neither can
+                   -- change while the address does not.
+                   buyer_note = case
+                       when excluded.last_chain_order > coalesce(inference_deals.last_chain_order, '')
+                           then coalesce(excluded.buyer_note, inference_deals.buyer_note)
+                       else coalesce(inference_deals.buyer_note, excluded.buyer_note)
+                   end,
                    last_chain_order = greatest(coalesce(inference_deals.last_chain_order, ''), excluded.last_chain_order),
                    updated_at = now()"#,
     )

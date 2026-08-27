@@ -2,6 +2,50 @@
 
 All notable changes to DEX.DO are recorded here. Entries are date-based, newest first.
 
+## [2026-08-27]
+
+### Fixed
+
+- **A deal no longer strands the notes that were party to it.** `TokenContract.cleanupUnopened` now tells both notes it is over (`PrivateNote.onDealClosed`), clears the endpoint ciphertext it was holding for the refunded buyer, and neither `fundFromOrderBook` nor `onSellClosed` charges the deal's gas reserve any more — a charge could revert the whole transaction and leave the `_offerPosted` latch set on a deal the book had already taken the ask from, with no retry.
+- **A buyer can no longer undo a matched deal on demand.** The note's wind-down path is gone: the deal could not tell a buyer who *cannot* post the bond from one who changed his mind, since both arrive with `_buyerBondFunded` false. `MATCH_OPEN_TIMEOUT` recovers the seller's money instead.
+
+### Added
+
+- `PrivateNote.fundBuyerBondNow(tokenContract, bond)` — posts the buyer's `2P` bond to a deal the note could not bond at match time, reopening the window before `MATCH_OPEN_TIMEOUT`. No SDK wrapper yet; the automatic path from `onInferenceFilled` is unchanged.
+
+### Changed
+
+- **Contracts re-pinned to the build deployed on shellnet.** `TOKEN_CONTRACT_CODE_HASH → 0xee4105b4…`, `ROOT_MODEL_CODE_HASH → 0xe92a14cb…`, and `PrivateNote`/`RootPN`/`SuperRoot`/`InferenceOrderBook`/`ModelRegistry` bytecode with them. The 2026-08-26 entry's hashes are superseded. A deal's address derives from these pins, so a client computing it from older artifacts looks at the wrong account.
+- **`PrivateNote.InferenceDealClosed` (external id 166) ends a deal's funding cycle.** It was ingested and projected as a no-op. The event names the deal in its payload — the sender is the note — and one close emits it from both notes, the second being inert. A wind-down that leaves the deal alive is now announced rather than inferred; the fresh-SELL-offer and `StreamFunded` signals stay as backstops for deals whose notes predate the update. See [indexer.md § Deal-address reuse](docs/tech-specs/indexer.md#deal-address-reuse).
+
+## [2026-08-26]
+
+### Breaking Changes
+
+- **A market's model is one field now, not an object.** `/api/v1/inference/markets` replaces `model: { producer, name, version, ref }` with **`modelRefName`** — a string carrying the model's name exactly as its order book reports it, e.g. `"Qwen2.5-32B-Instruct"`, or the model hash when the book has no name. Treat it as an opaque label: no structure is guaranteed and none is parsed. The same rename lands on `resolvesFrom.model` → **`resolvesFrom.modelRefName`** in `/api/v1/prediction/markets`, which already carried this value under the other name.
+
+  The split was a guess at structure the names never guaranteed: it required exactly three `--`-separated parts and produced three nulls for everything else, and the model registry has been re-seeded with names that are not in that shape at all.
+- **`?producer=` is gone from `/api/v1/inference/markets`.** It filtered on a field the response no longer carries, backed by a column that would have been NULL for every newly registered model. Callers that used it should filter client-side on `modelRefName`. It is also no longer one of the parameters that conflicts with a single-market `?inferenceOrderBookAddress=` lookup.
+
+- **A deal is deployed from the seller's note now, not by an external message** (contracts 4.0.36). `PrivateNote.deployDeal(nonce, modelName, modelHash, pricePerTick, maxTicks, gasReserve)` replaces the off-chain `TokenContract` deploy. The constructor takes a new `depositIdentifierHash` argument and requires `msg.sender` to be the canonical `PrivateNote` for it, so a seller-key-signed external deploy is refused outright. The deal therefore lives in the note's dApp instead of one of its own, and `PrivateNote`'s constructor takes a new `tokenContractCode` cell. Re-pinned code hashes: `PrivateNote → f7a49601`, `TokenContract → 4378e271` (depth 17 → 18), `RootModel → 87c63e32`, `InferenceOrderBook → 91f0af87`.
+- **`RootPN.setTokenContractCode` must run before any note is deployed.** A note minted without it bakes an empty TokenContract code cell, and its `deployDeal` puts a codeless account at a well-formed address. `RootPN.onCodeUpgrade` restores six codes, so every `updateCode` wipes `_inferenceOrderBookCode`, `_tokenContractCode` and the previous-generation note pin: re-run `setInferenceOrderBookCode`, `setTokenContractCode` and `setPrevPrivateNoteCode` after each upgrade.
+- **A BUY order now costs the note 0.025 SHELL**, burned as ECC[2] at placement (`PrivateNote.placeInferenceBuy`), mirroring what posting a SELL offer already cost the seller. Taken from the note's own SHELL, not from its recorded balance, so a note holding none cannot place a buy.
+
+### Added
+
+- `RootPN.setPrevPrivateNoteCode` / `getPrevPrivateNoteCode`: the root serves notes of one previous code generation, so a `PrivateNote` upgrade no longer strands the balances of notes already deployed — `withdrawTokens` accepts a note of either generation.
+- The indexer ingests the 15 `TokenContract.*` settlement routes (external ids 709, 710, 720–725, 727–733). [`inference_deals`](docs/tech-specs/data-schema.md#inference_deals) and [`inference_ticks`](docs/tech-specs/data-schema.md#inference_ticks) are populated from live capture instead of only from retained rows. No config change is needed; expect more `raw_events` volume wherever inference deals are active, since a deal emits ten-plus events per match plus one per claimed tick.
+
+### Removed
+
+- `inference_markets.producer`, `.model_name` and `.model_version` — the parsed name parts behind the retired `model` object. **Migration `0005_drop_inference_model_name_parts.sql` must be run.** Nothing is lost that cannot be recovered: they were derived from `model_ref`, which stays and is re-read from the book's `getModelName()` getter on every reconcile.
+
+### Changed
+
+- [`inference_deals`](docs/tech-specs/data-schema.md#inference_deals) describes a deal's **current** match, not its whole history. `cleanupUnopened` no longer destroys the deal on a buyer no-show, so one `TokenContract` address serves several matches: The wind-down is silent on chain, so the cycle is ended by the next SELL offer naming the deal (a funded deal cannot post one) and by `TokenContract.StreamFunded` as a backstop; either resets the per-cycle columns (`buyer_note`, `deposit`, `funded_at_chain`, `price_per_tick`, `opened_at_chain`, `settled_at_chain`, `close_kind`, `clean_settlement`, `disputed_at_chain`, `trusted_ticks`, `claimed_ticks`, `finalized_ticks`) and deletes the deal's `inference_ticks` rows, and `buyer_note` is newest-wins rather than first-write-wins. `orderbook_address` and `seller_note` are unchanged by a new cycle. The history of matches is [`inference_trades`](docs/tech-specs/data-schema.md#inference_trades).
+- A deal's gas is an ECC[2] reserve that each entrypoint burns a measured charge from, instead of a one-time native deposit sized by a published formula. `fundDeal`, `fundBuyerBond` and `fundDeployShell` send under flag 1 rather than 17, so the value stays SHELL instead of converting to native on arrival; a buyer's calls into a deal carry their own charge on the message.
+- `RootPN.withdrawTokens` is gated on the sender being a note of either code generation (was: the current generation only). Parameters are unchanged.
+
 ## [2026-07-25]
 
 ### Changed
