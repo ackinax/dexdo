@@ -22,7 +22,8 @@ Implementation-facing requirements for the indexer side of the market-data path.
 
 ```mermaid
 flowchart LR
-    chain[Acki Nacki GraphQL event stream] --> ingest[Indexer fetch loop]
+    dapp_stream[blockchain.events by DEX src_dapp_id] --> ingest[Indexer fetch loop]
+    root_stream[RootPN account.events] --> ingest
     ingest --> raw[raw_events]
     raw --> project[Projection loop]
     project --> projectors[Projectors]
@@ -50,23 +51,62 @@ flowchart LR
 
 ## Ingestion
 
-The indexer follows a GraphQL message-edge stream. Every edge becomes one row in [`raw_events`](data-schema.md#raw_events) regardless of whether it could be decoded — the raw log is the recovery boundary, and any downstream table can be rebuilt from `raw_events` plus a clean schema. Two pre-decode filters can drop edges before they reach the decoder; both are outside the rebuild boundary by design (see [Pre-decode filters](#pre-decode-filters) below).
+The indexer follows two independently paginated GraphQL message-edge streams. Every in-scope edge becomes one row in [`raw_events`](data-schema.md#raw_events) regardless of whether it could be decoded — the raw log is the recovery boundary, and any downstream table can be rebuilt from `raw_events` plus a clean schema. The unique `raw_events.msg_id` constraint deduplicates an event if the streams ever overlap.
+
+### Server-side capture scope
+
+The primary stream uses the gateway's indexed ExtOutV2 source-dApp field:
+
+```graphql
+blockchain {
+  events(src_dapp_id: "0000000000000000000000000000000000000000000000000000000000000004", first: $first, after: $after) { ... }
+}
+```
+
+The value comes from `dodex_chain::DEX_DAPP_ID` (`SystemDapp::Dex`), not configuration. This one query selects events from every current DEX contract without issuing one request per event `dst`.
+
+`RootPN` is the sole legacy contract whose ExtOut messages do not carry `src_dapp_id`, so the primary query cannot return them. Its events come from a second, address-scoped query:
+
+```graphql
+blockchain {
+  account(
+    account_id: "1010101010101010101010101010101010101010101010101010101010101010"
+    dapp_id: "0000000000000000000000000000000000000000000000000000000000000004"
+  ) {
+    events(first: $first, after: $after) { ... }
+  }
+}
+```
+
+The account id is `RootPn::DEFAULT_ADDRESS` without its `0:` workchain prefix. The account-events query deliberately has no `dst` argument; local routing filters run after this server-side source selection and before ABI decode. A protected gateway may use optional `graphql.bearer_token`; the indexer sends it as `Authorization: Bearer ...` on both GraphQL queries.
+
+These are the only live capture queries. In particular, the indexer does not issue one query per OrderBook event route or per-deal `TokenContract`: OrderBook traffic is covered by the DEX dApp stream, and the legacy RootPN traffic is covered by its fixed account address. Since contracts 4.0.36 a deal is deployed by its seller's `PrivateNote` (`deployDeal`) rather than by an external message, so it lives in the note's dApp — the DEX one — and its events arrive on the DEX dApp stream with everything else. No per-deal query is needed to reach them, and none is issued.
 
 ### Pre-decode filters
 
-Two filters run against the raw message edge — before any ABI decode — and drop matching edges entirely. The page cursor still advances past every dropped edge, so the indexer makes forward progress without storing or projecting them. Dropped edges do not produce a `raw_events` row and are outside the recovery boundary (they cannot be reprojected or rebuilt from `raw_events`).
+Three local filters run against the already source-scoped message edge — before any ABI decode — and drop matching edges entirely: `ignored_addresses`, the emitted-event `dst` allow-list, and `ignored_event_types`. The page cursor still advances past every dropped edge, so the indexer makes forward progress without storing or projecting them. Dropped edges do not produce a `raw_events` row and are outside the recovery boundary (they cannot be reprojected or rebuilt from `raw_events`).
 
-#### Scope filter: `indexer.dapp_id`
+Only the first **selects**; the other two subtract. That asymmetry is the point — on a shared chain a set of deny-lists cannot bound what is ingested.
 
-`indexer.dapp_id` (optional string; omit or leave unset to disable) scopes ingestion to one DEXDO application. When set, only edges whose `src_dapp_id` matches the configured value are kept; edges with no `src_dapp_id` field are also kept (so a gateway that omits the field does not silently drop everything); edges with a mismatching `src_dapp_id` are dropped before decode. When unset (the local default), the filter is inert and every edge is processed. Each per-tick log line includes a `foreign_skipped` count of edges dropped by this filter, and any nonzero `foreign_skipped` emits a `warn!` with the tick drop rate because a correctly scoped single-dapp deployment should see effectively no foreign traffic.
+#### Ingest scope: emitted-event `dst` (not configurable)
 
-Setting `dapp_id` to an empty string is rejected at startup by `IndexerConfig::validate` (it would otherwise deserialize to `Some("")` and treat every edge with a real `src_dapp_id` as foreign); omit the key to disable scoping.
+After the gateway has selected the DEX dApp or RootPN source, capture keeps an edge only when its `dst` is one of the 84 routing destinations in `config::SCOPED_EVENT_IDS`. Everything outside the allow-list is dropped before decode and counted as `out_of_scope`. `dst` is a 1:1 discriminator of event type readable from the message header, so this costs no decode.
+
+The 15 `TokenContract.*` settlement destinations (the 7xx block) are **in** the list as of contracts 4.0.36. They were excluded before it, and the exclusion cost nothing while it held: a deal was deployed by an external message and was therefore the root of its own dApp, so its events could not appear on the DEX dApp stream at all. Once the deal moved into the note's dApp, keeping the exclusion would have meant dropping — every tick, from a stream already being drained — exactly the events [`inference_deals`](data-schema.md#inference_deals) and [`inference_ticks`](data-schema.md#inference_ticks) are built from. Note that the deal's `ContractDeployed` routes to **732** (`DealDeployedEmit`), not to 703: it carries the same name and body as `RootModel.ContractDeployed` and shared its channel until contracts 4.0.35 split the two.
+
+An edge with **no** `dst` is dropped too — every event we emit is routed to one — but counted separately as `dst_missing`, and any nonzero count emits a `warn!`.
+
+This filter is unconditional and has no config key. Server-side source selection prevents the global-chain scan; the local `dst` allow-list prevents unrelated DEX-dApp or RootPN outbound messages from reaching decode or storage.
+
+The id list is pinned by `crates/infrastructure/tests/ingest_scope.rs`, which re-derives it from every `makeAddrExtern` call site under `contracts/**` on every run, and separately asserts the `TokenContract` block as a group. It cannot be derived from the ABI bundle: the ABI carries the event's *signature-hash* id, which is a different number from the EVENT_ID constant that forms the `dst`.
+
+The list is load-bearing in both directions. An indexed id missing from it is lost before `raw_events` and is **not** recoverable by reprojection; a stale id admits a route the indexer does not intend to store. The pinning test fails on either. The separate TokenContract test names those 15 routes as a group because their presence is a decision rather than a consequence: put the deal back outside the DEX dApp and it is the test that says what has to be reconsidered.
 
 #### No-op filter: `indexer.ignored_event_types`
 
 `indexer.ignored_event_types` accepts a list of event-type names (e.g. `"OrderBook.Queued"`). An edge whose external `dst` matches a configured entry is dropped before decode. The `dst` of an external event is `makeAddrExtern(EVENT_ID, 256)`, rendered as `:` followed by 64 lowercase hex digits; because the width is fixed, each `EVENT_ID` yields one stable `dst` string that acts as a 1:1 discriminator of event type — readable from the message header before the body is decoded. See [dex-events-routing.md](../contract-specs/dex-events-routing.md) for the full `dst` derivation and per-event values.
 
-Matching is by `dst` alone — it is not namespaced by contract or dapp — so a foreign contract that emits an event with the same `EVENT_ID` produces the same `dst` and is dropped too (no `raw_events` row). This is intentional: only DEXDO events are of interest, and our own non-no-op events use distinct EVENT_IDs outside the no-op set, so a wanted event is never dropped by this filter. To confine dropping to your own contracts, pair it with the `indexer.dapp_id` scope filter, which runs first.
+Matching is by `dst` alone, but it runs only after the GraphQL query has selected the DEX dApp or RootPN source. Our own non-no-op events use distinct EVENT_IDs outside the no-op set, so a wanted event is never dropped by this filter.
 
 Each per-tick log line includes a `type_ignored` count of edges dropped by this filter. A high `type_ignored` rate is not warned by itself because this filter is deliberately used to shed observability-only floods such as `OrderBook.Queued`.
 
@@ -80,11 +120,38 @@ Intended use: shed confirmed observability-only floods (e.g. `OrderBook.Queued`,
 
 ### Ingestion sequence per edge
 
-1. If `indexer.dapp_id` is set and the edge's `src_dapp_id` does not match (and is not absent), drop the edge. The page cursor still advances (step 4). `foreign_skipped` is incremented.
-2. If the edge's `dst` matches a configured `indexer.ignored_event_types` entry, drop the edge. The page cursor still advances (step 4). `type_ignored` is incremented.
-3. Try to decode the message body against the ABI bundle (`crates/infrastructure/src/decoder.rs`). The decoder is **route-aware**: when an event id is ambiguous it resolves `event_type` by the message's `dst` address (the external `makeAddrExtern(EVENT_ID, 256)` in the message header) rather than a flat event-name scan. No loaded ABI currently collides — the `InferenceOrderBook` events carry an `Inference` prefix, so `InferenceOrderBook.InferenceOrderCancelled` no longer shares an event id with `OrderBook.OrderCancelled`, and every event resolves directly by its unique id. The decoder still does **not** assume event ids are globally unique: its id index tolerates collisions (one id may map to several `(contract, event)` entries), and any colliding pair would be disambiguated by a small `dst` route table. The two `OrderCancelled` dsts are pinned in that table defensively; each route records the event's expected id, so a decoded body whose own id does not match its route is left undecoded with a warning rather than mis-attributed. On success, store the decoded JSON payload alongside `event_type`.
-4. Persist the row in `raw_events` with `processed_at = NULL`. The unique `msg_id` constraint deduplicates overlapping page fetches.
-5. After the page commits, persist the resume cursor in [`indexer_cursors`](data-schema.md#indexer_cursors). The cursor tracks capture progress, not projection; a restart resumes capture from it while the projection loop independently drains whatever rows remain `processed_at NULL`.
+1. The gateway selects the edge through either the DEX `src_dapp_id` stream or the RootPN account stream.
+2. If the edge's `src` is in `indexer.ignored_addresses`, drop it. The page cursor still advances.
+3. If the edge's `dst` is not one of the emitted-event destinations in `config::SCOPED_EVENT_IDS` — including when the edge carries no `dst` at all — drop it. `out_of_scope` is incremented, and a missing `dst` additionally increments `dst_missing`.
+4. If the edge's `dst` matches a configured `indexer.ignored_event_types` entry, drop it and increment `type_ignored`.
+5. Try to decode the message body against the ABI bundle (`crates/infrastructure/src/decoder.rs`). The decoder is **route-aware**: when an event id is ambiguous it resolves `event_type` by the message's `dst` address (the external `makeAddrExtern(EVENT_ID, 256)` in the message header) rather than a flat event-name scan. No loaded ABI currently collides — the `InferenceOrderBook` events carry an `Inference` prefix, so `InferenceOrderBook.InferenceOrderCancelled` no longer shares an event id with `OrderBook.OrderCancelled`, and every event resolves directly by its unique id. The decoder still does **not** assume event ids are globally unique: its id index tolerates collisions (one id may map to several `(contract, event)` entries), and any colliding pair would be disambiguated by a small `dst` route table. The two `OrderCancelled` dsts are pinned in that table defensively; each route records the event's expected id, so a decoded body whose own id does not match its route is left undecoded with a warning rather than mis-attributed. On success, store the decoded JSON payload alongside `event_type`.
+6. Persist the row in `raw_events` with `processed_at = NULL`. The unique `msg_id` constraint deduplicates overlapping page fetches and any cross-stream overlap.
+7. After the page commits, persist that source stream's resume cursor in [`indexer_cursors`](data-schema.md#indexer_cursors). An empty `endCursor` is refused before persistence and local assignment (`warn!`, cursor not advanced).
+8. Only after both streams complete successfully in the same tick, update the aggregate `blockchain_events` projection barrier and `at_head` state. A failed stream leaves the aggregate row unchanged and eventually makes the API freshness gate fail closed.
+
+### Dual-stream ordering barrier
+
+The DEX-dApp and RootPN queries have independent `after` cursors because either filtered stream can advance without returning an event from the other. Their source rows are `blockchain_events_dex_dapp` and `blockchain_events_root_pn`. The existing `blockchain_events` row is retained as an aggregate compatibility row consumed by the projector, metrics, inference orphan gate, and read API.
+
+The aggregate cursor is the largest globally ordered prefix known complete across both streams:
+
+- While one or both streams are still backfilling (`at_head=false`), the barrier is the minimum cursor among only those backfilling streams. A stream already at head imposes no bound; otherwise a quiet RootPN stream would freeze projection at its last event forever.
+- When both streams are at head, the maximum of their last event cursors becomes a **candidate** barrier. A head stream with no cursor is ignored because it has proved that it currently has no matching events.
+- A backfilling stream with no cursor makes the aggregate cursor NULL and blocks projection until that stream establishes progress.
+
+The all-head candidate is published only after the **next** successful poll of both streams. The two filtered queries do not share a database snapshot: if one answer returns before the other, a new event for the first stream can have a lower `chain_order` than an event observed by the second. The next poll captures any such event before releasing the previous candidate. Backfill barriers are safe immediately because their limiting cursor is behind the chain head. This one-poll stabilization is process-local; after a restart, the persisted safe barrier remains in place and the first all-head poll establishes a new candidate.
+
+`run_reprojection_loop` always caps its SQL scan at `raw_events.chain_order <= blockchain_events.cursor`. Rows captured by the faster stream or the current all-head poll remain pending above the barrier; they neither project out of order nor cause a busy loop. The aggregate `at_head` is true only when both source drains reached `hasNextPage=false` in the same successful tick.
+
+On the first deployment of this design, the old global-scan `blockchain_events` cursor is not a valid cross-stream barrier. Startup clears it when either source row is absent. On later restarts it preserves the last synchronized cursor but resets aggregate `at_head=false` until both streams have polled again.
+
+### Cold start
+
+With no source [`indexer_cursors`](data-schema.md#indexer_cursors) row — a fresh deployment, or a database restored without one — that source has no resume point. It does **not** ask for `after: null`. That is a legal query, but an unfiltered gateway query cannot answer it on a chain the size of mainnet: it fails the `blockchain` resolver with a `TIMEOUT` extension after ~2s. A stored empty-string cursor is treated as no resume point and logs a `warn!`. Capture sends the sentinel `after: "0"` instead (`EARLIEST_CURSOR`, `crates/infrastructure/src/graphql.rs`): cursors are `msg_chain_order` values — lex-sortable and always ordered above `"0"` — so the sentinel names the earliest retained matching event while staying on the indexed cursor path. Each source logs its cold start separately.
+
+The sentinel is load-bearing, not a tidiness fix. Sent verbatim, `after: null` deadlocks the deployment: the page fails, so no cursor is persisted, so the next tick asks the same unanswerable question. The read-model stays empty indefinitely instead of degrading, and every page failure is retried forever at the polling interval.
+
+A cold start recovers only what the gateway still holds. The event index keeps a bounded window (~39h on mainnet as measured 2026-08-19), so events older than that window are unreachable at any cursor; replaying them requires an archive node.
 
 ### Noise log
 
@@ -188,7 +255,7 @@ here.
 
 | Event | Effect |
 | --- | --- |
-| `InferenceOrderBook.InferenceOrderPlaced` | Upserts into `inference_orders` with `status = 'OPEN'`, `amount_initial = amount_remaining = ticks`, `price`, `is_buy`, `note_address = note`, `last_chain_order = msg_chain_order`. `tokenContract` and `deadline` are mandatory in the ABI and decoded strictly — a missing field fails the projection rather than inserting a row with a NULL that nothing would ever repair. A successfully decoded zero address or zero deadline normalizes to SQL NULL (`non_zero_address` / `non_zero_uint`): on chain a BUY carries the zero address and a resting SELL carries deadline 0. The upsert's conflict arm is NULL-preserving on both columns (`coalesce(excluded.…, inference_orders.…)`), so a replay — including an `InferenceSubscriptionPlaced` replay, which carries neither field — cannot erase a value the reconciler later recovered from chain. `chain_created_at` first-write-wins via `coalesce`; `chain_updated_at` via `greatest`. Conflict is `WHERE`-guarded against terminal rows (an isolated replay on a closed row is a no-op, logged at `warn!`). If `orderbook_address` is unknown, the projector also seeds a skeleton [`inference_markets`](data-schema.md#inference_markets) row (`orderbook_address`, `created_at_chain`, `last_reconciled_at = NULL`) so the inference reconciler picks it up — this first-order-event seed is the discovery trigger (the book does emit an `InferenceOrderBookDeployed` event, recognized as observability but no `inference_orders` mutation). **Caveat:** `InferenceOrderPlaced` carries no `flags`, and it is emitted for *every* placement — including pure-taker (`IOC`/`FOK`/`MARKET`) and rejected `POST_ONLY` orders that never rest. See [Non-resting orders](#non-resting-orders). |
+| `InferenceOrderBook.InferenceOrderPlaced` | Upserts into `inference_orders` with `status = 'OPEN'`, `amount_initial = amount_remaining = ticks`, `price`, `is_buy`, `note_address = note`, `last_chain_order = msg_chain_order`. `tokenContract` and `deadline` are mandatory in the ABI and decoded strictly — a missing field fails the projection rather than inserting a row with a NULL that nothing would ever repair. A successfully decoded zero address or zero deadline normalizes to SQL NULL (`non_zero_address` / `non_zero_uint`): on chain a BUY carries the zero address and a resting SELL carries deadline 0. The upsert's conflict arm is NULL-preserving on both columns (`coalesce(excluded.…, inference_orders.…)`), so a replay — including an `InferenceSubscriptionPlaced` replay, which carries neither field — cannot erase a value the reconciler later recovered from chain. `chain_created_at` first-write-wins via `coalesce`; `chain_updated_at` via `greatest`. Conflict is `WHERE`-guarded against terminal rows (an isolated replay on a closed row is a no-op, logged at `warn!`). If `orderbook_address` is unknown, the projector also seeds a skeleton [`inference_markets`](data-schema.md#inference_markets) row (`orderbook_address`, `created_at_chain`, `last_reconciled_at = NULL`) so the inference reconciler picks it up — this first-order-event seed is the discovery trigger (the book does emit an `InferenceOrderBookDeployed` event, recognized as observability but no `inference_orders` mutation). **Caveat:** `InferenceOrderPlaced` carries no `flags`, and it is emitted for *every* placement — including pure-taker (`IOC`/`FOK`/`MARKET`) and rejected `POST_ONLY` orders that never rest. See [Non-resting orders](#non-resting-orders). **Also ends a deal's funding cycle** when `isBuy=false` and `tokenContract` is non-zero: a funded deal cannot post an ask, so one that does proves its match was wound down — the only trace a silent `cleanupUnopened` leaves. See [Deal-address reuse](#deal-address-reuse). |
 | `InferenceOrderBook.InferenceFilled` | Decrements `amount_remaining` by `ticks` on **both** the `makerId` and `takerId` rows; advances `last_chain_order` / `chain_updated_at` via `greatest`. Close rule, mirroring the contract's one-deal-slot semantics: a **SELL offer** (`is_buy = false`) is consumed by the book on any match — flip it to `FILLED` on the first `InferenceFilled` that names it, even a partial one. A **BUY maker** spans deals — it stays `OPEN` until `amount_remaining` reaches zero, then flips to `FILLED`. A named row that has not arrived yet defers the event. **Also upserts [`inference_deals`](data-schema.md#inference_deals)** using the `sellerTC` field as the PK: sets `orderbook_address` (the source contract), `seller_note` (resolved from the SELL leg's `note_address` in `inference_orders`), and `buyer_note` (`buyerNote` field). Uses `coalesce` so a row seeded by an earlier `TokenContract.*` event keeps any columns already filled. This is the only event carrying both `sellerTC` and `buyerNote`, so it is the authoritative source for the orderbook↔deal cross-link. **Also appends one row to [`inference_trades`](data-schema.md#inference_trades)** — unlike `OrderFilled` on the prediction side there is no taker-side gate, since `InferenceFilled` is already one-per-match. `price`/`qty` come from `clearingPrice`/`ticks`; `isBuyerMaker` (not carried by the event) is read off the locked MAKER leg's `is_buy`, falling back to the inverse of the taker leg's `is_buy` when the maker leg is absent. The append is skipped only when neither leg is present (the direction is then unrecoverable) — see the orphan-repair note below. |
 | `InferenceOrderBook.InferenceOrderCancelled` | Flips `status` to `CANCELLED`, preserves `amount_remaining` as the unfilled remainder, advances `last_chain_order` / `chain_updated_at` via `greatest`. Terminal-state guard prevents a late cancel from demoting a `FILLED` row. |
 | `InferenceOrderBook.InferenceSubscriptionPlaced` | Upserts the resting BUY created by a §8 subscription: `status = 'OPEN'`, `is_buy = true`, `is_subscription = true`, `price = maxPrice`, `amount_initial = amount_remaining = ticks`. Carries neither `tokenContract` (a subscription is a bid, never a deal-naming SELL) nor `deadline`, so the upsert passes `NULL` for both; the NULL-preserving conflict arm (see above) means a value the reconciler later recovers via its `getOrder` probe is never erased by a replay of this event. It rests as a standing bid and is matched by incoming sells like any other buy maker. |
@@ -210,25 +277,53 @@ The inference reconciler closes this gap: it sweeps the book's `OPEN` rows with 
 
 ## Projection — TokenContract SETTLEMENT events
 
+These handlers run on live traffic as of contracts 4.0.36. Until then they applied only to retained rows — the deal lived in a dApp of its own and its events never reached capture — and the section described a replay-only path; see [Ingest scope](#ingest-scope-emitted-event-dst-not-configurable) for what changed. Public inference endpoints still derive their order and trade data from `InferenceOrderBook.*` and do not depend on settlement-event capture.
+
 `TokenContract.*` events drive [`inference_deals`](data-schema.md#inference_deals) and [`inference_ticks`](data-schema.md#inference_ticks) — the per-deal read model for the inference SETTLEMENT phase. A `TokenContract` is deployed per matched SELL offer; its address is the PK for `inference_deals`.
 
-The projector seeds a skeleton `inference_deals` row on the **first** `TokenContract.*` event it sees for a given address (keyed by `src_address = event.src`), so out-of-order or early delivery still records the deal. The `orderbook_address`, `seller_note`, and `buyer_note` cross-link columns are filled by the `InferenceOrderBook.InferenceFilled` handler (see the table above) — it is the only event carrying `sellerTC` + `buyerNote` together; the SETTLEMENT projector does not touch those columns. Both sides use `coalesce`-guarded upserts so whichever event arrives first preserves the other side's contribution.
+The projector seeds a skeleton `inference_deals` row on the **first** `TokenContract.*` event it sees for a given address (keyed by `src_address = event.src`), so out-of-order or early delivery still records the deal. That seed is a write, which is why no `TokenContract.*` type may be added to `IGNORABLE_EVENT_TYPES`: that list admits only genuine projector no-ops, and every event here goes through the seed.
+
+The `orderbook_address` and `seller_note` cross-link columns are filled by the `InferenceOrderBook.InferenceFilled` handler (see the table above) — it is the only event carrying `sellerTC` + `buyerNote` together — and the SETTLEMENT projector never touches them. `buyer_note` is written by both sides.
+
+### Deal-address reuse
+
+**A deal address serves more than one match as of contracts 4.0.36**, and the read model is keyed by that address. `cleanupUnopened` used to end in `_die`, so a buyer no-show destroyed the `TokenContract` and the next match needed a fresh deploy at a fresh address. It no longer does: it returns the deal to unfunded and the same contract takes a new offer through `postFromNote`, with a different buyer and a different deposit.
+
+**The note announces it.** `cleanupUnopened` has the deal call `onDealClosed` on the buyer's note AND the seller's, and each note emits `PrivateNote.InferenceDealClosed` carrying the deal's address in the payload — the sender is the note, not the deal, so this is the one deal projector that keys on a field rather than on `src_address`. One close therefore produces two events; the second finds the cycle already ended and is inert.
+
+That announcement arrived with the 4.0.36 contract update. Before it the call was silent — no `TokenContract.ContractDestroyed`, since the deal no longer dies, and no note-side event either — and the boundary had to be inferred entirely from what happened next. The two inferences below stay, now as backstops rather than as the only evidence: they are what covers a deal whose notes predate the update.
+
+**Not every close resets.** `_die` emits the same note-side event, on a deal that settled and was then destroyed, and that row carries a settlement the reset would erase. A recorded close (`close_kind` or `settled_at_chain`) separates the two, and `cleanupUnopened` can only run on a deal that never opened, so it always fires with neither set.
+
+**A fresh SELL offer naming the deal is the first backstop.** `InferenceOrderBook.InferenceOrderPlaced` with `isBuy=false` and a non-zero `tokenContract` ends that deal's cycle. The inference is sound rather than merely plausible: `postFromNote` opens with `if (_offerPosted || _funded) { return; }`, and a funded deal never clears `_offerPosted` — `onSellClosed` returns early while `_funded`. A funded deal therefore **cannot** put a new ask up, so an ask that reaches the book naming one proves its funding was undone.
+
+`StreamFunded` is the second, for a deal whose re-offer we never saw.
+
+Either way the projector clears everything that belongs to a cycle — `buyer_note`, `deposit`, `funded_at_chain`, `price_per_tick`, `opened_at_chain`, `settled_at_chain`, `close_kind`, `clean_settlement`, `disputed_at_chain`, `trusted_ticks`, `claimed_ticks`, `finalized_ticks` back to 0 — and deletes the deal's `inference_ticks` rows, so the counter and the log it counts stay in agreement. `orderbook_address` and `seller_note` survive: the deal address derives from the seller's key and nonce, so neither can change while the address does not.
+
+"Already funded" is read off **`deposit`**, not off `funded_at_chain`. Both are written by the same `StreamFunded` statement, but only `deposit` is written unconditionally — `funded_at_chain` comes from the edge's `created_at`, which the gateway may omit or send unparseable, in which case the ingest path stores `raw_events.created_at_chain` as NULL and warns rather than dropping the row. Keying the boundary on the timestamp would make one such edge permanent: the funding records a buyer and a deposit but no timestamp, every later boundary then skips the row, and the first-write-wins refill goes on serving the previous match's buyer and deposit.
+
+Both are gated on `msg_chain_order` being **newer** than the row's `last_chain_order`, and on the row having been funded at all. That gate is what makes the rule replay-safe and what separates a re-listing from the ask that produced the current match: in the ordinary flow the SELL rests *before* the funding it leads to, so a late delivery of it is older than the row and says nothing. A replay of cycle one's `StreamFunded` after cycle two has begun is inert for the same reason, and a deal that has never been funded has no cycle to end.
+
+`InferenceOrderBook.InferenceFilled` writes `buyer_note` under the same rule — newest `last_chain_order` wins rather than first-write-wins — so the party recorded against a deal is the one from its current match.
+
+One gap is left open deliberately: this orders cycles, not events within one. A cycle-one event delivered out of order *after* cycle two's funding still writes into cycle two through its own `coalesce`. Closing it needs a cycle number on the deal row and on every event that touches one — a migration and a wider primary key, against a case that has not been observed.
 
 | Event | Effect |
 | --- | --- |
 | `ContractDeployed` | Seeds the `inference_deals` skeleton only; no additional columns. |
-| `StreamFunded` | Sets `buyer_note` (first-write-wins), `deposit` (first-write-wins), `funded_at_chain` (first-write-wins). |
+| `StreamFunded` | Cycle boundary, as the backstop behind the SELL-offer signal — see [Deal-address reuse](#deal-address-reuse). On a funding newer than `last_chain_order` for an already-funded row, clears the per-cycle columns and the deal's `inference_ticks` rows first. Then sets `buyer_note`, `deposit`, `funded_at_chain` (first-write-wins into the cleared row) and advances `last_chain_order`. |
 | `StreamOpened` | Sets `buyer_note` (first-write-wins), `price_per_tick` (first-write-wins), `opened_at_chain` (first-write-wins). |
 | `TickFinalized` | Inserts one `inference_ticks` row keyed by `(token_contract_address, chain_order)` — idempotent on replay via `ON CONFLICT DO NOTHING`. Increments `finalized_ticks` on `inference_deals` **only** when the insert was a real insert (rows affected = 1), so `finalized_ticks` = count of `TickFinalized` events and replay does not double-count. The event's `finalizedOwed` is the contract's cumulative `_finalizedOwed`; it is stored on the tick row, not summed. |
 | `StreamStopped` | Sets `settled_at_chain` (first-write-wins), `close_kind = 'STOPPED'`, `clean_settlement = true` (first-write-wins). |
 | `DisputeResolved` | Sets `settled_at_chain` (first-write-wins), `close_kind = 'DISPUTE_RESOLVED'`, `clean_settlement = false` (first-write-wins). |
-| `StreamReclaimed` | Sets `settled_at_chain` (first-write-wins), `close_kind = 'RECLAIMED'`, `clean_settlement = false` (first-write-wins). |
+| `StreamReclaimed` | Sets `settled_at_chain` (first-write-wins), `close_kind = 'RECLAIMED'`, `clean_settlement = false` (first-write-wins). The contract no longer emits it — the event went with `reclaimOnTimeout` — so the arm serves retained rows only. |
 | `StreamDisputed` | Sets `disputed_at_chain` (first-write-wins), `clean_settlement = false`. |
 | `ContractDestroyed` | Sets `settled_at_chain` (first-write-wins), `close_kind = 'DESTROYED'`. |
 | `ProbeBurned` | Terminal close (buyer stop before probe-accept, or dispute-burn): sets `close_kind = 'PROBE_BURNED'` + `settled_at_chain` (first-write-wins). Does NOT set `clean_settlement` (stays NULL → not a clean settlement, no settlement-complete reward). |
-| `SellerBondFunded` / `ProbeAccepted` / `ShellWithdrawn` | No-op beyond skeleton seed — these carry no deal-level state the SETTLEMENT read-model needs. |
+| `SellerBondFunded` / `BuyerBondFunded` / `ProbeAccepted` / `ShellWithdrawn` / `EndpointSet` | No-op beyond skeleton seed — these carry no deal-level state the SETTLEMENT read-model needs. `EndpointSet` carries the buyer's endpoint as ciphertext only the two parties can read, so there is nothing in it a read model could serve. |
 
-The projector never returns `Deferred`; the skeleton seed ensures the row always exists before the event-specific handler runs. All close columns use `coalesce(existing, new)` first-write-wins so late or replayed close events cannot overwrite an already-settled row.
+The projector never returns `Deferred`; the skeleton seed ensures the row always exists before the event-specific handler runs. All close columns use `coalesce(existing, new)` first-write-wins so late or replayed close events cannot overwrite an already-settled row — first-write-wins *within a cycle*, which the `StreamFunded` reset above starts.
 
 **Read-model contract intended for the forthcoming rewards service.** Given a deal's `TokenContract` address, a single query — `SELECT orderbook_address, seller_note, buyer_note, finalized_ticks, clean_settlement, settled_at_chain FROM inference_deals WHERE token_contract_address = $1` — resolves the originating order book, both parties, and the tick/settlement outcome without replaying raw events. `inference_ticks` provides per-tick granularity (one row per finalized tick) for tick-level scoring such as "Tick выдан / Tick потрачен".
 
@@ -346,12 +441,11 @@ The projection loop applies the `inference_orphan_cutoff_ms` window as a dead-le
 
 #### Model identity (from `getModelName`)
 
-The order book carries only `model_hash`; the human `producer--model--version` name is not in `getParams()`. On the discovery pass the reconciler reads it from the book's `getModelName()` getter and parses it into the identity columns:
+The order book carries only `model_hash`; the human-readable name is not in `getParams()`. On the discovery pass the reconciler reads it from the book's `getModelName()` getter and stores it **verbatim** in `model_ref` — the column the API serves as `modelRefName`. Surrounding whitespace is kept, because the contract feeds the name into `sha256(modelName) == modelHash`: a padded name is a different model at a different book address, so trimming would serve two markets under one label. A name that is blank or all whitespace leaves the column NULL and the API renders the model by `model_hash`.
 
-- `model_ref` — the trimmed name verbatim.
-- `producer` / `model_name` / `model_version` — set only when the name is a clean three-part `producer--model--version` (exactly three non-empty `--`-separated parts); otherwise only `model_ref` is filled. An empty name leaves all four NULL, and the API then renders the model by `model_hash`.
+**Nothing is parsed out of the name.** It used to be split on exactly three `--`-separated parts into `producer` / `model_name` / `model_version`, with all three left NULL for anything else. The model registry has since been re-seeded with names that are not in that shape — `Qwen2.5-32B-Instruct`, not `qwen--qwen2.5-32b--instruct` — so the parts would have been NULL for every new market, and the split was a guess at structure the names never guaranteed. The three columns are gone (`0005_drop_inference_model_name_parts.sql`) and the whole string is served instead.
 
-This follows the "getter backfills what events don't carry" pattern: discovery is still triggered by the first order event ([projection](#projection--inference-order-events) routes `InferenceOrderBookDeployed` to observability-only), and the reconciler completes identity from the getter. `model_version` (the model's own version, rendered as the API's `model.version`) is distinct from the `version` column (the **contract** version from `getVersion()`, used only by the supersede logic).
+This follows the "getter backfills what events don't carry" pattern: discovery is still triggered by the first order event ([projection](#projection--inference-order-events) routes `InferenceOrderBookDeployed` to observability-only), and the reconciler completes identity from the getter. Note that `model_ref` is the MODEL's label while the `version` column is the **contract** version from `getVersion()`, used only by the supersede logic — the two are unrelated.
 
 > 🚧 **Still deferred — registry-walk fields.** `owner_pubkey`, `manifest_address`, and `root_model_address` require a registry walk (`SuperRoot` → `RootModel`) that is not yet implemented (the `ManifestMetadata` contract that earlier held the manifest was removed upstream in v4.0.10). These columns stay NULL.
 
@@ -362,7 +456,7 @@ Two outcomes leave a `raw_events` row pending:
 - **`Deferred`** — the projector knows it cannot apply this event yet (typically a child arriving before its parent). `processed_at` stays NULL and the projection loop retries it on a later pass. Forward passes resume above the last-drained ceiling; a separate retry pass rewinds to the front of the pending queue on a timer — roughly every `polling_interval_ms`, independent of whether the loop idled, so stuck rows are re-attempted on that cadence even under sustained ingest. A permanently deferred row is therefore retried at most once per interval, not on every ingest batch.
 - **`Err`** — the projector hit an unexpected error. Same effect on `processed_at`, plus a warn log and an increment in the failure counter. Useful for spotting ABI drift.
 
-The projection loop (`indexer_repo.rs::run_reprojection_loop`, draining via `reproject_pending_from`) picks pending rows in `chain_order` sequence, holds them with `for update skip locked` so a row is never projected twice even if a second consumer is ever added, and reuses the already-decoded payload from `raw_events.decoded` — bodies are not re-decoded. It is the sole projector: the capture path writes `raw_events` rows with `processed_at NULL` and never projects inline.
+The projection loop (`indexer_repo.rs::run_reprojection_loop`, draining via `reproject_pending_from`) picks pending rows in `chain_order` sequence up to the synchronized dual-stream barrier, holds them with `for update skip locked` so a row is never projected twice even if a second consumer is ever added, and reuses the already-decoded payload from `raw_events.decoded` — bodies are not re-decoded. It is the sole projector: the capture path writes `raw_events` rows with `processed_at NULL` and never projects inline.
 
 A batch is drained optimistically in a single transaction with **no per-row savepoint**, so an applied row costs only its projector statements — not an extra `SAVEPOINT`/`RELEASE` round-trip pair, which matters when the database is far (high per-round-trip latency). If a projector returns `Err`, that transaction is rolled back untouched and the same range is replayed with per-row savepoints, which applies the clean rows and leaves the failing one pending — the identical outcome to savepointing every row, paid for only when a failure actually occurs. The savepointed replay is paid only on passes that hit a projector error — in practice the periodic retry pass re-attempting a stuck row, though a newly captured row that errors on first sight also drops its forward pass to the fallback. A clean forward drain stays on the savepoint-free fast path.
 
@@ -389,7 +483,7 @@ Four gauges complement the counters, covering projection health and connection s
 | --- | --- | --- | --- |
 | `indexer_projection_backlog` | gauge | `raw_events` rows waiting for the projection loop (typed + decoded, `processed_at NULL`) | `count(*)` from `raw_events` |
 | `indexer_projection_lag_seconds` | gauge | Wall-clock age of the oldest eligible-but-unprojected `raw_events` row; read-model staleness | `extract(epoch from now() - min(created_at_chain))` over pending rows |
-| `indexer_capture_cursor_age_seconds` | gauge | Seconds since the capture cursor last advanced | `extract(epoch from now() - updated_at)` from `indexer_cursors` |
+| `indexer_capture_cursor_age_seconds` | gauge | Seconds since both capture streams last completed a synchronized tick | `extract(epoch from now() - updated_at)` from the aggregate `blockchain_events` cursor row |
 | `indexer_db_pool_connections{state=in_use\|idle}` | gauge | sqlx DB pool connections by state | `pool.size()` / `pool.num_idle()` — in-memory, no DB query |
 
 All four ride the same OTLP path as the counters: exported only when `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is set, refreshed every `REFRESH_INTERVAL` (15s). The pool gauge is sampled in the refresh loop (≤15s granularity). Diagnostic shape: backlog rising + pool `in_use` at max + cursor age small = projection stalled on connection exhaustion.
@@ -470,6 +564,6 @@ The same gate applies to inference markets: an [`inference_markets`](data-schema
 
 ## Capture-freshness / polling-interval coupling
 
-`GET /api/v1/inference/orders` fails closed whenever it cannot vouch for the completeness of its view of a book — see [read-api.md § Fail-closed gate](read-api.md#fail-closed-gate). One of that gate's three arms reads the same [`indexer_cursors`](data-schema.md#indexer_cursors) row the capture loop maintains for `CAPTURE_STREAM` (`crates/infrastructure/src/indexer_repo.rs`): `at_head` alone only records that the *last* poll saw no next page, so the gate additionally requires that poll to have landed within `CAPTURE_FRESHNESS_SECS` (30s, `crates/infrastructure/src/config.rs`) of the request. A capture loop that stops polling — crashed, wedged, or simply configured with too coarse a `polling_interval_ms` — therefore turns every book's TokenContract-filtered live-SELL queries into `MarketInconsistent` / 503 once the last poll ages past that bound, independent of whether the loop is actually behind.
+`GET /api/v1/inference/orders` fails closed whenever it cannot vouch for the completeness of its view of a book — see [read-api.md § Fail-closed gate](read-api.md#fail-closed-gate). One of that gate's three arms reads the aggregate [`indexer_cursors`](data-schema.md#indexer_cursors) row for `CAPTURE_STREAM` (`blockchain_events`). Its `at_head` is true only when both the DEX-dApp and RootPN drains reached head in the same successful tick; its `updated_at` is refreshed only after that synchronization. The gate additionally requires the row to be newer than `CAPTURE_FRESHNESS_SECS` (30s, `crates/infrastructure/src/config.rs`). A failed or stopped source therefore turns every book's TokenContract-filtered live-SELL queries into `MarketInconsistent` / 503 once the aggregate row ages past that bound.
 
 `IndexerConfig::validate` refuses to start a config whose `indexer.polling_interval_ms` cannot land at least two polls inside that window: `2.0 * polling_interval_ms / 1000.0 <= CAPTURE_FRESHNESS_SECS`. Two polls, not one, because a single slow poll near the boundary must not be able to make every book unqueryable on its own — the margin absorbs one missed or delayed tick. The shipped configs poll every 3 s (`polling_interval_ms: 3000`), ten polls inside the 30 s window; raising it above 15 s trips this check at startup rather than failing silently at request time with no indication of why.

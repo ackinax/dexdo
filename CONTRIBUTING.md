@@ -233,7 +233,23 @@ case you're in:
   next free index) and bump the `PN-API` count in
   [`tests/e2e/dex_test_notes.spec.json`](tests/e2e/dex_test_notes.spec.json) and
   `API_NOTES_FOR_ONE_EACH` in `services/api/tests/pn_pool_split.rs` to match —
-  a unit test fails if they disagree. The woodpecker e2e step runs this suite
+  a unit test fails if they disagree.
+
+  **An inference test draws from `PN-INF`, not `PN-API`, and the pair to bump is
+  its own**: the `PN-INF` count in the same spec and
+  `INFERENCE_NOTES_FOR_ONE_EACH` in the same file, guarded by its own unit test.
+  The currency is why the pools are separate rather than one: an inference buy
+  is paid out of `_balance[CURRENCIES_ID_SHELL]`, only the constructor writes
+  that ledger, so a NACKL note can never be topped up into an inference note.
+  A test that takes **two** notes — any scenario proving the two sides of a deal
+  are told apart — must also check that its two indices cannot fold onto one
+  row: they are read as `notes[k % len]`, so a pool shorter than the larger
+  index turns the scenario into the self-trade it exists to disprove. Bump the
+  `--count` for `PN-INF` in
+  [`.github/workflows/e2e-shellnet.yml`](.github/workflows/e2e-shellnet.yml)
+  alongside — that lane mints its pool instead of baking it from the spec, so
+  the guard test cannot see it, and the length assertion just below the mint
+  has to move with it. The woodpecker e2e step runs this suite
   four at a time, and the `serial-e2e-shared` group in
   [`.config/nextest.toml`](.config/nextest.toml) is the whole of what keeps
   concurrent tests off each other. A test belongs in that group if ANY of three
@@ -334,6 +350,9 @@ not optional and not narrowable to "the obviously relevant doc."
 2. Keep the change **scoped to what was asked** — a focused PR beats a sprawling
    one ([`AGENT_REQUIREMENTS.md`](AGENT_REQUIREMENTS.md#avoid-perfectionism)).
 3. Green locally: fmt, clippy, tests, doctests, and OpenAPI drift (above).
-4. Add a [`CHANGELOG.md`](CHANGELOG.md) entry under today's date if the change is
-   user-visible.
+4. Add a [`CHANGELOG.md`](CHANGELOG.md) entry under today's date describing the
+   branch's diff against `dev` — written for a devops engineer or a developer who
+   runs DEX.DO, not for the author. What counts as observable, and what to leave
+   out, is in
+   [`AGENT_REQUIREMENTS.md`](AGENT_REQUIREMENTS.md#write-for-the-reader-not-for-the-author).
 5. Run the doc sweep and commit doc updates **in the same commit** as the code.
