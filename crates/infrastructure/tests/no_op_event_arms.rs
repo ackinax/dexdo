@@ -26,7 +26,24 @@ use sqlx::PgPool;
 /// none of these are in `IGNORABLE_EVENT_TYPES` — that list is permission to
 /// drop an event at ingest, before `raw_events` is written, and dropping these
 /// would cut rewards off from the payload it settles on.
-const UNPERSISTED_DEX_EVENTS: [&str; 9] = [
+///
+/// `PrivateNote.InferenceDealClosed` was here and is not any more: the 4.0.36
+/// contract update made `cleanupUnopened` announce itself through both notes,
+/// which turned the event into the direct signal that a deal's funding cycle is
+/// over. It now writes, so it belongs to
+/// `crates/infrastructure/tests/token_contract_projectors.rs` instead.
+/// The three registry events (`RootModel.*`, `SuperRoot.RootRegistered`) are here
+/// for a sharper reason than the rest. The read model has no registry table, so
+/// they persist nothing — their ABIs are loaded only so the rows decode instead of
+/// landing with `event_type` NULL, which would leave them unprojectable and
+/// therefore unprunable forever.
+///
+/// `RootModel.ContractDeployed` carries the sharpest edge: it shares its name,
+/// body and signature id with the deal's own `TokenContract.ContractDeployed`, and
+/// until the decoder began routing dst 703 and 732 apart it decoded as the deal and
+/// seeded an `inference_deals` row per root model. The write assertion below is
+/// what pins that shut: if this event ever writes again, it is that bug returning.
+const UNPERSISTED_DEX_EVENTS: [&str; 11] = [
     "PMP.StakeForfeited",
     "PrivateNote.StakeForfeitConfirmed",
     "PrivateNote.StakeDroppedLocally",
@@ -34,8 +51,10 @@ const UNPERSISTED_DEX_EVENTS: [&str; 9] = [
     "PrivateNote.BookCredited",
     "PrivateNote.InferenceOrderRemoved",
     "PrivateNote.InferenceOrderRejectedMirror",
-    "PrivateNote.InferenceDealClosed",
     "RootPN.DealWriteOffReported",
+    "RootModel.ContractDeployed",
+    "RootModel.TokenContractRegistered",
+    "SuperRoot.RootRegistered",
 ];
 
 async fn setup() -> Option<PgPool> {

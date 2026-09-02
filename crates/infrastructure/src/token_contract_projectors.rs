@@ -74,6 +74,101 @@ async fn seed_deal_skeleton(
     Ok(())
 }
 
+/// End the deal's current funding cycle, clearing everything written per cycle.
+/// Returns whether a cycle was actually ended.
+///
+/// A deal address serves more than one match since contracts 4.0.36.
+/// `cleanupUnopened` used to end in `_die`, so a buyer no-show destroyed the
+/// deal and the next match needed a fresh deploy at a fresh address. It no
+/// longer does: it puts the state back to unfunded, clears `_offerPosted`, and
+/// the SAME `TokenContract` takes a new offer through `postFromNote` with a
+/// different buyer and a different deposit. The address is this table's primary
+/// key, so a second cycle lands on the first cycle's row.
+///
+/// `buyer_note`, `deposit` and `funded_at_chain` are cleared along with the
+/// rest, because the callers that refill them do so through `coalesce` and
+/// would otherwise keep cycle one's buyer forever while the row went on
+/// reporting a settlement that has been superseded. What is NOT cleared is what
+/// the address itself fixes: `orderbook_address` and `seller_note` derive from
+/// the seller's key and nonce and cannot change while the address does not.
+///
+/// Guarded by `last_chain_order` rather than run unconditionally, because
+/// reprojection replays rows: only an event NEWER than everything already
+/// folded into this row may end a cycle, so replaying cycle one after cycle two
+/// began is inert instead of destructive. A deal that has never been funded has
+/// no cycle to end and is skipped outright.
+///
+/// A cycle EXISTS when `deposit` is set, not when `funded_at_chain` is. Both
+/// are written by the same `StreamFunded` statement, but only `deposit` is
+/// written unconditionally: `funded_at_chain` comes from the edge's
+/// `created_at`, which the gateway may omit or send unparseable — a case
+/// `persist_page` already handles by storing NULL and warning
+/// (`indexer_repo::should_warn_unparseable_created_at`). Testing the timestamp
+/// made one such edge permanent: the funding recorded a buyer and a deposit but
+/// no timestamp, every later reset then skipped this row, and the `coalesce`
+/// below served cycle one's buyer and deposit for cycle two's match. The
+/// deposit IS the funding; the timestamp only says when it happened.
+///
+/// Known gap, left open deliberately: this orders cycles, not events within
+/// one. A cycle-one event delivered out of order AFTER cycle two has started
+/// still writes into cycle two through its own `coalesce`. Closing that needs a
+/// cycle number on every deal row and on every event that touches one — a
+/// migration and a wider key — and the case it guards against has not been
+/// observed.
+pub(crate) async fn end_funding_cycle(
+    tx: &mut Transaction<'_, Postgres>,
+    tc: &str,
+    chain_order: &str,
+) -> anyhow::Result<bool> {
+    let ended = sqlx::query_scalar::<_, bool>(
+        r#"update inference_deals
+              set buyer_note = null,
+                  deposit = null,
+                  funded_at_chain = null,
+                  price_per_tick = null,
+                  opened_at_chain = null,
+                  settled_at_chain = null,
+                  close_kind = null,
+                  clean_settlement = null,
+                  disputed_at_chain = null,
+                  finalized_ticks = 0,
+                  trusted_ticks = null,
+                  claimed_ticks = null,
+                  last_chain_order = $2,
+                  updated_at = now()
+            where token_contract_address = $1
+              and deposit is not null
+              and $2 > coalesce(last_chain_order, '')
+        returning true"#,
+    )
+    .bind(tc)
+    .bind(chain_order)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("end the deal's funding cycle")?
+    .unwrap_or(false);
+
+    // The per-tick log goes with the counter it backs: `apply_tick_finalized`
+    // increments `finalized_ticks` only when its insert is a real insert, so a
+    // counter reset that left the old rows behind would leave the two
+    // disagreeing forever — the COUNT would read as one cycle's worth of ticks
+    // split across two. The settled history of cycle one is in
+    // `inference_trades`.
+    if ended {
+        sqlx::query(r#"delete from inference_ticks where token_contract_address = $1"#)
+            .bind(tc)
+            .execute(&mut **tx)
+            .await
+            .context("clear inference_ticks for the ended cycle")?;
+    }
+    Ok(ended)
+}
+
+/// A deal is funded — and, since contracts 4.0.36, possibly not for the first
+/// time at this address, so the previous cycle is ended before the new figures
+/// go in. Ordinarily [`end_funding_cycle`] has already run on the SELL offer
+/// that produced this match (see `inference_projectors`); this call is what
+/// covers the deal whose re-offer we never saw.
 async fn apply_stream_funded(
     tx: &mut Transaction<'_, Postgres>,
     event: &DecodedEvent,
@@ -82,12 +177,17 @@ async fn apply_stream_funded(
     let tc = node.src.as_deref().context("StreamFunded: src missing")?;
     let buyer = field_str(&event.value, "buyer")?;
     let deposit = uint_field_to_decimal(&event.value, "deposit")?;
+    let chain_order = node_chain_order(node, "StreamFunded")?;
     let chain_seconds = parse_unix_seconds(node.created_at.as_ref());
+
+    end_funding_cycle(tx, tc, &chain_order).await?;
+
     sqlx::query(
         r#"update inference_deals
               set buyer_note = coalesce(buyer_note, $2),
                   deposit = coalesce(deposit, $3::numeric),
                   funded_at_chain = coalesce(funded_at_chain, to_timestamp($4::double precision)),
+                  last_chain_order = greatest(coalesce(last_chain_order, ''), $5),
                   updated_at = now()
             where token_contract_address = $1"#,
     )
@@ -95,6 +195,7 @@ async fn apply_stream_funded(
     .bind(buyer)
     .bind(&deposit)
     .bind(chain_seconds)
+    .bind(&chain_order)
     .execute(&mut **tx)
     .await
     .context("apply StreamFunded")?;

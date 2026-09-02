@@ -73,7 +73,7 @@ jobs:
       # deployPMP (ERR_INVALID_STATE), so any long-lived hosted note goes stale.
       # Fresh notes per run sidestep cross-run poisoning and need no secret.
       # They are drained in the teardown step below.
-      # TWO NOTES, AND THE CURRENCY IS NOT INTERCHANGEABLE. The trader path
+      # TWO CURRENCIES, AND THEY ARE NOT INTERCHANGEABLE. The trader path
       # deploys NACKL markets and stakes out of `_balance[NACKL]`; an inference
       # buy is paid out of `_balance[CURRENCIES_ID_SHELL]`. Only the constructor
       # writes that ledger (`_balance[tokenType] = value`), so the deposit
@@ -84,6 +84,22 @@ jobs:
       # to append a different token type), so they are minted separately and the
       # two seed_notes arrays concatenated; `--profile` is what tells the loader
       # which rows belong to which suite.
+      #
+      # ONE OF EACH HERE, twenty-four in the woodpecker spec, and the two counts
+      # are answering different questions. Every test picks its note as
+      # `notes[k % len]`, so a pool of one folds every index onto the same row.
+      # That is harmless in THIS lane: it runs `--test-threads 1` (see below)
+      # and every inference binary here is a self-trade, one note playing both
+      # sides, so there is no second party for a distinct row to be. The stand
+      # is what needs twenty-four — it runs four tests at once, and there the
+      # count costs nothing because the zerostate bakes the pool from
+      # `tests/e2e/dex_test_notes.spec.json` offline.
+      #
+      # Here it is not free: this step MINTS notes live on shellnet, one deploy
+      # at a time. Twenty-four of them ran the job into its 120-minute timeout
+      # (run 441) without reaching a single test, while one has been minting in
+      # about a minute all along. Raise this only together with the timeout, and
+      # only for a scenario that genuinely needs two parties.
       - name: Mint fresh e2e seed notes
         working-directory: sdk
         run: |
@@ -117,10 +133,10 @@ jobs:
       - name: cargo nextest run (e2e, single-threaded)
         run: cargo nextest run -p dodex-api --run-ignored only --test-threads 1 --no-fail-fast
 
-      # Teardown: drain the throwaway note to a random (uninit) address so the
-      # plaintext key surfaced in the mint step / fixture controls no funds after
-      # the run — and the note ends in the hasWithdrawn state, unusable. Runs even
-      # if the suite failed; best-effort (the next run mints a fresh note anyway),
+      # Teardown: drain every throwaway note to a random (uninit) address so the
+      # plaintext keys surfaced in the mint step / fixture control no funds after
+      # the run — and each note ends in the hasWithdrawn state, unusable. Runs even
+      # if the suite failed; best-effort (the next run mints fresh notes anyway),
       # so a drain failure never fails the job.
       - name: Drain e2e seed notes (teardown)
         if: always()
@@ -129,8 +145,10 @@ jobs:
           seed="$GITHUB_WORKSPACE/tests/fixtures/seed_notes.json"
           [ -s "$seed" ] || { echo "no seed note to drain — skip"; exit 0; }
           # Every row, not just the first: the file holds one note per profile
-          # and each one's key is in the clear. Draining only row 0 would leave
-          # the other spendable by anyone who read the log.
+          # and every key in it is in the clear. Draining only row 0 would leave
+          # the others spendable by anyone who read the log. The loop is written
+          # over the whole file rather than over a known count, so it keeps
+          # holding if the mint above ever grows a pool.
           for i in $(jq -r 'to_entries[].key' "$seed"); do
             jq --argjson i "$i" \
               '{pn_address: .[$i].pn_address, owner_public_key_hex: .[$i].pn_pubkey_hex, owner_secret_key_hex: .[$i].pn_seckey_hex}' \

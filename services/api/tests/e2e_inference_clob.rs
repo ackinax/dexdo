@@ -21,7 +21,7 @@ use std::time::UNIX_EPOCH;
 
 use ackinacki_kit::tvm_client::abi::Signer;
 use ackinacki_kit::tvm_client::crypto::KeyPair;
-use common::airegistry::deploy_token_contract;
+use common::airegistry::deploy_deal_from_note;
 use common::airegistry::fetch_inference_event_ids;
 use common::airegistry::wait_inference_book_live;
 use common::airegistry::wait_sell_offer_rested;
@@ -55,7 +55,17 @@ const ERR_NO_LIQUIDITY: u32 = 334;
 fn note_and_signer() -> (common::test_pns::TestPn, KeyPair) {
     let note = {
         let p = TestPnPool::load_inference();
-        p.notes[9 % p.notes.len()].clone()
+        // 13, not 9: `e2e_inference` takes 9 out of the same `PN-INF` pool, so
+        // the two binaries were drawing the same note. That was never a bug
+        // while both sat in the `serial-e2e-shared` group — a note serialises
+        // its own operations through `_busy`, so sharing cost latency, not
+        // correctness. It becomes one the moment either leaves the group, and
+        // the stand now runs four tests at a time (`--test-threads 4` in
+        // acki-nacki's `tests/dexdo/e2e-on-host.sh`), which makes the group the
+        // only thing standing between them. Distinct notes are cheaper than
+        // that dependency: the pool has the rows, and the index map lives in
+        // `pn_pool_split.rs`.
+        p.notes[13 % p.notes.len()].clone()
     };
     let keys = KeyPair {
         public: note.owner_public_key_hex.clone(),
@@ -123,16 +133,16 @@ async fn inference_partial_fill_leaves_remainder() {
 
     let (ob, model_hash) = deploy_book(&dex, &note.address, &model_name, signer()).await;
     let nonce = unique_nonce();
-    let tc = deploy_token_contract(
-        dex.context(),
-        &note.owner_public_key_hex,
+    let tc = deploy_deal_from_note(
+        &dex,
         &note.address,
+        &note.owner_public_key_hex,
         nonce,
         TokenDeal { model_name: model_name.clone(), price_per_tick: PRICE_PER_TICK, max_ticks: 2 },
         keys.clone(),
     )
     .await
-    .expect("deploy TokenContract");
+    .expect("deployDeal from the seller note");
     eprintln!("[e2e_clob] order_book={ob} token_contract={tc}");
 
     // 2-tick SELL offer rests.
@@ -245,16 +255,16 @@ async fn inference_match_emits_filled_event() {
 
     let (ob, model_hash) = deploy_book(&dex, &note.address, &model_name, signer()).await;
     let nonce = unique_nonce();
-    let tc = deploy_token_contract(
-        dex.context(),
-        &note.owner_public_key_hex,
+    let tc = deploy_deal_from_note(
+        &dex,
         &note.address,
+        &note.owner_public_key_hex,
         nonce,
         TokenDeal { model_name: model_name.clone(), price_per_tick: PRICE_PER_TICK, max_ticks: 2 },
         keys.clone(),
     )
     .await
-    .expect("deploy TokenContract");
+    .expect("deployDeal from the seller note");
 
     dex.post_sell_offer(
         &note.address,
