@@ -15,6 +15,7 @@ use dodex_application::InferenceMarketsSort;
 use dodex_domain::DomainError;
 use dodex_domain::InferenceMarket;
 use dodex_domain::InferenceMarketStatus;
+use dodex_domain::LiquidityFilter;
 use dodex_domain::Trade;
 use salvo::prelude::*;
 use salvo::writing::Json;
@@ -70,6 +71,12 @@ struct InferenceMarketDto {
     min_notional: String,
     /// Weekly-median price per tick; `null` when the book has no recent liquidity.
     reference_price: Option<String>,
+    /// Highest price a matchable bid rests at — the first level
+    /// `/api/v1/inference/depth` would return for this book. `null` when no bid
+    /// is matchable. Scaled like a depth level's price.
+    best_bid: Option<String>,
+    /// Lowest price a matchable ask rests at; `null` when no ask is matchable.
+    best_ask: Option<String>,
     created_at: i64,
 }
 
@@ -96,6 +103,7 @@ impl From<InferenceMarketStatus> for InferenceMarketStatusDto {
         ("inferenceOrderBookAddress" = Option<String>, Query, description = "Single-market lookup. Mutually exclusive with filters and pagination."),
         ("status" = Option<String>, Query, description = "Comma-separated statuses to include. Currently only TRADING."),
         ("sort" = Option<String>, Query, description = "Sort field. createdAt (default, DESC)."),
+        ("liquidity" = Option<dto::LiquidityFilter>, Query, description = "Return only books currently holding resting liquidity of this side. For volume, read the totals on /api/v1/inference/depth."),
         ("cursor" = Option<String>, Query, description = "Opaque pagination cursor from a previous call."),
         ("limit" = Option<i64>, Query, minimum = 1, maximum = 200, description = "Page size. Default 50, max 200; out-of-range values clamp."),
     ),
@@ -118,7 +126,7 @@ pub(crate) async fn get_inference_markets(
     })?;
 
     let now = now_seconds();
-    let request = build_inference_markets_request(req)?;
+    let request = build_inference_markets_request(req, now)?;
 
     let use_case = GetInferenceMarketsUseCase::new(inference_repo);
     let page = use_case
@@ -134,7 +142,10 @@ pub(crate) async fn get_inference_markets(
     }))
 }
 
-fn build_inference_markets_request(req: &mut Request) -> Result<InferenceMarketsRequest, ApiError> {
+fn build_inference_markets_request(
+    req: &mut Request,
+    now: i64,
+) -> Result<InferenceMarketsRequest, ApiError> {
     let address = non_empty_query(req, "inferenceOrderBookAddress");
 
     if let Some(addr) = address {
@@ -145,12 +156,13 @@ fn build_inference_markets_request(req: &mut Request) -> Result<InferenceMarkets
         // the typed parse, so the conflict is always -1102, never -1130 or a
         // silent single-market success. (Intentionally stricter than
         // prediction's `build_markets_request`.)
-        let conflicting =
-            ["status", "sort", "cursor", "limit"].iter().any(|&k| req.query::<String>(k).is_some());
+        let conflicting = ["status", "sort", "cursor", "limit", "liquidity"]
+            .iter()
+            .any(|&k| req.query::<String>(k).is_some());
         if conflicting {
             return Err(ApiError::from(DomainError::MissingParameter));
         }
-        return Ok(InferenceMarketsRequest::One { orderbook_address: addr });
+        return Ok(InferenceMarketsRequest::One { orderbook_address: addr, now });
     }
 
     // Listing path. `status` is validated (TRADING-only) but not stored: every
@@ -170,11 +182,25 @@ fn build_inference_markets_request(req: &mut Request) -> Result<InferenceMarkets
         None | Some("createdAt") => InferenceMarketsSort::CreatedAtDesc,
         Some(_) => return Err(ApiError::from(DomainError::InvalidParameter)),
     };
+    // Unlike `status`, this one is a real predicate: an unknown token is -1130
+    // rather than a silently ignored no-op. A blank value is -1102, not "no
+    // filter": an unbound `?liquidity=${side}` would otherwise return every
+    // book, dry ones included, as if they were quoted.
+    let liquidity = non_blank_query(req, "liquidity")?
+        .as_deref()
+        .map(|v| LiquidityFilter::parse(v).ok_or(ApiError::from(DomainError::InvalidParameter)))
+        .transpose()?;
     let limit = optional_typed_query::<i64>(req, "limit")?
         .map(|v| v.clamp(1, INFERENCE_MAX_LIMIT as i64) as u16)
         .unwrap_or(INFERENCE_DEFAULT_LIMIT);
 
-    Ok(InferenceMarketsRequest::Listing(InferenceMarketsListing { sort, cursor, limit }))
+    Ok(InferenceMarketsRequest::Listing(InferenceMarketsListing {
+        liquidity,
+        sort,
+        cursor,
+        limit,
+        now,
+    }))
 }
 
 fn inference_market_to_dto(m: InferenceMarket) -> InferenceMarketDto {
@@ -192,6 +218,8 @@ fn inference_market_to_dto(m: InferenceMarket) -> InferenceMarketDto {
         step_size: m.step_size,
         min_notional: m.min_notional,
         reference_price: m.reference_price,
+        best_bid: m.best_bid,
+        best_ask: m.best_ask,
         created_at: m.created_at,
     }
 }
@@ -210,6 +238,12 @@ struct InferenceDepthResponse {
     bids: Vec<[String; 2]>,
     #[salvo(schema(schema_with = inference_depth_asks_schema))]
     asks: Vec<[String; 2]>,
+    /// Ticks resting across the whole bid side. `limit` caps the levels in
+    /// `bids`, never this — the total is the same answer at any page size.
+    /// `"0"` on an empty side.
+    total_bid_ticks: String,
+    /// The same across the whole ask side.
+    total_ask_ticks: String,
 }
 
 // `[String; 2]` derives as an unbounded array; pin the [price, quantity] shape.
@@ -272,7 +306,7 @@ pub(crate) async fn get_inference_depth(
 
     let use_case = GetInferenceDepthUseCase::new(inference_repo);
     let snapshot = use_case
-        .execute(GetInferenceDepthQuery { orderbook_address: address, limit })
+        .execute(GetInferenceDepthQuery { orderbook_address: address, limit, now: now_seconds() })
         .await
         .map_err(|err| map_domain_or_unexpected(err, "get_inference_depth"))?;
 
@@ -282,6 +316,8 @@ pub(crate) async fn get_inference_depth(
         last_update_id: snapshot.last_update_id,
         bids: snapshot.bids.into_iter().map(|l| [l.price, l.quantity]).collect(),
         asks: snapshot.asks.into_iter().map(|l| [l.price, l.quantity]).collect(),
+        total_bid_ticks: snapshot.total_bid_ticks,
+        total_ask_ticks: snapshot.total_ask_ticks,
     }))
 }
 
@@ -336,9 +372,10 @@ struct InferenceOrderDto {
         ("tokenContract" = Option<String>, Query, description = "Exact deal TokenContract. Mutually exclusive with `note`. Refused with -1500 (HTTP 503, retry) while the book has a live SELL whose TokenContract the indexer does not know."),
         ("note" = Option<String>, Query, description = "Exact owning PrivateNote address. Mutually exclusive with `tokenContract`."),
         ("side" = Option<String>, Query, description = "BUY or SELL."),
-        ("status" = Option<Vec<dto::InferenceOrderStatus>>, Query, style = Form, explode = false, description = "Comma-separated: LIVE, FILLED, CANCELLED, EXPIRED. Default: all. LIVE means currently resting; EXPIRED means the book dropped it once its deadline passed."),
+        ("status" = Option<Vec<dto::InferenceOrderStatus>>, Query, style = Form, explode = false, description = "Comma-separated: LIVE, FILLED, CANCELLED, EXPIRED. Default: all. LIVE means the order is in the book; EXPIRED means the chain confirmed the book dropped it. Whether a LIVE row has passed its deadline is the separate includeExpired filter."),
         ("limit" = Option<i64>, Query, minimum = 1, maximum = 500, description = "Page size. Default 100, max 500; out-of-range values are rejected."),
         ("cursor" = Option<String>, Query, description = "Keyset cursor from a previous call's nextCursor."),
+        ("includeExpired" = Option<bool>, Query, description = "Include orders that are in the book but past their deadline — present yet unmatchable. A filter of its own, composed with status. Default false. A tokenContract query returns such rows either way."),
     ),
     security(()),
 )]
@@ -360,6 +397,9 @@ pub(crate) async fn get_inference_orders(
 
     let address = non_blank_query(req, "inferenceOrderBookAddress")?
         .ok_or(ApiError::from(DomainError::MissingParameter))?;
+    // One clock for both: clients compare `deadline` against `serverTime`, so
+    // the rows must be cut at the instant the response reports.
+    let now = now_seconds();
     let input = GetInferenceOrdersInput {
         orderbook_address: address.clone(),
         token_contract: non_blank_query(req, "tokenContract")?,
@@ -370,6 +410,14 @@ pub(crate) async fn get_inference_orders(
         // MissingParameter inside the use case, matching prediction/orders.
         limit: optional_typed_query::<i64>(req, "limit")?,
         cursor: req.query::<String>("cursor"),
+        now,
+        // Blank is MissingParameter like every filter here, and `bool::from_str`
+        // takes exactly `true` / `false`, anything else being InvalidParameter —
+        // so neither a typo nor an unbound template variable can fall back to
+        // the default, which hides rows.
+        include_expired: non_blank_query(req, "includeExpired")?
+            .map(|v| v.parse::<bool>().map_err(|_| ApiError::from(DomainError::InvalidParameter)))
+            .transpose()?,
     };
 
     let use_case = GetInferenceOrdersUseCase::new(inference_repo);
@@ -382,7 +430,7 @@ pub(crate) async fn get_inference_orders(
     // scan was truncated. Derive the wire `hasMore` from it before the field is moved.
     let has_more = page.next_cursor.is_some();
     Ok(Json(InferenceOrdersResponse {
-        server_time: now_seconds(),
+        server_time: now,
         last_update_id: page.last_update_id,
         next_cursor: page.next_cursor,
         has_more,
