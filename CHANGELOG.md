@@ -2,6 +2,31 @@
 
 All notable changes to DEX.DO are recorded here. Entries are date-based, newest first.
 
+## [2026-09-29]
+
+### Added
+
+- **`totalAskTicks` on every inference market.** `GET /api/v1/inference/markets` now carries each book's ask-side volume — the ticks resting across the whole ask side, identical to `totalAskTicks` on `/api/v1/inference/depth` for that book. `"0"` when nothing is matchable on the ask side, never `null`. Lapsed, closed and exhausted asks do not count; subscriptions do, as on depth. There is no bid-side total on the market — read `totalBidTicks` from depth for that.
+
+### Changed
+
+- **The inference market listing joins after it picks its page.** The top-of-book and ask-volume lookups now run only for the markets returned, not for every visible book. Same results, same order and cursors.
+
+## [2026-09-28]
+
+### Added
+
+- **`GET /api/v1/inference/markets?liquidity=BUY|SELL|ANY|BOTH` — list only the models someone is actually quoting.** An order counts when it is open and still has ticks left, the same orders `/api/v1/inference/depth` shows; filled and cancelled ones never do, and subscriptions count exactly as depth counts them. `BUY` wants a resting bid, `SELL` a resting ask, `ANY` either, `BOTH` one of each. The response shape is unchanged: the filter answers "is this side quoted", not "how much". Any other value is `-1130 / 400` and a blank one `-1102 / 400`, so an unbound template variable cannot silently drop the filter; like the other listing parameters it cannot be combined with `inferenceOrderBookAddress` — presence alone conflicts, so even an empty `&liquidity=` is `-1102 / 400`.
+- **`bestBid` / `bestAsk` on every inference market.** `GET /api/v1/inference/markets` now carries each book's top of book — the highest matchable bid and the lowest matchable ask, scaled like a depth level's price. They are exactly the first level `/api/v1/inference/depth` would return for that book, so screening many models no longer needs one depth call each. `null` means that side has nothing matchable resting, which is an empty side and not a zero price. An order that is in the book but past its `deadline` sets no quote, the same rule the rest of the read path follows. For the volume behind a quote rather than its price, read `totalBidTicks` / `totalAskTicks` from `/api/v1/inference/depth`.
+- **`?includeExpired=` on `GET /api/v1/inference/orders`.** A second, independent filter alongside `status`. `status` says whether the order is in the book — `LIVE` is exactly that — while `includeExpired` says whether a row that is in the book can still be matched. They are different questions: an order carries an optional `deadline`, and once it passes the book will not settle against it, but the order stays in the book and `LIVE` until a taker's match reaches it, someone calls the book's `expireOrder`, or its owner cancels it, however long that takes. For that window it is present but unhittable. The default (`false`) hides those rows; `includeExpired=true` returns them. Exactly `true` or `false` — any other value is `-1130` and a blank one `-1102`, so neither a typo nor an unbound template variable can silently hide rows. A `tokenContract` lookup ignores the filter and always returns a lapsed row: a lapsed SELL still holds its TokenContract, which cannot post a new offer or close until the order leaves the book. A row returned under `includeExpired=true` still reports `"status": "LIVE"`, because it really is still in the book; compare its `deadline` against `serverTime` to see that it lapsed. `deadline: null` never lapses and is never hidden; the boundary is inclusive (`deadline == serverTime` has already lapsed), matching the book's own rule. In practice only `LIVE` rows are affected — a terminal row left the book, so its deadline is irrelevant.
+- **Migration `0006_inference_orders_liquidity_idx` — run it.** Adds `inference_orders_liquidity_idx`, a partial index on `(orderbook_address, is_buy) INCLUDE (amount_remaining, deadline)` where `status = 'OPEN' AND amount_remaining > 0`, which the `?liquidity=` filter on `/api/v1/inference/markets` reads index-only. Without it the filter falls back to heap fetches over the existing `inference_orders_open_book_idx`. Index creation is not `CONCURRENTLY`. The indexer applies migrations at startup, before it captures or projects anything, so it stays idle until the build commits; any other process writing `inference_orders` meanwhile — an old indexer during a rolling restart, say — blocks on the SHARE lock for the whole build. Reads are unaffected.
+
+### Changed
+
+- **`GET /api/v1/inference/depth` gains `totalBidTicks` / `totalAskTicks`.** Ticks resting across the whole side, not just the levels in `bids` / `asks`. `limit` caps how many levels come back and nothing else, so the totals are the same answer at any page size — a client no longer has to page through the book to learn how deep it is. `"0"` on an empty side. They obey the same definition of resting as the levels they sit beside, so adding the levels up lands on the same number whenever `limit` did not truncate them.
+- **`GET /api/v1/inference/depth` no longer quotes orders whose deadline has passed.** The book will not settle against such a maker, so a taker could not fill against the ticks it advertised. Depth, the new `?liquidity=` filter and the per-market `bestBid` / `bestAsk` now share one definition of resting — open, ticks remaining, deadline not passed — so they cannot disagree. There is no opt-out on any of them; the row-level `/api/v1/inference/orders` has `includeExpired` instead. A book whose quotes all sat past their deadline will now report an empty side where it previously reported depth. Nothing about stored state changed, and `EXPIRED` is still set only by the chain's `InferenceOrderExpired`.
+- **`GET /api/v1/inference/orders` hides lapsed orders by default.** A `LIVE` row whose `deadline` has passed is no longer returned unless the request passes `includeExpired=true` — this applies to existing calls too, including a plain request with no `status`. A `tokenContract` lookup is the exception and still returns it.
+
 ## [2026-09-01]
 
 ### Fixed

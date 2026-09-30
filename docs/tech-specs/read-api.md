@@ -22,6 +22,10 @@ Implementation-facing requirements for the HTTP layer that serves the market-dat
 
 **Depth** — the `/api/v1/prediction/depth` response for one market outcome: sorted bid and ask price levels plus `lastUpdateId`. It is built from `live_orders`, not by querying the OrderBook contract during the HTTP request.
 
+**Resting liquidity** — orders currently on a book AND still matchable: rows with `status = 'OPEN' AND amount_remaining > 0 AND (deadline IS NULL OR deadline > now)`. On the inference side three readers share this one definition — [depth](#apiv1inferencedepth) (its levels and its whole-book totals alike), the [`?liquidity=` listing filter](#resting-liquidity-filter-liquidity), the per-market [top of book](#top-of-book-bestbid--bestask) and the per-market [ask volume](#ask-volume-totalaskticks) — so they cannot disagree about what is on the book. The default LIVE view of [`/api/v1/inference/orders`](#apiv1inferenceorders) applies the deadline half of it, except to a `tokenContract` lookup (see [§ includeExpired](#includeexpired)).
+
+**Lapsed order** — a row that is still in the book (stored `OPEN`) but whose `deadline` has passed. The book will not settle against it (`_isExpired` in `InferenceOrderBook.sol`: `deadline != 0 && block.timestamp >= deadline`), but it leaves the book only when a taker's match reaches it, someone calls the permissionless `expireOrder`, or its owner cancels it; until the indexer projects the event that follows, the row stays `OPEN`. Orthogonal to the public `EXPIRED` status, which only the event sets — see [§ Lapsed vs EXPIRED](#lapsed-vs-expired).
+
 **Trade tape** — a bare, newest-first list of maker↔taker matches built from an append-only table, never by querying the chain contract during the HTTP request. Two instances share this contract: `/api/v1/prediction/trades` (per market outcome, from the `trades` table) and `/api/v1/inference/trades` (per model order book, from the `inference_trades` table).
 
 **DTO** — Data Transfer Object. In this document it means the API response object after the backend has assembled it from database rows, but before it is serialized to JSON and sent to the client.
@@ -438,20 +442,61 @@ Per row: render `modelRefName` from `model_ref`, falling back to `model_hash` wh
 
 `contractVersion` is passed through verbatim from [`inference_markets.version`](data-schema.md#inference_markets) — the **contract** version reported by the book's `getVersion()` getter (e.g. `"4.0.30"`), the same column the reconciler parses as semver for cross-version supersede resolution. It is **not** a model version: `modelRefName` is the model's own label and carries whatever the book reports, and the two columns are kept distinct on purpose. `null` when the getter has not yet populated the column. No decode or validation — an unreconciled book is already hidden by the visibility gate, and whatever string the getter returned is served as-is.
 
+### Top of book (`bestBid` / `bestAsk`)
+
+Each market row carries the best matchable quote on each side, built by two `LEFT JOIN LATERAL` sub-selects — `ORDER BY price DESC LIMIT 1` for the bid, `ASC` for the ask — over the same [resting](#glossary) predicate depth aggregates. `bestBid` is therefore exactly depth's first `bids` level, digit for digit: same filter, same `price_precision` scaling. An empty side yields no lateral row and renders `null`, never `"0"`.
+
+LATERAL rather than a second round trip: the join runs once per market row it is joined to, and the listing picks its page in a subquery before joining (see [Ask volume](#ask-volume-totalaskticks)), so the cost is two index probes per *returned* market — never two per visible book.
+
+The probe stops at the first index entry only while the top of book is live. `deadline` is not a prefix of the index key, so a wall of lapsed orders priced above the best live quote is walked through: on a book with 4000 lapsed bids above 20 live ones, one probe measured 1.078 ms against 0.109 ms for the same probe without the deadline test. The cost is bounded by how many lapsed orders sit above the best live price, and is self-limiting in practice — the chain drops them on the next match that reaches them. Should it ever stop being self-limiting, the fix is to maintain the quote as columns on [`inference_markets`](data-schema.md#inference_markets) written by the projector, turning the read into a keyed lookup with no scan.
+
+Both fetch paths (single-market and listing) share one builder, so the two cannot drift; the single-market request carries `now` for the same reason the listing does.
+
+### Ask volume (`totalAskTicks`)
+
+Each market row carries the ticks resting across its whole ask side, as a third `LEFT JOIN LATERAL`: `sum(amount_remaining)` over the [resting](#glossary) predicate with `NOT is_buy`, scaled by `quantity_precision`. It is therefore exactly depth's `totalAskTicks` for the same book at the same clock. An empty side sums to NULL, which renders `"0"` — a total of nothing, as on depth, not `null`. Only the ask side is carried; the bid-side total is not requested and would double the cost.
+
+Unlike the top-of-book probes this is an aggregate: it reads every resting ask on the book, so its cost grows with the book, not with the page. It is an index-only range scan of `inference_orders_liquidity_idx`, which carries both `amount_remaining` and `deadline`, so no row costs a heap fetch.
+
+The listing picks its page **before** joining: `FROM (SELECT … ORDER BY … LIMIT $3) inference_markets` and only then the three LATERALs. Nothing indexes the sort key, so the planner sorts every visible book before `LIMIT`; with the joins at the same level it ran them for every visible book too — for the top-of-book probes that was cheap, for a whole-side sum it is not. The `?liquidity=` predicate and the keyset stay inside the subquery, since they decide which books make the page.
+
+Measured on a local Postgres 16 with 1M orders across 200 books (1,500 resting asks per book), median of 25 runs:
+
+| Page | Before (top of book only) | Page-first, top of book only | Page-first + `totalAskTicks` |
+| --- | --- | --- | --- |
+| 51 rows | 4.5 ms | 3.4 ms | 11.5 ms |
+| 201 rows (every book) | 4.7 ms | 6.0 ms | 44.1 ms |
+
+That is about 0.15 µs per resting ask on the page's books. Should that stop being acceptable, the fix is the same as for the quote: keep the total as a column on [`inference_markets`](data-schema.md#inference_markets) maintained by the projector.
+
+### Resting-liquidity filter (`?liquidity=`)
+
+`?liquidity=BUY|SELL|ANY|BOTH` keeps only books that currently have orders resting on them. "Resting" is `inference_orders.status = 'OPEN' AND amount_remaining > 0 AND (deadline IS NULL OR deadline > $now)` — byte for byte the predicate [`/api/v1/inference/depth`](#apiv1inferencedepth) aggregates, so the two endpoints cannot disagree about what is on the book. Subscriptions are not excluded for the same reason: depth counts them, so the filter counts them. The deadline conjunct is explained in [§ Lapsed vs EXPIRED](#lapsed-vs-expired); `$now` is the handler's request clock, threaded through `InferenceMarketsListing::now` rather than taken from SQL `now()` so one response cannot mix clocks.
+
+The predicate is an `EXISTS` semi-join on `inference_orders.orderbook_address`, emitted per side: `BUY` adds `AND io.is_buy`, `SELL` adds `AND NOT io.is_buy`, `ANY` constrains neither, `BOTH` emits two independent `EXISTS`. Two properties are load-bearing:
+
+- **Existential, never aggregate.** The semi-join stops at the first matching row, so the filter costs one index probe per candidate book instead of a scan of its book. Summing here would make the filter's cost proportional to every open order on every *candidate* book, returned or not. The ask volume the listing does carry is summed only for the books on the page — see [Ask volume](#ask-volume-totalaskticks).
+- **No outcome dimension.** An `InferenceOrderBook` is one book per model, so `orderbook_address` plus a side is the whole key — exactly the leading edge of `inference_orders_liquidity_idx` (migration 0006). The prediction side needs an extra rule here (a market matches when *any* outcome quotes the side); the inference side does not.
+
+The side is an allow-listed enum (`LiquidityFilter::parse`) rendered as a literal SQL fragment; it consumes no bind parameter, so the listing's fixed `$1..$3` numbering is untouched. It is read through `non_blank_query`, so a present-but-blank value is `MissingParameter` → 400 rather than "no filter" — an unbound template variable would otherwise list every book, dry ones included. An unparseable value is `InvalidParameter` → 400. Unlike `status` — validated but not a predicate, since every visible row is `TRADING` — this one actually filters.
+
+Index backing is `inference_orders_liquidity_idx` (migration 0006): `(orderbook_address, is_buy) INCLUDE (amount_remaining, deadline)` under the partial predicate `status = 'OPEN' AND amount_remaining > 0`. The filter uses exactly that predicate, so the correlated per-book probe is an index-only scan with the deadline test applied to the index tuple. `deadline` is payload and not predicate because the comparison is against the request clock, which no index predicate may reference. `inference_orders_open_book_idx` leads with the same two columns but carries neither the `amount_remaining > 0` predicate nor either value, so every candidate row would cost a heap fetch.
+
 ### Pagination
 
 Same cursor machinery as `/api/v1/prediction/markets` (URL-safe base64 of `"<sort_key>:<id>"`). One sort mode: `sort=createdAt` (default, DESC, key `created_at_chain`) — `resultStart` from the prediction side does not apply (inference markets have no result timing). A corrupted cursor → `InvalidParameter` → 400.
 
 ### Single-market mode
 
-`?inferenceOrderBookAddress=` returns exactly one market and is mutually exclusive with the list parameters (`status`, `sort`, `cursor`, `limit`) — passing both → `MissingParameter` → 400, mirroring [`/api/v1/prediction/markets`](#apiv1predictionmarkets)'s `predictionMarketAddress` single-market rule. An unknown or unreconciled address → `InvalidMarketOrSymbol` → 404. The response is the same market object built per [Building the response](#building-the-response-1), wrapped with `serverTime`.
+`?inferenceOrderBookAddress=` returns exactly one market and is mutually exclusive with the list parameters (`status`, `sort`, `liquidity`, `cursor`, `limit`) — passing both → `MissingParameter` → 400, mirroring [`/api/v1/prediction/markets`](#apiv1predictionmarkets)'s `predictionMarketAddress` single-market rule. An unknown or unreconciled address → `InvalidMarketOrSymbol` → 404. The response is the same market object built per [Building the response](#building-the-response-1), wrapped with `serverTime`.
 
 ### Error mapping
 
 | Condition | DomainError | HTTP |
 | --- | --- | --- |
 | `inferenceOrderBookAddress` unknown / not yet reconciled | `InvalidMarketOrSymbol` | 404 |
-| Invalid `status` / `sort` enum value | `InvalidParameter` | 400 |
+| Invalid `status` / `sort` / `liquidity` enum value | `InvalidParameter` | 400 |
+| `liquidity` present but blank | `MissingParameter` | 400 |
 | `inferenceOrderBookAddress` together with list filters | `MissingParameter` | 400 |
 | Corrupted cursor | `InvalidParameter` | 400 |
 
@@ -471,9 +516,11 @@ A reconciled book with no `OrderPlaced` yet returns the well-formed empty shape 
 
 One SQL query produces both sides. Per side, the database:
 
-1. Filters `inference_orders` to `status = 'OPEN' AND amount_remaining > 0` for this `orderbook_address` (resting buy orders and subscriptions are bids, sell offers are asks).
+1. Filters `inference_orders` to `status = 'OPEN' AND amount_remaining > 0 AND (deadline IS NULL OR deadline > $3)` for this `orderbook_address` (resting buy orders and subscriptions are bids, sell offers are asks). The deadline conjunct is not optional here — see [§ Lapsed vs EXPIRED](#lapsed-vs-expired).
 2. Groups by `price`, sums `amount_remaining` — orders at one price collapse into one level (`[pricePerTick, ticks]`).
 3. Orders by price (bids DESC, asks ASC), `LIMIT $limit`. The partial index `inference_orders_open_book_idx` (`WHERE status = 'OPEN'`) backs this.
+
+Each branch also carries `sum(sum(amount_remaining)) over ()` — a window over the GROUPed rows, which SQL evaluates after `GROUP BY` but before `ORDER BY` / `LIMIT`. It therefore totals every price level of the side even though only `limit` of them are returned, and it rides the scan the `GROUP BY` is already making rather than adding a second pass. Every row of a side repeats that side's total; an empty side has no rows, which the projection reads as `"0"` rather than a missing answer. The totals are scaled like a level's quantity, so adding the returned levels up lands on the same number whenever `limit` did not truncate them.
 
 Each side is then re-sorted in Rust with exact-numeric `BigUint` comparison (lexicographic string order would misrank prices of differing length). Price is decoded ÷ `10^9` (SHELL atoms → SHELL) and formatted at `price_precision`; quantity (ticks) is integer, formatted at `quantity_precision = 0`.
 
@@ -486,6 +533,7 @@ Each side is then re-sorted in Rust with exact-numeric `BigUint` comparison (lex
 1. `bids` DESC, `asks` ASC by price, exact-numeric.
 2. One `[price, quantity]` per price level; quantity is the summed resting ticks.
 3. `lastUpdateId` scoped to the book; empty string before any event; never lex-decreases.
+4. `totalBidTicks` / `totalAskTicks` cover the whole side regardless of `limit`, and equal the sum of the returned levels whenever `limit` did not truncate them.
 
 ### Error mapping
 
@@ -521,19 +569,58 @@ The reason is structural, not a validation preference: [`inference_orders_book_t
 
 A resting SELL whose `token_contract` is still NULL (the indexer has not yet learned it — see [`inference_orders.token_contract`](data-schema.md#inference_orders)) makes any TokenContract-filtered query over live SELLs suspect: the row might belong to the requested TokenContract and simply not say so yet. The repository probes [`inference_orders_live_sell_tc_null_idx`](data-schema.md#inference_orders) for such rows and fails closed with `MarketInconsistent` → 503 rather than silently omitting a row that could match — one of three arms of the fail-closed gate; see [§ Fail-closed gate](#fail-closed-gate).
 
+### Lapsed vs EXPIRED
+
+Two independent questions. Neither is derived from the other, and the read model must not collapse them.
+
+**Is the order in the book?** That is the `status` axis, and the chain owns it. `LIVE` is exactly stored `OPEN`: the order is physically resting. Migration 0002 is explicit that a row whose `deadline` already sits in the past keeps that `OPEN` status until `InferenceOrderExpired` arrives (or, if its owner cancels it first, `InferenceOrderCancelled`), and the column comment forbids deriving a status from wall-clock. Nothing here changes that — `status` is read straight from the column, and a lapsed row is `LIVE` because it is, in fact, still in the book.
+
+**Can it still be matched?** A separate question with a separate answer, and the book has already given it: `_isExpired(deadline)` in `InferenceOrderBook.sol` is `deadline != 0 && block.timestamp >= deadline`, and the matching loops skip such a maker and drop it inline rather than settling against it. An order no taker's match reaches stays in the book until its owner cancels it or someone calls the permissionless `expireOrder`; no service in this repository calls it, so that window has no upper bound. So a lapsed order is present and unmatchable at the same time — there is nothing contradictory about that, and no status can express it.
+
+Because the two are independent, the filters are too: `?status=` selects on presence, `?includeExpired=` selects on matchability, and they compose. Folding the deadline into the meaning of `LIVE` would have destroyed the distinction the chain maintains.
+
+The read model must not paper over that gap. Quoting a lapsed order in depth advertises ticks no taker can hit — the failure is a client sending an order against liquidity that was never there. So the *resting* predicate excludes lapsed rows everywhere the read model describes the book:
+
+| Reader | Lapsed rows | Opt-out |
+| --- | --- | --- |
+| [`/api/v1/inference/depth`](#apiv1inferencedepth) | excluded | none — an unhittable order is not depth |
+| [`?liquidity=` filter](#resting-liquidity-filter-liquidity) | excluded | none |
+| [`/api/v1/inference/orders`](#apiv1inferenceorders), `status=LIVE` | excluded by default, never on a `tokenContract` lookup | `?includeExpired=true` |
+
+`/orders` gets the opt-out because it is the row-level view: an operator chasing why a note's order never filled needs to see the row, and the response carries `deadline` and `serverTime` so the lapse is visible. The aggregate views do not, because there is nothing there to inspect — a lapsed order would simply inflate a number.
+
+`deadline IS NULL` never lapses. On a book at contract 4.0.31 or later it is a BUY placed with `deadline == 0`, good-till-cancel; every SELL there carries a deadline. A book at 4.0.30 or earlier adds two sources: a SELL, which then carried `deadline = 0` and never lapsed, and a row projected from the retired `InferenceSubscriptionPlaced`, whose deadline the chain held but the event never published — it stays NULL until the reconciler's sweep recovers it, and until then there is nothing to compare. The boundary follows the contract exactly: `deadline == now` has already lapsed, matching `>=`. The clock is the handler's request `now`, so it is the same instant the response reports as `serverTime`.
+
+The remaining skew is between that wall-clock and `block.timestamp`. It is the same skew `/api/v1/oracles` already lives with for event availability, and it is one-sided in the safe direction on the read path: an order shown as resting a second before the chain would drop it is the pre-existing behaviour, not a regression.
+
 ### Status vocabulary
 
-Three public values, exhaustive over every row (`InferenceOrderStatus::ALL`):
+Four public values, exhaustive over every row (`InferenceOrderStatus::ALL`):
 
 | Public `status` | `inference_orders.status` |
 | --- | --- |
 | `LIVE` | `OPEN` |
 | `FILLED` | `FILLED` |
 | `CANCELLED` | `CANCELLED` |
+| `EXPIRED` | `EXPIRED` |
 
-`LIVE` is exactly `OPEN`: every chain placement path on an `InferenceOrderBook` requires non-zero size, and the fill projector moves a row to `FILLED` as soon as its remainder reaches zero, so an `OPEN` row is always still resting. This three-way split is exhaustive — every row falls under exactly one value — which is what lets the default (no `status` filter) query claim to cover the whole book.
+`LIVE` is exactly `OPEN`: every chain placement path on an `InferenceOrderBook` requires non-zero size, and the fill projector moves a row to `FILLED` as soon as its remainder reaches zero, so an `OPEN` row is always still in the book. This four-way split is exhaustive — every row falls under exactly one value — which is what lets the default (no `status` filter) query claim to cover the whole book.
 
-`status` is a CSV, parsed by `InferenceOrderStatus::from_csv`: blank / whitespace-only → `MissingParameter` → `-1102` / 400 (a present-but-empty value is a client bug — an unbound template variable — not "no filter"); an unrecognized token → `InvalidParameter` → `-1130` / 400. Tokens are de-duplicated on parse; omitting `status` entirely defaults to all three values.
+`LIVE` is presence, nothing more. Whether a present order has passed its deadline is a separate filter that composes with this one — see [§ includeExpired](#includeexpired) — and it never changes the status a row reports.
+
+`status` is a CSV, parsed by `InferenceOrderStatus::from_csv`: blank / whitespace-only → `MissingParameter` → `-1102` / 400 (a present-but-empty value is a client bug — an unbound template variable — not "no filter"); an unrecognized token → `InvalidParameter` → `-1130` / 400. Tokens are de-duplicated on parse; omitting `status` entirely defaults to all four values.
+
+### includeExpired
+
+`?includeExpired=` is read through `non_blank_query` like every other filter on this endpoint, so a present-but-blank value → `MissingParameter` → `-1102` / 400; the rest is parsed with `bool::from_str`, which accepts exactly `true` and `false`; anything else → `InvalidParameter` → `-1130` / 400. Neither a typo nor an unbound template variable may quietly fall back to the default, because the default hides rows and the caller would have no way to notice.
+
+Absent → `false`. When false and the query names no `tokenContract`, the `LIVE` branch of the union carries `AND (deadline IS NULL OR deadline > $now)`, emitted alongside the `note` predicate rather than as part of the status term — it is one more independent filter on the row, not a redefinition of the status.
+
+It reaches only the `LIVE` branch as a consequence rather than a special case: the filter asks about an order that is *in the book* and past its deadline, and a `FILLED`, `CANCELLED` or `EXPIRED` row is not in the book, so nothing there can match the description.
+
+It is never applied to a `tokenContract` lookup. That query asks whether the TokenContract is in use — presence, not matchability — and a lapsed SELL still holds its TC's `_offerPosted` latch: the TC cannot post a new offer or close until the order leaves the book. Hiding the row would report the TC free while the chain still holds it, the one direction the [§ Fail-closed gate](#fail-closed-gate) exists to rule out.
+
+The predicate is a heap residual on that one branch rather than an index term, and is cheap per row: every page column is read from the heap anyway, so the conjunct rides along with a fetch the query was already making. It does mean a book carrying many lapsed rows scans further to fill a page, and those rows stay until a match, `expireOrder` or the owner's cancel removes them.
 
 ### Page-size protocol
 
@@ -613,6 +700,8 @@ Arm 1 (`tc_unknown`) logs at `error!` on **every** request that observes it, eva
 | `side` present and not `BUY` / `SELL` | `InvalidParameter` | `-1130` | 400 |
 | `status` CSV blank / whitespace-only | `MissingParameter` | `-1102` | 400 |
 | `status` CSV contains an unknown token | `InvalidParameter` | `-1130` | 400 |
+| `includeExpired` present but blank | `MissingParameter` | `-1102` | 400 |
+| `includeExpired` present and not exactly `true` / `false` | `InvalidParameter` | `-1130` | 400 |
 | `limit` out of `[1, 500]` (including values outside `u16` range) | `MissingParameter` | `-1102` | 400 |
 | `limit` present but non-numeric | `InvalidParameter` | `-1130` | 400 |
 | `cursor` — see [§ Cursor format](#cursor-format) | | | |

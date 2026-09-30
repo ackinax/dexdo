@@ -27,8 +27,10 @@
       - [OracleOutcome](#oracleoutcome)
   - [Inference Market Data](#inference-market-data)
     - [Inference Markets](#inference-markets)
+      - [Liquidity filter](#liquidity-filter)
     - [Inference Depth](#inference-depth)
     - [Inference Orders](#inference-orders)
+      - [Lapsed orders](#lapsed-orders)
     - [Inference Trades](#inference-trades)
   - [Account Endpoints](#account-endpoints)
     - [Account Balance](#account-balance)
@@ -831,6 +833,8 @@ GET /api/v1/inference/markets
 
 List the tradable models — one entry per model order book.
 
+`bestBid` / `bestAsk` carry each book's top of book, so screening many books does not need one [`/api/v1/inference/depth`](#inference-depth) call each. They obey the same definition of resting as depth: an order that is in the book but past its `deadline` sets no quote (see [Lapsed orders](#lapsed-orders)). `totalAskTicks` carries the ask-side volume the same way — the ticks resting across the whole ask side, identical to `totalAskTicks` on depth. There is no bid-side total on the market; for it, read `totalBidTicks` from [`/api/v1/inference/depth`](#inference-depth).
+
 Query parameters:
 
 | Name | Type | Mandatory | Description |
@@ -838,6 +842,7 @@ Query parameters:
 | `inferenceOrderBookAddress` | STRING | NO | Return one market only. Mutually exclusive with the filter and pagination parameters below. |
 | `status` | STRING | NO | Comma-separated statuses to include. Currently only `TRADING`. |
 | `sort` | STRING | NO | Sort field. `createdAt` (default, DESC). |
+| `liquidity` | ENUM | NO | Return only books that currently hold resting liquidity. One of: `BUY` (at least one open bid), `SELL` (at least one open ask), `ANY` (either side), `BOTH` (a bid **and** an ask). See [Liquidity filter](#liquidity-filter). |
 | `cursor` | STRING | NO | Opaque pagination cursor from a previous call. |
 | `limit` | INT | NO | Page size. Default: `50`. Max: `200`. |
 
@@ -863,6 +868,9 @@ Response:
       "stepSize": "1",
       "minNotional": "1",
       "referencePrice": "1010",
+      "bestBid": "0.000001200",
+      "bestAsk": "0.000001800",
+      "totalAskTicks": "290",
       "createdAt": 1709980000
     }
   ]
@@ -889,6 +897,9 @@ Response fields:
 | `stepSize` | DECIMAL | Minimum tick-quantity increment (`"1"`). |
 | `minNotional` | DECIMAL | Minimum order notional in `SHELL`. |
 | `referencePrice` | DECIMAL \| null | Weekly-median price per tick used to settle prediction markets. **`null`** when the book has no recent liquidity. |
+| `bestBid` | DECIMAL \| null | Top of book: the highest price a matchable bid rests at, scaled by `pricePrecision`. Identical to the first `bids` level [`/api/v1/inference/depth`](#inference-depth) would return for this book. **`null`** when no bid is matchable — an empty side, not a zero. |
+| `bestAsk` | DECIMAL \| null | The lowest price a matchable ask rests at; **`null`** when no ask is matchable. |
+| `totalAskTicks` | DECIMAL | Ticks resting across the whole ask side, scaled by `quantityPrecision`. Identical to `totalAskTicks` on [`/api/v1/inference/depth`](#inference-depth) for this book. **`"0"`** when no ask is matchable. |
 | `createdAt` | LONG | Unix seconds. When the book was first seen. |
 
 Errors:
@@ -896,9 +907,27 @@ Errors:
 | Condition | Code | HTTP |
 | --- | --- | --- |
 | `inferenceOrderBookAddress` together with filter/pagination params | `-1102` | 400 |
-| Invalid `status` / `sort` value | `-1130` | 400 |
+| Invalid `status` / `sort` / `liquidity` value | `-1130` | 400 |
+| `liquidity` present but blank | `-1102` | 400 |
 | Corrupted `cursor` | `-1130` | 400 |
 | `inferenceOrderBookAddress` not found | `-1121` | 404 |
+
+#### Liquidity filter
+
+`?liquidity=` keeps only books that currently have orders resting on them. An order counts when it is open, still has ticks left, and has not lapsed — exactly the orders [`/api/v1/inference/depth`](#inference-depth) would show. Filled and cancelled orders never count, neither does an order with no ticks left to match, and neither does one whose `deadline` has passed (see [Lapsed orders](#lapsed-orders)); an order with no deadline is good-till-cancel and always counts.
+
+| Value | A book is returned when |
+| --- | --- |
+| `BUY` | at least one open bid rests on it |
+| `SELL` | at least one open ask rests on it |
+| `ANY` | at least one open order rests on it, either side |
+| `BOTH` | at least one bid **and** at least one ask rest on it |
+
+Each model has exactly one order book, so the question is simply whether that book quotes the side — there is no outcome dimension the way there is on a prediction market.
+
+The filter answers "is this side quoted", not "how much is quoted". Each market carries its ask-side volume as `totalAskTicks`; for the bid side, read `totalBidTicks` from [`/api/v1/inference/depth`](#inference-depth) on a book.
+
+Any other value is rejected with `-1130 / 400`, and a blank one with `-1102 / 400` — an unbound template variable must not silently drop the filter and list every book. Like the other listing parameters, `liquidity` MUST NOT be combined with `inferenceOrderBookAddress` (`-1102 / 400`) — presence alone conflicts, so even an empty `&liquidity=` is refused.
 
 ### Inference Depth
 
@@ -929,16 +958,22 @@ Response:
   "asks": [
     ["1050", "80"],
     ["1060", "210"]
-  ]
+  ],
+  "totalBidTicks": "420",
+  "totalAskTicks": "290"
 }
 ```
 
 Each bid or ask item is `[pricePerTick, ticks]` — price in `SHELL` and the total ticks resting at that price.
 
+Orders whose `deadline` has passed are **not** included: the book skips such a maker when matching, so quoting it would advertise ticks no taker can hit. See [Lapsed orders](#lapsed-orders). There is no opt-out — an unhittable order is not depth.
+
 | Field | Type | Description |
 | --- | --- | --- |
 | `contractVersion` | STRING \| null | Version of the deployed order-book contract for this book (e.g. `"4.0.30"`). Same value as `contractVersion` in [`/api/v1/inference/markets`](#inference-markets) for the same `inferenceOrderBookAddress`. `null` when the contract version is not yet known on chain. |
 | `lastUpdateId` | STRING | Opaque chain-order cursor for this book. Lex-comparable: a larger string means a newer event has touched the book. Empty string when no order has landed yet. Do not parse it as an integer. |
+| `totalBidTicks` | DECIMAL | Ticks resting across the **whole** bid side, not only the levels in `bids`. `limit` caps how many levels come back; it does not cap this, so the total is the same answer at any page size. `"0"` on an empty side. |
+| `totalAskTicks` | DECIMAL | The same across the whole ask side. |
 
 Errors:
 
@@ -969,9 +1004,28 @@ Query parameters:
 | `tokenContract` | STRING | NO | Exact deal `TokenContract` address. Mutually exclusive with `note`. Refused with `-1500` (HTTP 503, retry) while the book holds a live SELL whose `TokenContract` the indexer does not know. |
 | `note` | STRING | NO | Exact owning PrivateNote address. Mutually exclusive with `tokenContract`. |
 | `side` | STRING | NO | `BUY` or `SELL`. |
-| `status` | STRING | NO | Comma-separated: `LIVE`, `FILLED`, `CANCELLED`, `EXPIRED`. Tokens are trimmed and de-duplicated. Default: all statuses. `LIVE` means currently resting; `EXPIRED` means the book dropped it once its deadline passed. |
+| `status` | STRING | NO | Comma-separated: `LIVE`, `FILLED`, `CANCELLED`, `EXPIRED`. Tokens are trimmed and de-duplicated. Default: all statuses. `LIVE` means the order is in the book; `EXPIRED` means the chain confirmed the book dropped it. Whether a `LIVE` row has passed its deadline is a separate question — see [`includeExpired`](#lapsed-orders). |
 | `limit` | INT | NO | Page size. Default: `100`. Range: `[1, 500]`; out-of-range values are rejected, not clamped. |
 | `cursor` | STRING | NO | Keyset cursor: the decimal `orderId` of the last row on the previous page, taken verbatim from a previous call's `nextCursor`. |
+| `includeExpired` | BOOLEAN | NO | Include `LIVE` rows whose `deadline` has already passed. Default `false`. Exactly `true` or `false`; any other value is `-1130`. A `tokenContract` query returns such rows either way. See [Lapsed orders](#lapsed-orders). |
+
+#### Lapsed orders
+
+`status` and `includeExpired` are two independent filters and answer two different questions.
+
+**`status`** — is the order in the book? `LIVE` means it is: physically resting, exactly the rows the book holds. `FILLED`, `CANCELLED` and `EXPIRED` mean it left, and how.
+
+**`includeExpired`** — can a row still be matched? An order carries an optional `deadline`. Once it passes, the book will not settle against that order, but the order leaves the book only when a taker's match reaches it, someone calls the book's permissionless `expireOrder`, or its owner cancels it — and nothing guarantees any of these happens soon. Until then the row is still in the book and still `LIVE`; an expiry then makes it `EXPIRED`, a cancel `CANCELLED`. For that window the order is present but unhittable, and `includeExpired` is what decides whether you see it.
+
+By default it is `false`, hiding those rows. `includeExpired=true` returns them.
+
+- `deadline` **null** is never treated as lapsed. On a book at contract 4.0.31 or later it means a BUY placed good-till-cancel; see the `deadline` note below for books at 4.0.30 or earlier.
+- The boundary is inclusive: at `deadline == serverTime` the order has already lapsed, matching the book's own rule.
+- The filter composes with `status`, it does not modify it. In practice only `LIVE` rows are affected, because only an order that is in the book can be in the book past its deadline — a terminal row left the book already, so its `deadline` is irrelevant and it is returned either way.
+- A row returned under `includeExpired=true` still reports `"status": "LIVE"`, because it is still in the book. Compare its `deadline` against `serverTime` to see that it has lapsed.
+- A `tokenContract` query ignores the filter and always returns a lapsed row. It asks whether the TokenContract is in use, and a lapsed SELL still holds it: the TokenContract cannot post a new offer or close until the order leaves the book. Its seller can release it by cancelling the order, and anyone can by passing its `orderId` to `expireOrder`.
+
+[`/api/v1/inference/depth`](#inference-depth) and the [`?liquidity=` filter](#liquidity-filter) apply the same deadline rule with no opt-out: those describe what can be traded against, and a lapsed order cannot.
 
 Response:
 
@@ -1017,7 +1071,7 @@ Response fields:
 | `price` | DECIMAL | Price per tick, in `SHELL`. |
 | `ticks` | DECIMAL | The **resting remainder** — ticks still available at this order. Compare directly against a level in [`/api/v1/inference/depth`](#inference-depth), which uses the same name (`ticks`) for the same quantity. |
 | `ticksInitial` | DECIMAL | The size the order was placed with. On chain, `InferenceOrderPlaced.ticks` is this initial size — the same field name carries a different number in the chain event than it does in this response's `ticks`. |
-| `deadline` | STRING \| null | Unix seconds as a **decimal string**, reproducing the chain `uint64` verbatim (it can exceed both `i64` and JSON's exact-integer range). `null` means no deadline is known to the indexer — see the note below; it does not mean "no deadline". |
+| `deadline` | STRING \| null | Unix seconds as a **decimal string**, reproducing the chain `uint64` verbatim (it can exceed both `i64` and JSON's exact-integer range). `null` means no deadline is known to the indexer — from contract 4.0.31 on, a good-till-cancel BUY; see the note below. |
 | `status` | ENUM | `LIVE`, `FILLED`, `CANCELLED`, or `EXPIRED`. `EXPIRED` means the book dropped the order once its `deadline` passed, as opposed to someone cancelling it. A past `deadline` on its own never implies `EXPIRED`: the status changes only when the chain reports the removal, so an order can read `LIVE` with a `deadline` already behind it. See the notes below. |
 | `createdAt` | LONG \| null | Unix seconds. `null` when the chain timestamp was not recovered — the row is served regardless. |
 | `updatedAt` | LONG \| null | Unix seconds, same convention as `createdAt`. |
@@ -1027,23 +1081,24 @@ Errors:
 | Condition | Code | HTTP |
 | --- | --- | --- |
 | `inferenceOrderBookAddress` missing or blank | `-1102` | 400 |
-| `tokenContract`, `note`, `side`, `status`, or `cursor` present but blank | `-1102` | 400 |
+| `tokenContract`, `note`, `side`, `status`, `cursor`, or `includeExpired` present but blank | `-1102` | 400 |
 | `tokenContract` and `note` both supplied | `-1130` | 400 |
 | `side` present and not `BUY` / `SELL` | `-1130` | 400 |
 | `status` contains an unknown token | `-1130` | 400 |
 | `limit` present but not an integer | `-1130` | 400 |
 | `limit` outside `[1, 500]` | `-1102` | 400 |
 | `cursor` present but not all decimal digits, or oversized | `-1130` | 400 |
+| `includeExpired` present and not exactly `true` / `false` | `-1130` | 400 |
 | `inferenceOrderBookAddress` not found | `-1121` | 404 |
 | A `tokenContract` query scopes live SELLs while the book holds one whose TokenContract the indexer does not know | `-1500` | 503 |
 
 Notes:
 
-- `LIVE` means currently resting: placed, not cancelled, not fully filled. `InferenceOrderCancelled` moves an order to `CANCELLED`; a fill moves it to `FILLED` once no ticks remain, and a SELL leaves `LIVE` on its first fill because one SELL offer is one deal.
+- `LIVE` means the order is in the book: placed, not cancelled, not fully filled, not yet expired by the chain. `InferenceOrderCancelled` moves an order to `CANCELLED`; a fill moves it to `FILLED` once no ticks remain, and a SELL leaves `LIVE` on its first fill because one SELL offer is one deal.
 - `status=LIVE` can transiently include an order that was placed but never rested — a `POST_ONLY` placement rejected for crossing, a failed `FOK`, or a partially matched BUY `MARKET`/`IOC` whose remainder was refunded on chain without an order-bearing event. The reconciler's probe clears these on its next sweep. The error runs in the safe direction: such a row reports its TokenContract as *in use*, never as free.
 - `lastUpdateId` orders chain progress only. The reconciler mutates rows without advancing it, so two responses sharing a `lastUpdateId` are not guaranteed identical.
 - A `tokenContract` query that scopes live SELLs returns `-1500` (HTTP 503) while the book holds a live SELL whose TokenContract the indexer does not know. Deliberate: an empty page would otherwise be indistinguishable from "not in use", and 503 tells the client to retry where 404 would tell it to stop.
-- `deadline: null` means the indexer knows of no deadline, and it conflates two chain states the client cannot separate. `placeBuyOrder` accepts `deadline == 0` ("no deadline"), and a resting SELL always has `deadline = 0`; but a subscription always holds one on chain and never publishes it, so its row is born `null` and gains a value only when the sweep probes it. Do not let `null` read as "no deadline". Likewise `createdAt` / `updatedAt` may be `null`.
+- `deadline: null` means the indexer knows of no deadline. On a book at contract 4.0.31 or later that is a BUY placed with `deadline == 0` — good-till-cancel; every SELL offer there carries a deadline. A book's version is the `contractVersion` that [`/api/v1/inference/markets`](#inference-markets) and [`/api/v1/inference/depth`](#inference-depth) report. A book at 4.0.30 or earlier adds two more sources: a SELL, which then carried no deadline and never lapsed, and a row from the retired subscription order type, whose deadline the chain held but the `InferenceSubscriptionPlaced` event never published — such a row is born `null` and gains a value only when the sweep probes it. Likewise `createdAt` / `updatedAt` may be `null`.
 - `ticks` is the **resting remainder**; `ticksInitial` is the placed size. `InferenceOrderPlaced.ticks` on chain is the initial size, so the same field name carries different numbers in the event and in this response. The `ticks` name follows [`/api/v1/inference/depth`](#inference-depth), which already publishes `[pricePerTick, ticks]` for the ticks resting at a level — a client comparing an order against a depth level finds one name for one quantity.
 - `deadline` is a **decimal string** while `createdAt`, `updatedAt`, and `serverTime` are JSON numbers, though all four are unix seconds. `deadline` is a chain `uint64` reproduced verbatim, and can exceed both `i64` and JSON's exact-integer range; the other three are database timestamps. This follows the repo-wide rule that chain-native unsigned integers (`price`, `ticks`, `lastUpdateId`) serialize as strings.
 - `note` and `tokenContract` cannot be combined: `-1130`, HTTP 400. Both are present, so nothing is missing — the combination is what cannot be served, because no index pins both and the pair would scan one filter's whole history. This is a different relation from [`/api/v1/prediction/orders`](#orders), where `predictionMarketAddress` and `symbol` must be given together or not at all, and a half-specified pair is `-1102`.
