@@ -21,6 +21,7 @@ use dodex_domain::InferenceDepthSnapshot;
 use dodex_domain::InferenceMarket;
 use dodex_domain::InferenceMarketStatus;
 use dodex_domain::InferenceMarketsPage;
+use dodex_domain::LiquidityFilter;
 use dodex_domain::PriceLevel;
 use dodex_domain::Trade;
 use dodex_domain::INFERENCE_MAKER_REBATE_CAP_BPS;
@@ -52,6 +53,10 @@ struct InferenceMarketRow {
     step_size: Option<String>,
     min_notional: Option<String>,
     reference_price: Option<String>,
+    best_bid: Option<String>,
+    best_ask: Option<String>,
+    /// Raw ticks resting on the ask side; `"0"` when none — see `ask_volume_join`.
+    total_ask_ticks: String,
     created_at: i64,
     created_at_micros: i64,
 }
@@ -61,6 +66,10 @@ struct InferenceDepthLevelRow {
     is_buy: bool,
     price: String,
     quantity: String,
+    /// Ticks across this row's whole side, repeated on every row of it. A
+    /// window over the grouped rows, so it is the total across all price
+    /// levels of the side and not just the ones `limit` lets through.
+    side_total: String,
 }
 
 // Column list shared by the listing and single-market queries. `created_at`
@@ -71,21 +80,89 @@ const INFERENCE_MARKET_COLUMNS: &str = r#"
     id, orderbook_address, model_hash::text as model_hash, model_ref,
     version as contract_version, platform_fee_bps, price_precision, quantity_precision,
     tick_size, step_size, min_notional, reference_price::text as reference_price,
+    best_bid.price::text as best_bid, best_ask.price::text as best_ask,
+    coalesce(ask_volume.ticks, 0)::text as total_ask_ticks,
     coalesce(extract(epoch from created_at_chain)::bigint, 0) as created_at,
     coalesce((least(greatest(extract(epoch from created_at_chain), 0), 4102444800) * 1000000)::bigint, 0) as created_at_micros
 "#;
+
+/// Top of book for the market row being selected, as two LATERAL sub-selects.
+///
+/// `$clock` is the caller's `$N` for the request clock. Each side is an
+/// `ORDER BY price … LIMIT 1` over the same resting predicate everything else
+/// on this path uses, so `bestBid` is exactly the first level
+/// `/api/v1/inference/depth` would return — a lapsed order is skipped here for
+/// the same reason it is skipped there.
+///
+/// LATERAL rather than a second round trip: the join runs once per market row
+/// it is joined to. The listing selects its page in a subquery before joining
+/// (see `fetch_listing_inference`), so the cost is two index probes per
+/// returned market and never two per visible book.
+///
+/// The probe stops at the first entry only while the top of book is live: the
+/// deadline test is not a prefix of the index key, so a wall of lapsed orders
+/// priced above the best live quote is walked through. That is bounded by how
+/// many lapsed orders sit above it, and self-limiting in practice — the book
+/// drops them on the next match that reaches them.
+fn top_of_book_joins(clock: &str) -> String {
+    let side = |is_buy_sql: &str, direction: &str| {
+        format!(
+            "left join lateral (select price from inference_orders \
+                                 where orderbook_address = inference_markets.orderbook_address \
+                                   and status = 'OPEN' \
+                                   and amount_remaining > 0 \
+                                   and (deadline is null or deadline > {clock}) \
+                                   and {is_buy_sql} \
+                                 order by price {direction} limit 1)"
+        )
+    };
+    format!(
+        "{} best_bid on true {} best_ask on true {}",
+        side("is_buy", "desc"),
+        side("not is_buy", "asc"),
+        ask_volume_join(clock)
+    )
+}
+
+/// Ticks resting on the market's ask side, as a LATERAL sum over the same
+/// resting predicate `/api/v1/inference/depth` totals — so `totalAskTicks` on
+/// the market equals depth's `totalAskTicks` for that book at the same clock.
+/// An empty side sums to NULL, which the column list coalesces to `0`.
+///
+/// Unlike the top-of-book probes this is an aggregate: it reads every resting
+/// ask on the book, so its cost grows with the book, not with the page. It is
+/// an index-only range scan of `inference_orders_liquidity_idx`, which carries
+/// both `amount_remaining` and `deadline`, so no row costs a heap fetch.
+/// Measured on 1M orders / 200 books with 1,500 resting asks each: about
+/// 0.15 µs per resting ask, so ~8 ms on a 50-row page.
+///
+/// Only the ask side is summed: the bid-side total is not asked for, and
+/// would double the cost.
+fn ask_volume_join(clock: &str) -> String {
+    format!(
+        "left join lateral (select sum(amount_remaining) as ticks from inference_orders \
+                             where orderbook_address = inference_markets.orderbook_address \
+                               and status = 'OPEN' \
+                               and amount_remaining > 0 \
+                               and (deadline is null or deadline > {clock}) \
+                               and not is_buy) ask_volume on true"
+    )
+}
 
 impl PostgresReadModelRepository {
     async fn fetch_one_inference(
         &self,
         orderbook_address: &str,
+        now: i64,
     ) -> Result<InferenceMarketsPage, anyhow::Error> {
+        let joins = top_of_book_joins("$2");
         let sql = format!(
-            "select {INFERENCE_MARKET_COLUMNS} from inference_markets \
+            "select {INFERENCE_MARKET_COLUMNS} from inference_markets {joins} \
              where orderbook_address = $1 and last_reconciled_at is not null limit 1"
         );
         let row: Option<InferenceMarketRow> = sqlx::query_as(&sql)
             .bind(orderbook_address)
+            .bind(now)
             .fetch_optional(self.pool())
             .await
             .context("select single inference market")?;
@@ -114,20 +191,39 @@ impl PostgresReadModelRepository {
         // validates the query value. The keyset and ORDER BY share the coalesced
         // microsecond expression so a NULL `created_at_chain` row sorts last and
         // is never skipped or stranded across pages.
+        //
+        // `liquidity` is the one real filter. It renders as a literal fragment
+        // (the side is an allow-listed enum, never user text) so the $1..$3
+        // numbering above stays fixed whether or not the filter is present.
+        let liquidity_predicate = inference_liquidity_predicate(listing.liquidity);
+        // `$4` is the request clock. It was conditional while only the optional
+        // liquidity filter referenced it; the top-of-book joins reference it on
+        // every listing, so it is now always bound.
+        let joins = top_of_book_joins("$4");
+        // The page is chosen in a subquery and only then joined. Nothing
+        // indexes the sort key, so the planner sorts every visible book before
+        // `LIMIT`; with the joins at the same level it would run them for every
+        // visible book too, and the ask-volume sum reads a whole book side.
+        // Aliasing the subquery `inference_markets` keeps the join fragments'
+        // correlation unchanged.
         let sql = format!(
-            "select {INFERENCE_MARKET_COLUMNS} from inference_markets \
-             where last_reconciled_at is not null \
-               and ($1::bigint is null \
-                    or (coalesce((least(greatest(extract(epoch from created_at_chain), 0), 4102444800) * 1000000)::bigint, 0), id) \
-                       < ($1, $2)) \
+            "select {INFERENCE_MARKET_COLUMNS} \
+             from (select * from inference_markets \
+                   where last_reconciled_at is not null \
+                     and ($1::bigint is null \
+                          or (coalesce((least(greatest(extract(epoch from created_at_chain), 0), 4102444800) * 1000000)::bigint, 0), id) \
+                             < ($1, $2)){liquidity_predicate} \
+                   order by coalesce((least(greatest(extract(epoch from created_at_chain), 0), 4102444800) * 1000000)::bigint, 0) desc, \
+                            id desc \
+                   limit $3) inference_markets {joins} \
              order by coalesce((least(greatest(extract(epoch from created_at_chain), 0), 4102444800) * 1000000)::bigint, 0) desc, \
-                      id desc \
-             limit $3"
+                      id desc"
         );
         let mut rows: Vec<InferenceMarketRow> = sqlx::query_as(&sql)
             .bind(cursor_key)
             .bind(cursor_id)
             .bind(limit + 1)
+            .bind(listing.now)
             .fetch_all(self.pool())
             .await
             .context("select inference markets listing")?;
@@ -155,8 +251,8 @@ impl InferenceReadRepository for PostgresReadModelRepository {
         request: &InferenceMarketsRequest,
     ) -> Result<InferenceMarketsPage, anyhow::Error> {
         match request {
-            InferenceMarketsRequest::One { orderbook_address } => {
-                self.fetch_one_inference(orderbook_address).await
+            InferenceMarketsRequest::One { orderbook_address, now } => {
+                self.fetch_one_inference(orderbook_address, *now).await
             }
             InferenceMarketsRequest::Listing(listing) => {
                 self.fetch_listing_inference(listing).await
@@ -168,8 +264,9 @@ impl InferenceReadRepository for PostgresReadModelRepository {
         &self,
         orderbook_address: &str,
         limit: u16,
+        now: i64,
     ) -> Result<InferenceDepthSnapshot, anyhow::Error> {
-        get_inference_depth_impl(self, orderbook_address, limit).await
+        get_inference_depth_impl(self, orderbook_address, limit, now).await
     }
 
     async fn list_inference_orders(
@@ -252,6 +349,29 @@ fn assemble_inference_market(row: InferenceMarketRow) -> Result<InferenceMarket,
             Some(scale_uint_to_decimal(&raw, price_scale))
         }
     };
+    // Top of book, scaled exactly like a depth level's price so the two agree
+    // digit for digit. NULL is an empty side, not corruption — the LATERAL
+    // returns no row when nothing matchable rests. A non-numeric raw price is
+    // the same read-model corruption `get_inference_depth_impl` fails closed
+    // on, so it is rejected here too rather than rendered.
+    let scale_quote = |raw: Option<String>, side: &'static str| match raw {
+        None => Ok(None),
+        Some(raw) => {
+            if BigUint::parse_bytes(raw.as_bytes(), 10).is_none() {
+                warn!(orderbook = %ob, side, raw = %raw, "inference top-of-book price is not a non-negative integer");
+                return Err(anyhow!(DomainError::MarketInconsistent));
+            }
+            Ok(Some(scale_uint_to_decimal(&raw, price_scale)))
+        }
+    };
+    let best_bid = scale_quote(row.best_bid, "bid")?;
+    let best_ask = scale_quote(row.best_ask, "ask")?;
+    // Scaled like depth's `totalAskTicks`, so the two agree digit for digit.
+    if BigUint::parse_bytes(row.total_ask_ticks.as_bytes(), 10).is_none() {
+        warn!(orderbook = %ob, raw = %row.total_ask_ticks, "inference ask-side total is not a non-negative integer");
+        return Err(anyhow!(DomainError::MarketInconsistent));
+    }
+    let total_ask_ticks = scale_uint_to_decimal(&row.total_ask_ticks, quantity_scale);
 
     let inconsistent = |field: &str| {
         warn!(orderbook = %ob, field, "inference trading-rule column null on a reconciled row");
@@ -275,14 +395,78 @@ fn assemble_inference_market(row: InferenceMarketRow) -> Result<InferenceMarket,
         step_size,
         min_notional,
         reference_price,
+        best_bid,
+        best_ask,
+        total_ask_ticks,
         created_at: row.created_at,
     })
+}
+
+/// SQL fragment for the `?liquidity=` listing filter, appended to the market
+/// listing's WHERE clause (leading ` and`, empty when the filter is absent).
+///
+/// Existential, never aggregate: the semi-join stops at the first matching
+/// row, so the filter costs one index probe per candidate book rather than a
+/// scan of its whole book. Summing here would make the filter's cost
+/// proportional to every open order on every candidate book, returned or not;
+/// the ask volume the listing does carry is summed only for the books on the
+/// page — see `ask_volume_join`.
+///
+/// An `InferenceOrderBook` is one book per model, so — unlike the prediction
+/// side — there is no outcome dimension the probe has to quantify over: an
+/// `orderbook_address` plus a side is the whole key, which is exactly the
+/// leading edge of `inference_orders_liquidity_idx` (migration 0006).
+///
+/// The resting predicate is byte-for-byte what `get_inference_depth_impl`
+/// aggregates — `status = 'OPEN' AND amount_remaining > 0` and a deadline that
+/// has not passed — so the filter and the book a client then fetches cannot
+/// disagree. Subscriptions (`is_subscription`) are not excluded for the same
+/// reason: depth counts them, so this counts them.
+///
+/// The deadline conjunct mirrors the book's own `_isExpired` (`deadline != 0 &&
+/// block.timestamp >= deadline`): the matcher skips a maker past its deadline,
+/// so quoting one would advertise liquidity no taker can hit. A NULL deadline
+/// never expires: from contract 4.0.31 on it is a good-till-cancel BUY; older
+/// books also hold deadline-0 SELLs and legacy subscription rows (see the
+/// `inference_orders.deadline` column in data-schema.md).
+/// This is a question about matchability, not about status: the row keeps the
+/// `OPEN` status the chain gave it until the chain reports its removal
+/// (`InferenceOrderExpired`, or `InferenceOrderCancelled` on an owner's cancel),
+/// exactly as migration 0002 requires.
+///
+/// `$4` is the request clock. The listing always binds it, filter or not,
+/// because the top-of-book joins reference it too — see
+/// `fetch_listing_inference`.
+///
+/// The side comes from an allow-listed enum and is rendered as a literal, so
+/// the fragment adds no bind of its own and cannot disturb `$N` numbering.
+fn inference_liquidity_predicate(filter: Option<LiquidityFilter>) -> String {
+    let side_exists = |is_buy_sql: &str| {
+        format!(
+            " and exists (select 1 from inference_orders io \
+                           where io.orderbook_address = inference_markets.orderbook_address \
+                             and io.status = 'OPEN' \
+                             and io.amount_remaining > 0 \
+                             and (io.deadline is null or io.deadline > $4){is_buy_sql})"
+        )
+    };
+    match filter {
+        None => String::new(),
+        Some(LiquidityFilter::Buy) => side_exists(" and io.is_buy"),
+        Some(LiquidityFilter::Sell) => side_exists(" and not io.is_buy"),
+        Some(LiquidityFilter::Any) => side_exists(""),
+        // Two independent probes: a book quoting only one side must not match.
+        Some(LiquidityFilter::Both) => {
+            format!("{}{}", side_exists(" and io.is_buy"), side_exists(" and not io.is_buy"))
+        }
+    }
 }
 
 async fn get_inference_depth_impl(
     repo: &PostgresReadModelRepository,
     orderbook_address: &str,
     limit: u16,
+    now: i64,
 ) -> Result<InferenceDepthSnapshot, anyhow::Error> {
     // Resolve + visibility gate. A missing row is a client miss (-1121); a
     // reconciled row with NULL precision is corruption (-1500 via inference_scale).
@@ -303,20 +487,30 @@ async fn get_inference_depth_impl(
 
     let limit = limit.max(1) as i64;
     let rows: Vec<InferenceDepthLevelRow> = sqlx::query_as(
+        // `sum(sum(...)) over ()` is a window over the GROUPed rows. SQL
+        // evaluates windows after GROUP BY but before ORDER BY / LIMIT, so it
+        // totals every price level of the side even though only `$2` of them
+        // are returned — and it rides the scan the GROUP BY is already making,
+        // costing no second pass over the book.
         r#"(select true  as is_buy, price::text as price,
-                   sum(amount_remaining)::text as quantity
+                   sum(amount_remaining)::text as quantity,
+                   (sum(sum(amount_remaining)) over ())::text as side_total
               from inference_orders
-             where orderbook_address = $1 and status = 'OPEN' and amount_remaining > 0 and is_buy
+             where orderbook_address = $1 and status = 'OPEN' and amount_remaining > 0
+               and (deadline is null or deadline > $3) and is_buy
              group by price order by price desc limit $2)
            union all
            (select false as is_buy, price::text as price,
-                   sum(amount_remaining)::text as quantity
+                   sum(amount_remaining)::text as quantity,
+                   (sum(sum(amount_remaining)) over ())::text as side_total
               from inference_orders
-             where orderbook_address = $1 and status = 'OPEN' and amount_remaining > 0 and not is_buy
+             where orderbook_address = $1 and status = 'OPEN' and amount_remaining > 0
+               and (deadline is null or deadline > $3) and not is_buy
              group by price order by price asc limit $2)"#,
     )
     .bind(orderbook_address)
     .bind(limit)
+    .bind(now)
     .fetch_all(repo.pool())
     .await
     .context("aggregate inference_orders for depth")?;
@@ -325,7 +519,16 @@ async fn get_inference_depth_impl(
     // A non-numeric raw price is read-model corruption — fail closed.
     let mut bids: Vec<(BigUint, PriceLevel)> = Vec::new();
     let mut asks: Vec<(BigUint, PriceLevel)> = Vec::new();
+    // Every row of a side repeats that side's total; an empty side has no rows
+    // at all, which is a total of zero rather than a missing answer.
+    let mut total_bid_raw = String::from("0");
+    let mut total_ask_raw = String::from("0");
     for row in rows {
+        if row.is_buy {
+            total_bid_raw.clone_from(&row.side_total);
+        } else {
+            total_ask_raw.clone_from(&row.side_total);
+        }
         let key = BigUint::parse_bytes(row.price.as_bytes(), 10).ok_or_else(|| {
             warn!(orderbook = %orderbook_address, raw = %row.price, "inference_orders.price is not a non-negative integer");
             anyhow!(DomainError::MarketInconsistent)
@@ -359,6 +562,10 @@ async fn get_inference_depth_impl(
         last_update_id: last_update_id.unwrap_or_default(),
         bids,
         asks,
+        // Same scaling as a level's quantity, so a client can add the levels up
+        // and land on this number.
+        total_bid_ticks: scale_uint_to_decimal(&total_bid_raw, quantity_scale),
+        total_ask_ticks: scale_uint_to_decimal(&total_ask_raw, quantity_scale),
     })
 }
 
@@ -616,8 +823,9 @@ fn build_snapshot_query<'a>(
                 b.push_bind(is_buy);
                 b.push(" and status = ");
                 b.push_bind(status.db_status());
-                // No residual on any branch: `db_status()` pins one stored value, and LIVE
-                // is exactly OPEN. An index scan alone decides membership.
+                // No residual from the status itself: `db_status()` pins one stored
+                // value, and LIVE is exactly OPEN — the order is physically in the
+                // book. An index scan alone decides that membership.
                 if let Some(tc) = &q.token_contract {
                     b.push(" and token_contract = ");
                     b.push_bind(tc);
@@ -625,6 +833,31 @@ fn build_snapshot_query<'a>(
                 if let Some(note) = &q.note {
                     b.push(" and note_address = ");
                     b.push_bind(note);
+                }
+                // Expiry is its own filter, composed with the others above rather than
+                // folded into the status. `status` answers "is the order in the book";
+                // this answers "can it still be matched". The book will not settle
+                // against a maker past its deadline (`_isExpired`), yet the order stays
+                // in the book — and the row OPEN — until a taker's match reaches it,
+                // someone calls `expireOrder`, or its owner cancels it, and the indexer
+                // projects the event that follows.
+                //
+                // Applied only to the LIVE branch: a FILLED, CANCELLED or EXPIRED row is
+                // not in the book, so "in the book past its deadline" cannot describe it.
+                //
+                // Never to a TokenContract lookup. That asks whether the TC is in use,
+                // which is presence, not matchability: a lapsed SELL still holds its
+                // TC's offer latch, and hiding it would report the TC free.
+                //
+                // The residual is cheap: every page column is read from the heap anyway,
+                // so the conjunct rides along with a fetch the query already makes.
+                if !q.include_expired
+                    && q.token_contract.is_none()
+                    && matches!(status, InferenceOrderStatus::Live)
+                {
+                    b.push(" and (deadline is null or deadline > ");
+                    b.push_bind(q.now);
+                    b.push(")");
                 }
                 if let Some(cursor) = &q.cursor {
                     // `order_id` is numeric(78,0); u128 has no Postgres encoding, so pass
@@ -804,4 +1037,79 @@ fn public_status(raw: &str) -> Result<InferenceOrderStatus, anyhow::Error> {
         warn!(status = raw, "inference_orders.status is not a known value");
         anyhow!(DomainError::MarketInconsistent)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn liquidity_predicate_is_existential_per_side() {
+        let buy = inference_liquidity_predicate(Some(LiquidityFilter::Buy));
+        assert_eq!(buy.matches("exists (select 1 from inference_orders").count(), 1);
+        assert!(buy.contains("and io.is_buy)"), "BUY must probe the bid side; sql={buy}");
+
+        let sell = inference_liquidity_predicate(Some(LiquidityFilter::Sell));
+        assert!(sell.contains("and not io.is_buy)"), "SELL must probe the ask side; sql={sell}");
+
+        // ANY leaves the side open — one probe, no is_buy predicate.
+        let any = inference_liquidity_predicate(Some(LiquidityFilter::Any));
+        assert_eq!(any.matches("exists (select 1 from inference_orders").count(), 1);
+        assert!(!any.contains("io.is_buy"), "ANY must not constrain the side; sql={any}");
+
+        // BOTH needs two independent probes.
+        let both = inference_liquidity_predicate(Some(LiquidityFilter::Both));
+        assert_eq!(both.matches("exists (select 1 from inference_orders").count(), 2);
+        assert!(both.contains("and io.is_buy)") && both.contains("and not io.is_buy)"));
+    }
+
+    #[test]
+    fn liquidity_predicate_never_aggregates_and_matches_the_index_predicate() {
+        for filter in [
+            LiquidityFilter::Buy,
+            LiquidityFilter::Sell,
+            LiquidityFilter::Any,
+            LiquidityFilter::Both,
+        ] {
+            let sql = inference_liquidity_predicate(Some(filter));
+            // A `sum()` here would make the listing cost proportional to every
+            // open order on every visible book — the totals endpoint exists so
+            // this stays a first-row-wins semi-join.
+            assert!(!sql.contains("sum("), "listing filter must stay existential; sql={sql}");
+            // Both conjuncts are the `inference_orders_liquidity_idx` predicate
+            // (migration 0006); dropping either turns the probe into a heap
+            // fetch and would also disagree with /inference/depth about what
+            // counts as resting.
+            assert!(sql.contains("io.status = 'OPEN'"), "sql={sql}");
+            assert!(sql.contains("io.amount_remaining > 0"), "sql={sql}");
+            // A maker past its deadline is skipped by the book's matcher, so it
+            // is not liquidity. NULL is the chain's `0` — good-till-cancel —
+            // and must survive.
+            assert!(
+                sql.contains("(io.deadline is null or io.deadline > $4)"),
+                "the resting definition must exclude lapsed makers; sql={sql}",
+            );
+            // The fragment is appended to an existing WHERE clause.
+            assert!(sql.starts_with(" and exists ("), "sql={sql}");
+            // `$4` — the request clock — is the ONLY placeholder the fragment
+            // introduces, and it sits past the listing's fixed $1..$3, so
+            // adding or dropping the filter never renumbers them. The side is
+            // a literal and binds nothing.
+            let placeholders: Vec<&str> =
+                sql.match_indices('$').map(|(i, _)| &sql[i..i + 2]).collect();
+            assert!(
+                placeholders.iter().all(|p| *p == "$4"),
+                "the filter may reference only $4; sql={sql}",
+            );
+        }
+    }
+
+    #[test]
+    fn absent_liquidity_filter_leaves_the_listing_untouched() {
+        assert_eq!(
+            inference_liquidity_predicate(None),
+            "",
+            "no ?liquidity= must not touch the order book at all",
+        );
+    }
 }

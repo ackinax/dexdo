@@ -228,6 +228,14 @@ paths:
           type:
           - string
           - 'null'
+      - name: liquidity
+        in: query
+        description: Return only books currently holding resting liquidity of this side. Each market carries its ask volume as totalAskTicks; the bid-side total is on /api/v1/inference/depth.
+        required: false
+        schema:
+          allOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/LiquidityFilter'
       - name: cursor
         in: query
         description: Opaque pagination cursor from a previous call.
@@ -309,7 +317,7 @@ paths:
           - 'null'
       - name: status
         in: query
-        description: 'Comma-separated: LIVE, FILLED, CANCELLED, EXPIRED. Default: all. LIVE means currently resting; EXPIRED means the book dropped it once its deadline passed.'
+        description: 'Comma-separated: LIVE, FILLED, CANCELLED, EXPIRED. Default: all. LIVE means the order is in the book; EXPIRED means the chain confirmed the book dropped it. Whether a LIVE row has passed its deadline is the separate includeExpired filter.'
         required: false
         schema:
           type:
@@ -337,6 +345,14 @@ paths:
         schema:
           type:
           - string
+          - 'null'
+      - name: includeExpired
+        in: query
+        description: Include orders that are in the book but past their deadline — present yet unmatchable. A filter of its own, composed with status. Default false. A tokenContract query returns such rows either way.
+        required: false
+        schema:
+          type:
+          - boolean
           - 'null'
       responses:
         '200':
@@ -1413,6 +1429,8 @@ components:
       - lastUpdateId
       - bids
       - asks
+      - totalBidTicks
+      - totalAskTicks
       properties:
         asks:
           type: array
@@ -1444,6 +1462,15 @@ components:
         lastUpdateId:
           type: string
           description: Opaque lex-comparable chain-order cursor; empty when no order has landed.
+        totalAskTicks:
+          type: string
+          description: The same across the whole ask side.
+        totalBidTicks:
+          type: string
+          description: |-
+            Ticks resting across the whole bid side. `limit` caps the levels in
+            `bids`, never this — the total is the same answer at any page size.
+            `"0"` on an empty side.
     InferenceMarketDto:
       type: object
       required:
@@ -1458,8 +1485,22 @@ components:
       - tickSize
       - stepSize
       - minNotional
+      - totalAskTicks
       - createdAt
       properties:
+        bestAsk:
+          type:
+          - string
+          - 'null'
+          description: Lowest price a matchable ask rests at; `null` when no ask is matchable.
+        bestBid:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Highest price a matchable bid rests at — the first level
+            `/api/v1/inference/depth` would return for this book. `null` when no bid
+            is matchable. Scaled like a depth level's price.
         contractVersion:
           type:
           - string
@@ -1506,6 +1547,12 @@ components:
           description: Decimal string; the buyer fee `platform_fee_bps / 10000`.
         tickSize:
           type: string
+        totalAskTicks:
+          type: string
+          description: |-
+            Ticks resting across the whole ask side — the same figure as
+            `totalAskTicks` on `/api/v1/inference/depth`. `"0"` when no ask is
+            matchable. There is no bid-side total on the market.
     InferenceMarketStatusDto:
       type: string
       description: Reserved for future inactive states; clients treat it as opaque.
@@ -1592,7 +1639,8 @@ components:
       type: string
       description: |-
         Order statuses accepted by the `GET /api/v1/inference/orders` `status` filter.
-        `LIVE` means currently resting; see docs/api-spec.md §Inference Orders.
+        `LIVE` means the order is in the book; whether it has passed its deadline
+        is the separate `includeExpired` filter. See docs/api-spec.md §Inference Orders.
         Shapes the OpenAPI `status` parameter's allowed values; the handler passes the raw CSV
         query string to the application crate's parser rather than using this enum for logic.
       enum:
@@ -1668,6 +1716,18 @@ components:
           description: |-
             Opaque, lex-comparable id for the match — the chain order of the
             `InferenceFilled` event that recorded it. Shared by both sides of the match.
+    LiquidityFilter:
+      type: string
+      description: |-
+        Values accepted by the `GET /api/v1/inference/markets` `liquidity`
+        filter. An `InferenceOrderBook` is one book per model, so the filter
+        asks about the book itself — there is no outcome dimension the way
+        there is on a prediction market.
+      enum:
+      - BUY
+      - SELL
+      - ANY
+      - BOTH
     MarketBalancesResponse:
       type: object
       required:
